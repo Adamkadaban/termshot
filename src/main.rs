@@ -128,12 +128,16 @@ async fn main() -> anyhow::Result<()> {
                 &config.default_theme,
             )?;
 
-            let cmd_str = command.join(" ");
             let timeout = Duration::from_secs(timeout);
 
             let exec_result = if !no_prompt {
-                executor::execute_command(&cmd_str, &config.shell, rows, cols, timeout).await?
+                // Each CLI argument is a separate command. The shell will
+                // show a PS1 prompt before each one.
+                let cmd_refs: Vec<&str> = command.iter().map(|s| s.as_str()).collect();
+                executor::execute_command(&cmd_refs, &config.shell, rows, cols, timeout).await?
             } else {
+                // Without prompt, join everything into a single shell -c invocation
+                let cmd_str = command.join(" ");
                 executor::execute_command_simple(&cmd_str, &config.shell, rows, cols, timeout)
                     .await?
             };

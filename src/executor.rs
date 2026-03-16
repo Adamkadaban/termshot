@@ -12,18 +12,22 @@ pub struct ExecResult {
     pub timed_out: bool,
 }
 
-/// Execute a command in an interactive login shell, capturing the PS1 prompt
-/// and full output including ANSI escape sequences.
+/// Execute one or more commands in an interactive login shell, capturing the
+/// PS1 prompt and full output including ANSI escape sequences.
+///
+/// When multiple commands are provided, each is sent on its own line so the
+/// shell displays a fresh PS1 prompt before each one. The trailing prompt
+/// after the last command is stripped from the output.
 ///
 /// Strategy:
 ///   1. Spawn interactive shell, wait for initial prompt
-///   2. Send the user command followed by a sentinel `echo`
+///   2. Send all user commands, then a sentinel `echo`
 ///   3. Read output until sentinel value appears
 ///   4. Use vt100 to parse and re-render only the content up to (but not
 ///      including) the sentinel echo command, which also removes the
 ///      trailing PS1 prompt
 pub async fn execute_command(
-    command: &str,
+    commands: &[&str],
     shell: &str,
     rows: u16,
     cols: u16,
@@ -42,15 +46,17 @@ pub async fn execute_command(
     let prompt_bytes =
         read_until_idle(&mut reader, Duration::from_millis(500), Duration::from_secs(5)).await?;
 
-    // Phase 2: Send the command + sentinel.
+    // Phase 2: Send all commands, then the sentinel.
     let sentinel = format!("__TERMSHOT_{:08x}__", rand_u32());
-    // We use a subshell so the `echo` doesn't interfere with the command's
-    // exit code, and we put a blank line before the sentinel for clean separation.
-    let to_send = format!(
-        "{cmd}\necho ''\necho '{sentinel}'\n",
-        cmd = command,
-        sentinel = sentinel,
-    );
+    // Send each command on its own line. The shell will display a PS1
+    // prompt before each one (except the first, which already has the
+    // prompt from Phase 1). After all commands, send the sentinel echo.
+    let mut to_send = String::new();
+    for cmd in commands {
+        to_send.push_str(cmd);
+        to_send.push('\n');
+    }
+    to_send.push_str(&format!("echo ''\necho '{sentinel}'\n"));
     writer
         .write_all(to_send.as_bytes())
         .await

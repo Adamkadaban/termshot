@@ -104,7 +104,7 @@ impl ScreenshotServer {
         let show_prompt = params.show_prompt.unwrap_or(true);
 
         let result = if show_prompt {
-            executor::execute_command(&params.command, &self.config.shell, rows, cols, timeout)
+            executor::execute_command(&[params.command.as_str()], &self.config.shell, rows, cols, timeout)
                 .await
         } else {
             executor::execute_command_simple(
