@@ -1,0 +1,41 @@
+[package]
+name = "screenshot-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP server and CLI tool that captures terminal screenshots with full ANSI rendering"
+
+[[bin]]
+name = "termshot"
+path = "src/main.rs"
+
+[dependencies]
+# MCP server
+rmcp = { version = "1.2", features = ["server", "transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Terminal emulation
+vt100 = "0.16"
+
+# PTY for command execution
+pty-process = { version = "0.5", features = ["async"] }
+
+# Image rendering
+fontdue = "0.9"
+image = "0.25"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Config
+toml = "0.8"
+
+# Utilities
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
