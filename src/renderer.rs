@@ -150,7 +150,12 @@ impl Renderer {
         let mut parser = vt100::Parser::new(rows, cols, 0);
         parser.process(data);
         let screen = parser.screen();
-        let plain_text = screen.contents();
+        let plain_text = screen
+            .rows(0, cols)
+            .collect::<Vec<String>>()
+            .join("\n")
+            .trim_end()
+            .to_string();
         let theme = self.get_theme(theme_name);
         let image = self.render_screen(screen, theme)?;
 
