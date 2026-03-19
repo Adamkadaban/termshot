@@ -43,8 +43,12 @@ pub async fn execute_command(
     let (mut reader, mut writer) = pty.into_split();
 
     // Phase 1: Wait for the initial prompt to appear.
-    let prompt_bytes =
-        read_until_idle(&mut reader, Duration::from_millis(500), Duration::from_secs(5)).await?;
+    let prompt_bytes = read_until_idle(
+        &mut reader,
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+    )
+    .await?;
 
     // Phase 2: Send all commands, then the sentinel.
     let sentinel = format!("__TERMSHOT_{:08x}__", rand_u32());
@@ -194,7 +198,12 @@ pub async fn execute_command(
 /// Rebuild raw ANSI bytes from a vt100 Screen, taking only the first
 /// `keep_rows` rows. This preserves colors and attributes by emitting
 /// SGR escape sequences for each cell.
-fn rebuild_raw_from_screen(screen: &vt100::Screen, keep_rows: usize, rows: u16, cols: u16) -> Vec<u8> {
+fn rebuild_raw_from_screen(
+    screen: &vt100::Screen,
+    keep_rows: usize,
+    rows: u16,
+    cols: u16,
+) -> Vec<u8> {
     let mut output = Vec::new();
     let total_rows = keep_rows.min(rows as usize);
 
@@ -472,10 +481,7 @@ fn strip_title_sequences(data: &[u8]) -> Vec<u8> {
                                     i += 1;
                                     break;
                                 }
-                                if data[i] == 0x1b
-                                    && i + 1 < data.len()
-                                    && data[i + 1] == b'\\'
-                                {
+                                if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'\\' {
                                     // ST terminator
                                     i += 2;
                                     break;
@@ -501,4 +507,71 @@ fn strip_title_sequences(data: &[u8]) -> Vec<u8> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_gnu_screen_title_sequence() {
+        let input = b"ls -la\r\n\x1bkls\x1b\\total 123\r\n";
+        let output = strip_title_sequences(input);
+        assert_eq!(String::from_utf8_lossy(&output), "ls -la\r\ntotal 123\r\n");
+    }
+
+    #[test]
+    fn strips_osc_title_sequences_bel_and_st_terminated() {
+        let input = b"a\x1b]0;hello world\x07b\x1b]2;other title\x1b\\c";
+        let output = strip_title_sequences(input);
+        assert_eq!(String::from_utf8_lossy(&output), "abc");
+    }
+
+    #[test]
+    fn rebuild_raw_preserves_separate_rows() {
+        let mut parser = vt100::Parser::new(10, 80, 0);
+        parser.process(b"prompt$ ls -la\r\ntotal 616K\r\nwhoami\r\nadam\r\n");
+        let screen = parser.screen();
+
+        let rebuilt = rebuild_raw_from_screen(screen, 4, 10, 80);
+
+        let mut reparsed = vt100::Parser::new(10, 80, 0);
+        reparsed.process(&rebuilt);
+        let rows: Vec<String> = reparsed.screen().rows(0, 80).collect();
+
+        assert_eq!(rows[0].trim_end(), "prompt$ ls -la");
+        assert_eq!(rows[1].trim_end(), "total 616K");
+        assert_eq!(rows[2].trim_end(), "whoami");
+        assert_eq!(rows[3].trim_end(), "adam");
+    }
+
+    #[test]
+    fn cut_line_logic_keeps_multiple_prompts_but_not_trailing_prompt() {
+        let mut parser = vt100::Parser::new(20, 120, 0);
+        parser.process(
+            b"prompt$ ls\r\nfile1\r\nprompt$ whoami\r\nadam\r\nprompt$ echo ''\r\n\r\nprompt$ echo '__TERMSHOT__'\r\n__TERMSHOT__\r\nprompt$ ",
+        );
+
+        let screen = parser.screen();
+        let rows: Vec<String> = screen.rows(0, 120).collect();
+        let cut_line = rows.iter().position(|line| {
+            line.contains("echo '__TERMSHOT__'") || line.trim_end().ends_with("echo ''")
+        });
+
+        assert_eq!(cut_line, Some(4));
+
+        let rebuilt = rebuild_raw_from_screen(screen, cut_line.unwrap(), 20, 120);
+        let mut reparsed = vt100::Parser::new(20, 120, 0);
+        reparsed.process(&rebuilt);
+        let rebuilt_rows: Vec<String> = reparsed.screen().rows(0, 120).collect();
+
+        assert_eq!(rebuilt_rows[0].trim_end(), "prompt$ ls");
+        assert_eq!(rebuilt_rows[1].trim_end(), "file1");
+        assert_eq!(rebuilt_rows[2].trim_end(), "prompt$ whoami");
+        assert_eq!(rebuilt_rows[3].trim_end(), "adam");
+        assert!(rebuilt_rows.iter().all(|r| !r.contains("__TERMSHOT__")));
+        assert!(rebuilt_rows
+            .iter()
+            .all(|r| !r.trim_end().ends_with("echo ''")));
+    }
 }

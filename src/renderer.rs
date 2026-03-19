@@ -1,4 +1,4 @@
-use crate::config::ThemeConfig;
+use crate::config::{ChromeConfig, ThemeConfig};
 use anyhow::{Context, Result};
 use fontdue::{Font, FontSettings};
 use image::{ImageBuffer, Rgba, RgbaImage};
@@ -12,6 +12,31 @@ pub struct Theme {
     pub foreground: Rgba<u8>,
     pub background: Rgba<u8>,
     pub palette: [Rgba<u8>; 16],
+}
+
+#[derive(Debug, Clone)]
+pub struct ChromeOptions {
+    pub enabled: bool,
+    pub preset: String,
+    pub title: Option<String>,
+    pub shadow: bool,
+    pub radius: u32,
+    pub outer_padding: u32,
+    pub title_bar_height: u32,
+}
+
+impl ChromeOptions {
+    pub fn from_config(config: &ChromeConfig) -> Self {
+        Self {
+            enabled: config.enabled && config.preset != "none",
+            preset: config.preset.clone(),
+            title: config.title.clone(),
+            shadow: config.shadow,
+            radius: config.radius,
+            outer_padding: config.outer_padding,
+            title_bar_height: config.title_bar_height,
+        }
+    }
 }
 
 impl Theme {
@@ -74,6 +99,7 @@ pub struct Renderer {
     cell_height: u32,
     themes: HashMap<String, Theme>,
     default_theme: String,
+    default_chrome: ChromeOptions,
     padding: u32,
 }
 
@@ -83,6 +109,7 @@ impl Renderer {
         font_size: f32,
         theme_configs: &HashMap<String, ThemeConfig>,
         default_theme: &str,
+        chrome_config: &ChromeConfig,
     ) -> Result<Self> {
         let font_data = std::fs::read(font_path)
             .with_context(|| format!("Failed to read font: {:?}", font_path))?;
@@ -116,6 +143,7 @@ impl Renderer {
             cell_height,
             themes,
             default_theme: default_theme.to_string(),
+            default_chrome: ChromeOptions::from_config(chrome_config),
             padding: 16,
         })
     }
@@ -146,6 +174,7 @@ impl Renderer {
         rows: u16,
         output_dir: &Path,
         theme_name: Option<&str>,
+        chrome: Option<&ChromeOptions>,
     ) -> Result<(PathBuf, String)> {
         let mut parser = vt100::Parser::new(rows, cols, 0);
         parser.process(data);
@@ -157,7 +186,12 @@ impl Renderer {
             .trim_end()
             .to_string();
         let theme = self.get_theme(theme_name);
-        let image = self.render_screen(screen, theme)?;
+        let terminal_image = self.render_screen(screen, theme)?;
+        let image = self.compose_with_chrome(
+            terminal_image,
+            theme,
+            chrome.unwrap_or(&self.default_chrome),
+        );
 
         let id = &uuid::Uuid::new_v4().to_string()[..8];
         let filename = format!("termshot_{}.png", id);
@@ -206,6 +240,256 @@ impl Renderer {
         }
 
         Ok(img)
+    }
+
+    fn compose_with_chrome(
+        &self,
+        terminal: RgbaImage,
+        theme: &Theme,
+        chrome: &ChromeOptions,
+    ) -> RgbaImage {
+        if !chrome.enabled {
+            return terminal;
+        }
+
+        let title_bar = match chrome.preset.as_str() {
+            "minimal" => 0,
+            _ => chrome.title_bar_height,
+        };
+        let shadow = if chrome.shadow { 16 } else { 0 };
+        let frame_pad = chrome.outer_padding;
+
+        let width = terminal.width() + frame_pad * 2 + shadow;
+        let height = terminal.height() + frame_pad * 2 + title_bar + shadow;
+
+        let mut img: RgbaImage = ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0]));
+
+        let frame_x = 0;
+        let frame_y = 0;
+        let frame_w = width - shadow;
+        let frame_h = height - shadow;
+
+        if chrome.shadow {
+            self.draw_shadow(&mut img, 8, 8, frame_w, frame_h, chrome.radius);
+        }
+
+        let frame_bg = match chrome.preset.as_str() {
+            "macos" => Rgba([28, 28, 30, 255]),
+            "report" => Rgba([18, 20, 24, 255]),
+            _ => theme.background,
+        };
+        self.draw_rounded_rect(
+            &mut img,
+            frame_x,
+            frame_y,
+            frame_w,
+            frame_h,
+            chrome.radius,
+            frame_bg,
+        );
+
+        if title_bar > 0 {
+            let title_bg = match chrome.preset.as_str() {
+                "macos" => Rgba([44, 44, 46, 255]),
+                "gnome" => Rgba([32, 34, 39, 255]),
+                "report" => Rgba([30, 32, 36, 255]),
+                _ => Rgba([
+                    theme.background[0].saturating_add(10),
+                    theme.background[1].saturating_add(10),
+                    theme.background[2].saturating_add(10),
+                    255,
+                ]),
+            };
+            self.draw_rect(&mut img, frame_x, frame_y, frame_w, title_bar, title_bg);
+            self.draw_title_bar_accents(&mut img, chrome, frame_w, title_bar, theme);
+            if let Some(title) = chrome.title.as_deref() {
+                self.draw_text_line(
+                    &mut img,
+                    frame_w / 2,
+                    title_bar / 2,
+                    title,
+                    theme.foreground,
+                    true,
+                );
+            }
+        }
+
+        let term_x = frame_pad;
+        let term_y = frame_pad + title_bar;
+        for y in 0..terminal.height() {
+            for x in 0..terminal.width() {
+                let px = terminal.get_pixel(x, y);
+                img.put_pixel(term_x + x, term_y + y, *px);
+            }
+        }
+
+        img
+    }
+
+    fn draw_shadow(&self, img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, radius: u32) {
+        for layer in 0..12u32 {
+            let alpha = 24u8.saturating_sub((layer * 2) as u8);
+            let color = Rgba([0, 0, 0, alpha]);
+            self.draw_rounded_rect(img, x + layer, y + layer, w, h, radius, color);
+        }
+    }
+
+    fn draw_rounded_rect(
+        &self,
+        img: &mut RgbaImage,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        radius: u32,
+        color: Rgba<u8>,
+    ) {
+        let r = radius.min(w / 2).min(h / 2) as i32;
+        for py in y..y + h {
+            for px in x..x + w {
+                let dx = if px < x + radius {
+                    (x + radius) as i32 - px as i32
+                } else if px >= x + w - radius {
+                    px as i32 - (x + w - radius - 1) as i32
+                } else {
+                    0
+                };
+                let dy = if py < y + radius {
+                    (y + radius) as i32 - py as i32
+                } else if py >= y + h - radius {
+                    py as i32 - (y + h - radius - 1) as i32
+                } else {
+                    0
+                };
+                if dx == 0 || dy == 0 || dx * dx + dy * dy <= r * r {
+                    if px < img.width() && py < img.height() {
+                        img.put_pixel(px, py, color);
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_title_bar_accents(
+        &self,
+        img: &mut RgbaImage,
+        chrome: &ChromeOptions,
+        width: u32,
+        title_bar_height: u32,
+        theme: &Theme,
+    ) {
+        match chrome.preset.as_str() {
+            "macos" => {
+                let colors = [
+                    Rgba([255, 95, 86, 255]),
+                    Rgba([255, 189, 46, 255]),
+                    Rgba([39, 201, 63, 255]),
+                ];
+                for (i, color) in colors.into_iter().enumerate() {
+                    self.draw_circle(img, 18 + (i as u32 * 16), title_bar_height / 2, 5, color);
+                }
+            }
+            "gnome" => {
+                self.draw_rect(
+                    img,
+                    16,
+                    title_bar_height / 2 - 1,
+                    52,
+                    2,
+                    Rgba([255, 255, 255, 30]),
+                );
+            }
+            "report" => {
+                self.draw_rect(
+                    img,
+                    0,
+                    title_bar_height.saturating_sub(1),
+                    width,
+                    1,
+                    Rgba([255, 255, 255, 20]),
+                );
+            }
+            _ => {
+                let accent = Rgba([
+                    theme.foreground[0],
+                    theme.foreground[1],
+                    theme.foreground[2],
+                    18,
+                ]);
+                self.draw_rect(img, 0, title_bar_height.saturating_sub(1), width, 1, accent);
+            }
+        }
+    }
+
+    fn draw_circle(&self, img: &mut RgbaImage, cx: u32, cy: u32, r: u32, color: Rgba<u8>) {
+        let r = r as i32;
+        for y in (cy as i32 - r)..=(cy as i32 + r) {
+            for x in (cx as i32 - r)..=(cx as i32 + r) {
+                let dx = x - cx as i32;
+                let dy = y - cy as i32;
+                if dx * dx + dy * dy <= r * r && x >= 0 && y >= 0 {
+                    let x = x as u32;
+                    let y = y as u32;
+                    if x < img.width() && y < img.height() {
+                        img.put_pixel(x, y, color);
+                    }
+                }
+            }
+        }
+    }
+
+    fn draw_text_line(
+        &self,
+        img: &mut RgbaImage,
+        center_x: u32,
+        center_y: u32,
+        text: &str,
+        color: Rgba<u8>,
+        compact: bool,
+    ) {
+        let size = if compact {
+            self.font_size * 0.85
+        } else {
+            self.font_size
+        };
+        let total_width: i32 = text
+            .chars()
+            .map(|ch| self.font.metrics(ch, size).advance_width.ceil() as i32)
+            .sum();
+        let mut cursor_x = center_x as i32 - (total_width / 2);
+        for ch in text.chars() {
+            let (metrics, bitmap) = self.font.rasterize(ch, size);
+            let glyph_y = center_y as i32 - (metrics.height as i32 / 2);
+            for gy in 0..metrics.height {
+                for gx in 0..metrics.width {
+                    let alpha = bitmap[gy * metrics.width + gx];
+                    if alpha == 0 {
+                        continue;
+                    }
+                    let px = cursor_x + metrics.xmin + gx as i32;
+                    let py = glyph_y + gy as i32;
+                    if px >= 0 && py >= 0 {
+                        let px = px as u32;
+                        let py = py as u32;
+                        if px < img.width() && py < img.height() {
+                            let bg = img.get_pixel(px, py);
+                            let a = alpha as f32 / 255.0;
+                            img.put_pixel(
+                                px,
+                                py,
+                                Rgba([
+                                    (color[0] as f32 * a + bg[0] as f32 * (1.0 - a)) as u8,
+                                    (color[1] as f32 * a + bg[1] as f32 * (1.0 - a)) as u8,
+                                    (color[2] as f32 * a + bg[2] as f32 * (1.0 - a)) as u8,
+                                    255,
+                                ]),
+                            );
+                        }
+                    }
+                }
+            }
+            cursor_x += self.font.metrics(ch, size).advance_width.ceil() as i32;
+        }
     }
 
     fn find_content_rows(&self, screen: &Screen, rows: u32, cols: u32) -> u32 {
@@ -337,5 +621,70 @@ impl Renderer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chrome_options_from_config_respects_enabled_and_preset() {
+        let config = ChromeConfig {
+            enabled: true,
+            preset: "gnome".to_string(),
+            title: Some("demo".to_string()),
+            shadow: true,
+            radius: 12,
+            outer_padding: 20,
+            title_bar_height: 30,
+        };
+
+        let options = ChromeOptions::from_config(&config);
+        assert!(options.enabled);
+        assert_eq!(options.preset, "gnome");
+        assert_eq!(options.title.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn compose_with_chrome_increases_canvas_size() {
+        let renderer = Renderer {
+            font: Font::from_bytes(
+                std::fs::read("fonts/JetBrainsMono-Regular.ttf").expect("font present"),
+                FontSettings::default(),
+            )
+            .expect("font parse"),
+            font_size: 16.0,
+            cell_width: 8,
+            cell_height: 16,
+            themes: HashMap::new(),
+            default_theme: "dark".to_string(),
+            default_chrome: ChromeOptions {
+                enabled: false,
+                preset: "none".to_string(),
+                title: None,
+                shadow: true,
+                radius: 14,
+                outer_padding: 18,
+                title_bar_height: 34,
+            },
+            padding: 16,
+        };
+
+        let terminal = ImageBuffer::from_pixel(100, 50, Rgba([10, 10, 10, 255]));
+        let theme = Theme::dark();
+        let chrome = ChromeOptions {
+            enabled: true,
+            preset: "gnome".to_string(),
+            title: Some("demo".to_string()),
+            shadow: true,
+            radius: 14,
+            outer_padding: 18,
+            title_bar_height: 34,
+        };
+
+        let result = renderer.compose_with_chrome(terminal, &theme, &chrome);
+        assert!(result.width() > 100);
+        assert!(result.height() > 50);
     }
 }

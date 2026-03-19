@@ -23,6 +23,8 @@ pub struct ConfigFile {
     pub shell: Option<String>,
     /// Name of the default theme to use.
     pub default_theme: String,
+    /// Default chrome settings.
+    pub chrome: ChromeConfig,
     /// Custom theme definitions (keyed by name).
     pub themes: HashMap<String, ThemeConfig>,
 }
@@ -38,7 +40,34 @@ impl Default for ConfigFile {
             timeout_secs: 30,
             shell: None,
             default_theme: "dark".to_string(),
+            chrome: ChromeConfig::default(),
             themes: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChromeConfig {
+    pub enabled: bool,
+    pub preset: String,
+    pub title: Option<String>,
+    pub shadow: bool,
+    pub radius: u32,
+    pub outer_padding: u32,
+    pub title_bar_height: u32,
+}
+
+impl Default for ChromeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            preset: "none".to_string(),
+            title: None,
+            shadow: true,
+            radius: 14,
+            outer_padding: 18,
+            title_bar_height: 34,
         }
     }
 }
@@ -65,6 +94,7 @@ pub struct Config {
     pub default_timeout_secs: u64,
     pub shell: String,
     pub default_theme: String,
+    pub chrome: ChromeConfig,
     pub themes: HashMap<String, ThemeConfig>,
 }
 
@@ -135,6 +165,12 @@ impl Config {
         let default_theme =
             std::env::var("SCREENSHOT_MCP_THEME").unwrap_or(file_config.default_theme);
 
+        let mut chrome = file_config.chrome;
+        if let Ok(preset) = std::env::var("SCREENSHOT_MCP_CHROME") {
+            chrome.enabled = preset != "none";
+            chrome.preset = preset;
+        }
+
         std::fs::create_dir_all(&output_dir)?;
 
         Ok(Self {
@@ -146,6 +182,7 @@ impl Config {
             default_timeout_secs,
             shell,
             default_theme,
+            chrome,
             themes: file_config.themes,
         })
     }

@@ -1,15 +1,10 @@
 use crate::config::Config;
 use crate::executor;
-use crate::renderer::Renderer;
+use crate::renderer::{ChromeOptions, Renderer};
 use rmcp::{
-    handler::server::router::tool::ToolRouter,
-    handler::server::wrapper::Parameters,
-    model::*,
-    schemars, tool, tool_handler, tool_router,
-    service::ServiceExt,
-    transport::io::stdio,
-    ErrorData as McpError,
-    ServerHandler,
+    handler::server::router::tool::ToolRouter, handler::server::wrapper::Parameters, model::*,
+    schemars, service::ServiceExt, tool, tool_handler, tool_router, transport::io::stdio,
+    ErrorData as McpError, ServerHandler,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -43,6 +38,19 @@ pub struct ExecuteAndScreenshotParams {
     /// Theme name for rendering. Uses default theme from config if not specified.
     #[serde(default)]
     pub theme: Option<String>,
+
+    /// Optional list of commands. If provided, each command is executed on its
+    /// own line and receives its own PS1 prompt. If omitted, `command` is used.
+    #[serde(default)]
+    pub commands: Option<Vec<String>>,
+
+    /// Chrome preset: none, minimal, gnome, macos, report.
+    #[serde(default)]
+    pub chrome: Option<String>,
+
+    /// Optional chrome title.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -61,6 +69,14 @@ pub struct RenderAnsiParams {
     /// Theme name for rendering. Uses default theme from config if not specified.
     #[serde(default)]
     pub theme: Option<String>,
+
+    /// Chrome preset: none, minimal, gnome, macos, report.
+    #[serde(default)]
+    pub chrome: Option<String>,
+
+    /// Optional chrome title.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Clone)]
@@ -99,16 +115,22 @@ impl ScreenshotServer {
         let cols = params.cols.unwrap_or(self.config.default_cols);
         let rows = params.rows.unwrap_or(self.config.default_rows);
         let timeout = Duration::from_secs(
-            params.timeout_secs.unwrap_or(self.config.default_timeout_secs),
+            params
+                .timeout_secs
+                .unwrap_or(self.config.default_timeout_secs),
         );
         let show_prompt = params.show_prompt.unwrap_or(true);
+        let commands = params
+            .commands
+            .unwrap_or_else(|| vec![params.command.clone()]);
+        let command_refs: Vec<&str> = commands.iter().map(|s| s.as_str()).collect();
+        let chrome_options = chrome_options_from_params(&self.config, params.chrome, params.title);
 
         let result = if show_prompt {
-            executor::execute_command(&[params.command.as_str()], &self.config.shell, rows, cols, timeout)
-                .await
+            executor::execute_command(&command_refs, &self.config.shell, rows, cols, timeout).await
         } else {
             executor::execute_command_simple(
-                &params.command,
+                &commands.join(" "),
                 &self.config.shell,
                 rows,
                 cols,
@@ -130,6 +152,7 @@ impl ScreenshotServer {
                 rows,
                 &self.config.output_dir,
                 theme_name,
+                chrome_options.as_ref(),
             )
             .map_err(|e| McpError::internal_error(format!("Rendering failed: {}", e), None))?;
 
@@ -162,6 +185,7 @@ impl ScreenshotServer {
         let cols = params.cols.unwrap_or(self.config.default_cols);
         let rows = params.rows.unwrap_or(self.config.default_rows);
         let theme_name = params.theme.as_deref();
+        let chrome_options = chrome_options_from_params(&self.config, params.chrome, params.title);
 
         let data = std::fs::read(&params.input_path).map_err(|e| {
             McpError::internal_error(
@@ -172,7 +196,14 @@ impl ScreenshotServer {
 
         let (image_path, plain_text) = self
             .renderer
-            .render_bytes(&data, cols, rows, &self.config.output_dir, theme_name)
+            .render_bytes(
+                &data,
+                cols,
+                rows,
+                &self.config.output_dir,
+                theme_name,
+                chrome_options.as_ref(),
+            )
             .map_err(|e| McpError::internal_error(format!("Rendering failed: {}", e), None))?;
 
         Ok(CallToolResult::success(vec![
@@ -203,4 +234,23 @@ pub async fn run_mcp_server(config: Config, renderer: Renderer) -> anyhow::Resul
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+fn chrome_options_from_params(
+    config: &Config,
+    chrome: Option<String>,
+    title: Option<String>,
+) -> Option<ChromeOptions> {
+    if chrome.is_none() && title.is_none() {
+        return None;
+    }
+    let mut options = ChromeOptions::from_config(&config.chrome);
+    if let Some(preset) = chrome {
+        options.enabled = preset != "none";
+        options.preset = preset;
+    }
+    if title.is_some() {
+        options.title = title;
+    }
+    Some(options)
 }

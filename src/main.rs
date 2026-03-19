@@ -5,7 +5,7 @@ mod server;
 
 use clap::{Parser, Subcommand};
 use config::Config;
-use renderer::Renderer;
+use renderer::{ChromeOptions, Renderer};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -56,6 +56,14 @@ enum Commands {
         #[arg(long)]
         theme: Option<String>,
 
+        /// Chrome preset: none, minimal, gnome, macos, report
+        #[arg(long)]
+        chrome: Option<String>,
+
+        /// Optional chrome title
+        #[arg(long)]
+        title: Option<String>,
+
         /// Output file path (default: auto-generated in output dir)
         #[arg(short, long)]
         output: Option<String>,
@@ -77,6 +85,14 @@ enum Commands {
         /// Theme name
         #[arg(long)]
         theme: Option<String>,
+
+        /// Chrome preset: none, minimal, gnome, macos, report
+        #[arg(long)]
+        chrome: Option<String>,
+
+        /// Optional chrome title
+        #[arg(long)]
+        title: Option<String>,
 
         /// Output file path
         #[arg(short, long)]
@@ -109,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
                 config.font_size,
                 &config.themes,
                 &config.default_theme,
+                &config.chrome,
             )?;
             server::run_mcp_server(config, renderer).await?;
         }
@@ -119,6 +136,8 @@ async fn main() -> anyhow::Result<()> {
             timeout,
             no_prompt,
             theme,
+            chrome,
+            title,
             output,
         } => {
             let renderer = Renderer::new(
@@ -126,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
                 config.font_size,
                 &config.themes,
                 &config.default_theme,
+                &config.chrome,
             )?;
 
             let timeout = Duration::from_secs(timeout);
@@ -143,12 +163,14 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let theme_name = theme.as_deref();
+            let chrome_options = chrome_options_from_args(&config, chrome, title);
             let (image_path, plain_text) = renderer.render_bytes(
                 &exec_result.raw_output,
                 cols,
                 rows,
                 &config.output_dir,
                 theme_name,
+                chrome_options.as_ref(),
             )?;
 
             // If user specified an output path, move the file there
@@ -180,6 +202,8 @@ async fn main() -> anyhow::Result<()> {
             cols,
             rows,
             theme,
+            chrome,
+            title,
             output,
         } => {
             let renderer = Renderer::new(
@@ -187,12 +211,20 @@ async fn main() -> anyhow::Result<()> {
                 config.font_size,
                 &config.themes,
                 &config.default_theme,
+                &config.chrome,
             )?;
 
             let data = std::fs::read(&input)?;
             let theme_name = theme.as_deref();
-            let (image_path, plain_text) =
-                renderer.render_bytes(&data, cols, rows, &config.output_dir, theme_name)?;
+            let chrome_options = chrome_options_from_args(&config, chrome, title);
+            let (image_path, plain_text) = renderer.render_bytes(
+                &data,
+                cols,
+                rows,
+                &config.output_dir,
+                theme_name,
+                chrome_options.as_ref(),
+            )?;
 
             let final_path = if let Some(out) = output {
                 let out = std::path::PathBuf::from(&out);
@@ -212,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
                 config.font_size,
                 &config.themes,
                 &config.default_theme,
+                &config.chrome,
             )?;
             let names = renderer.theme_names();
             let default = &config.default_theme;
@@ -226,4 +259,24 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn chrome_options_from_args(
+    config: &Config,
+    chrome: Option<String>,
+    title: Option<String>,
+) -> Option<ChromeOptions> {
+    if chrome.is_none() && title.is_none() {
+        return None;
+    }
+
+    let mut options = ChromeOptions::from_config(&config.chrome);
+    if let Some(preset) = chrome {
+        options.enabled = preset != "none";
+        options.preset = preset;
+    }
+    if title.is_some() {
+        options.title = title;
+    }
+    Some(options)
 }

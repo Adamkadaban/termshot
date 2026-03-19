@@ -1,0 +1,29 @@
+output_dir = "/tmp/screenshot-mcp"
+font_size = 16.0
+cols = 120
+rows = 40
+timeout_secs = 30
+default_theme = "adamkadaban"
+
+[chrome]
+enabled = false
+preset = "none"
+title = "termshot"
+shadow = true
+radius = 14
+outer_padding = 18
+title_bar_height = 34
+
+# Optional overrides
+# font_path = "/path/to/your/monospace.ttf"
+# shell = "/bin/bash"
+
+[themes.report]
+foreground = "#e6edf3"
+background = "#0d1117"
+palette = [
+  "#0d1117", "#ff7b72", "#3fb950", "#d29922",
+  "#58a6ff", "#bc8cff", "#39c5cf", "#b1bac4",
+  "#484f58", "#ffa198", "#56d364", "#e3b341",
+  "#79c0ff", "#d2a8ff", "#56d4dd", "#f0f6fc",
+]
