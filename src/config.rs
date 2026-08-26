@@ -178,10 +178,10 @@ impl Config {
         // Create the config directory and default config/theme files the first
         // time termshot runs (only for the default location, never when the
         // user explicitly points at a config file).
-        if config_path.is_none() {
-            if let Err(e) = bootstrap_defaults(&config_dir) {
-                tracing::warn!("Failed to write default config files: {}", e);
-            }
+        if config_path.is_none()
+            && let Err(e) = bootstrap_defaults(&config_dir)
+        {
+            tracing::warn!("Failed to write default config files: {}", e);
         }
 
         // Start with defaults

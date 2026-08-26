@@ -163,8 +163,7 @@ pub fn explicit_request_is_blocked(cfg: &RedactionConfig, redact: bool, no_redac
 }
 
 /// Error message for a blocked explicit request, shared by the CLI and MCP.
-pub const REDACTION_DISABLED_MSG: &str =
-    "redaction was requested but is disabled in config ([redaction] enabled = false); \
+pub const REDACTION_DISABLED_MSG: &str = "redaction was requested but is disabled in config ([redaction] enabled = false); \
      set enabled = true to use --redact / redact: true";
 
 /// A compiled rule ready to match against terminal text.
@@ -395,23 +394,23 @@ impl RedactionEngine {
 
         for (line, positions) in logical_lines(screen) {
             for rule in &self.rules {
-                if let Some(names) = only {
-                    if !names.iter().any(|n| n == &rule.name) {
-                        continue;
-                    }
+                if let Some(names) = only
+                    && !names.iter().any(|n| n == &rule.name)
+                {
+                    continue;
                 }
 
                 for (start, end) in rule.match_spans(&line) {
                     let matched = &line[start..end];
-                    if let Some(skip) = rule.skip {
-                        if skip(matched) {
-                            continue;
-                        }
+                    if let Some(skip) = rule.skip
+                        && skip(matched)
+                    {
+                        continue;
                     }
-                    if let Some(threshold) = rule.min_entropy {
-                        if shannon_entropy(matched) < threshold {
-                            continue;
-                        }
+                    if let Some(threshold) = rule.min_entropy
+                        && shannon_entropy(matched) < threshold
+                    {
+                        continue;
                     }
 
                     // Collect the distinct cells this match covers, which may

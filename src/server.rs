@@ -1,17 +1,17 @@
 use crate::config::Config;
 use crate::executor;
 use crate::redaction::{
-    explicit_request_is_blocked, resolve_should_redact, RedactionEngine, RedactionMap,
-    RedactionRuleConfig, REDACTION_DISABLED_MSG,
+    REDACTION_DISABLED_MSG, RedactionEngine, RedactionMap, RedactionRuleConfig,
+    explicit_request_is_blocked, resolve_should_redact,
 };
 use crate::renderer::{
-    fallback_output_name, ChromeOptions, ComposeLayout, RedactionRequest, RenderMeta, Renderer,
-    TextOptions,
+    ChromeOptions, ComposeLayout, RedactionRequest, RenderMeta, Renderer, TextOptions,
+    fallback_output_name,
 };
 use rmcp::{
-    handler::server::router::tool::ToolRouter, handler::server::wrapper::Parameters, model::*,
-    schemars, service::ServiceExt, tool, tool_handler, tool_router, transport::io::stdio,
-    ErrorData as McpError, ServerHandler,
+    ErrorData as McpError, ServerHandler, handler::server::router::tool::ToolRouter,
+    handler::server::wrapper::Parameters, model::*, schemars, service::ServiceExt, tool,
+    tool_handler, tool_router, transport::io::stdio,
 };
 use serde::Deserialize;
 use std::collections::HashMap;

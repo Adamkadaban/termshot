@@ -581,11 +581,7 @@ pub fn read_png_description(path: &Path) -> Option<String> {
         .map_err(|e| tracing::debug!("Undecodable description in {:?}: {}", path, e))
         .ok()?;
     let text = text.trim_end_matches('\n').to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    if text.is_empty() { None } else { Some(text) }
 }
 
 /// Build the `Description` metadata for a composed image from the descriptions
@@ -1071,14 +1067,14 @@ impl Renderer {
         let redaction_map =
             redaction.map(|req| req.engine.redact_screen(screen, req.rules.as_deref()));
 
-        if let Some(map) = &redaction_map {
-            if !map.is_empty() {
-                tracing::info!(
-                    "redaction: masked {} cell(s) ({})",
-                    map.cell_count(),
-                    map.audit_summary()
-                );
-            }
+        if let Some(map) = &redaction_map
+            && !map.is_empty()
+        {
+            tracing::info!(
+                "redaction: masked {} cell(s) ({})",
+                map.cell_count(),
+                map.audit_summary()
+            );
         }
 
         let plain_text = self.output_text(data, screen, cols, redaction_map.as_ref(), text);
@@ -1228,12 +1224,11 @@ impl Renderer {
         redaction: Option<&RedactionMap>,
         opts: TextOptions,
     ) -> String {
-        if opts.redact_text {
-            if let Some(map) = redaction {
-                if !map.is_empty() {
-                    return map.redacted_plain_text(screen);
-                }
-            }
+        if opts.redact_text
+            && let Some(map) = redaction
+            && !map.is_empty()
+        {
+            return map.redacted_plain_text(screen);
         }
         if opts.strip_ansi {
             screen
@@ -1265,10 +1260,10 @@ impl Renderer {
         if !opts.embed_description {
             return None;
         }
-        if let Some(map) = redaction {
-            if !map.is_empty() {
-                return Some(map.redacted_plain_text(screen));
-            }
+        if let Some(map) = redaction
+            && !map.is_empty()
+        {
+            return Some(map.redacted_plain_text(screen));
         }
         Some(
             screen

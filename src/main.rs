@@ -4,11 +4,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 use termshot::config::Config;
 use termshot::redaction::{
-    explicit_request_is_blocked, resolve_should_redact, RedactionEngine, REDACTION_DISABLED_MSG,
+    REDACTION_DISABLED_MSG, RedactionEngine, explicit_request_is_blocked, resolve_should_redact,
 };
 use termshot::renderer::{
-    fallback_output_name, ChromeOptions, ComposeLayout, FontSelection, RedactionRequest, Renderer,
-    TextOptions,
+    ChromeOptions, ComposeLayout, FontSelection, RedactionRequest, Renderer, TextOptions,
+    fallback_output_name,
 };
 use termshot::{executor, server};
 
@@ -387,10 +387,10 @@ async fn main() -> anyhow::Result<()> {
 
             if exec_result.timed_out {
                 eprintln!("(timed out)");
-            } else if let Some(code) = exec_result.exit_code {
-                if code != 0 {
-                    eprintln!("(exit {})", code);
-                }
+            } else if let Some(code) = exec_result.exit_code
+                && code != 0
+            {
+                eprintln!("(exit {})", code);
             }
         }
         Commands::Render {
