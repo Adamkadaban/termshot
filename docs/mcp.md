@@ -44,6 +44,12 @@ optional redaction audit, and the terminal text.
 - `redact`, `redaction_rules`, `redact_text`, `show_labels`: with `redact: true`
   (or `[redaction] auto = true`) the image is masked; the returned text keeps
   the original content unless `redact_text: true`.
+- `redactions`: manual redactions applied as the image is rendered - the same
+  regex-pattern and cell-range specifications `redact_screenshot` and the CLI's
+  `--redaction '<JSON>'` take, in one array. They mask the image even without
+  `redact`, compose with the built-in rules when `redact: true` (or
+  `redaction_rules`) is also set, and conflict with `redact: false`
+  (`invalid_params`, exactly as `--redaction` conflicts with `--no-redact`).
 - `output_name`: preferred way to name the file, for example `finding-01-sqli`.
 - `strip_ansi`: return text without ANSI color codes.
 
@@ -59,6 +65,15 @@ titles, and the trailing prompt are not part of it.
 ```json
 { "command": "cargo test", "tail_lines": 25,
   "output_name": "test-summary-after-fix" }
+```
+
+```json
+{ "command": "secretsdump.py corp.local/user@10.20.30.40",
+  "redactions": [
+    { "pattern": "[a-f0-9]{32}", "replacement": "HASH", "keep_prefix": 4,
+      "color": "#ff6600" }
+  ],
+  "output_name": "finding-02-hashes" }
 ```
 
 #### Viewport rows vs retained output
@@ -94,9 +109,9 @@ screen.
 ### `render_ansi`
 
 Renders a file of raw ANSI output to a PNG without executing anything. Takes
-`input_path` plus the same rendering, redaction, and `head_lines` / `tail_lines`
-parameters as `execute_and_screenshot`. A log taller than `rows` is rendered
-whole, not clipped to its last screenful.
+`input_path` plus the same rendering, redaction (including inline `redactions`),
+and `head_lines` / `tail_lines` parameters as `execute_and_screenshot`. A log
+taller than `rows` is rendered whole, not clipped to its last screenful.
 
 ```json
 { "input_path": "/var/log/scan.ansi", "theme": "dracula", "redact": true }
@@ -113,9 +128,12 @@ cell range (`row`, `col_start`, `col_end`, optional `label` and `color`).
 an unparseable color is rejected with an `invalid_params` error.
 
 These are the same specifications the CLI takes through its repeatable
-`--redaction '<JSON>'` option on `exec` and `render`, decoded by the same code,
-so a redaction behaves identically from either entry point. The schema
-`tools/list` publishes says exactly that: two mutually exclusive variants
+`--redaction '<JSON>'` option on `exec` and `render`, and the same ones
+`execute_and_screenshot` and `render_ansi` take inline in their own
+`redactions` array, decoded by the same code, so a redaction behaves
+identically from any entry point. The schema `tools/list` publishes says
+exactly that: every tool that takes redactions references one shared
+`ManualRedactionSpec` definition with two mutually exclusive variants
 (`oneOf`), each naming every field it accepts and refusing anything else
 (`additionalProperties: false`). See
 [redaction.md](./redaction.md#manual-redaction-cli-and-mcp).
@@ -172,6 +190,10 @@ and can wrap the result in one outer window frame. `layout` is `"horizontal"` or
 3. Call `redact_screenshot` with the returned screenshot path and the
    redactions you want. Use `keep_prefix` / `keep_suffix` to reveal only part of
    a value (see [redaction.md](./redaction.md#partial-redaction)).
+
+When you already know what to mask, skip the round trip: pass the same
+specifications as `redactions` on `execute_and_screenshot` / `render_ansi` and
+the image is never written unmasked.
 
 `redact_screenshot` works only on screenshots from the current server process.
 

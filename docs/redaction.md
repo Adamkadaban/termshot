@@ -118,9 +118,10 @@ the CLI and MCP:
 
 A manual redaction masks something the rules do not know about. The CLI takes
 one per repeatable `--redaction '<JSON>'` option on `exec` and `render`, and
-MCP takes a list of them in `redact_screenshot`'s `redactions`. Both decode the
-same JSON with the same code, so a specification behaves identically either
-way - same blocks, same labels, same audit names.
+MCP takes a list of them in `execute_and_screenshot`, `render_ansi`, and
+`redact_screenshot`'s `redactions`. All of them decode the same JSON with the
+same code, so a specification behaves identically either way - same blocks,
+same labels, same audit names, same pixels.
 
 A regex pattern, matched against every line the screenshot shows:
 
@@ -179,6 +180,27 @@ On the CLI:
   redaction.
 - Invalid JSON, an unknown field, an invalid regex, and an unparseable color
   are refused before the command runs.
+
+Over MCP, `execute_and_screenshot` and `render_ansi` take the same list inline:
+
+```json
+{
+  "command": "secretsdump.py corp.local/user@10.20.30.40",
+  "redactions": [
+    { "pattern": "[a-f0-9]{32}", "replacement": "HASH", "keep_prefix": 4,
+      "color": "#ff6600" }
+  ]
+}
+```
+
+The rules are the CLI's, point for point: the list applies in order (patterns
+first, then cell ranges), it masks the image even when `redact` is omitted,
+`redact: true` or `redaction_rules` runs the built-in rules alongside it, and
+`redact: false` with a non-empty list is an `invalid_params` error rather than
+an unredacted screenshot - the MCP spelling of `--redaction` conflicting with
+`--no-redact`. An invalid regex, color, or coordinate range is refused before
+the command runs. `redact_screenshot` is still there for what you only notice
+after reading the output.
 
 ## Selective redaction workflow
 

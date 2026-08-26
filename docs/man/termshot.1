@@ -183,9 +183,9 @@ the text keeps the original (unredacted) content.
 .BI \-\-redaction " JSON"
 Apply a manual redaction, given as JSON, on top of any rule\-based redaction.
 Repeatable; the specifications apply in the order given. Accepts exactly what
-the MCP
-.B redact_screenshot
-tool accepts: a regex pattern
+the MCP tools\(aq
+.B redactions
+accept: a regex pattern
 .RB ( pattern ,
 optional
 .BR replacement / label ,
@@ -522,9 +522,25 @@ option on
 and
 .BR render ;
 MCP takes a list of them in
+.BR execute_and_screenshot ,
+.BR render_ansi ,
+and
 .BR redact_screenshot .
-Both decode the same JSON with the same code, so a specification behaves
-identically either way.
+All of them decode the same JSON with the same code, so a specification behaves
+identically either way. Over MCP the inline
+.B redactions
+list follows the CLI rule for rule: it masks the image even when
+.B redact
+is omitted, composes with the built\-in rules when
+.B "redact: true"
+(or
+.BR redaction_rules )
+is also set, and conflicts with
+.B "redact: false"
+just as
+.B \-\-redaction
+conflicts with
+.BR \-\-no\-redact .
 .PP
 A regex pattern is
 .IR "{\(dqpattern\(dq: \(dq[a-f0-9]{32}\(dq, \(dqreplacement\(dq: \(dqHASH\(dq, \(dqkeep_prefix\(dq: 4}" :
@@ -576,6 +592,14 @@ or an explicit cell range
 .BR col_start ,
 .BR col_end ).
 The screenshot is re\-rendered in place from the in\-memory record.
+.PP
+When what to mask is known up front, pass the same list as
+.B redactions
+on
+.B execute_and_screenshot
+or
+.B render_ansi
+instead, and the PNG is never written unmasked.
 .SS Labels and colors
 Labels can be turned off with
 .B show_labels: false

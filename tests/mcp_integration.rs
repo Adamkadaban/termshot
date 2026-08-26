@@ -2520,3 +2520,691 @@ async fn the_1_0_0_redact_parameters_still_drive_the_tool() {
     assert!(!terminal.contains("10.20.30.40"), "{terminal}");
     assert!(!terminal.contains("secret"), "{terminal}");
 }
+
+// -------------------------------------------------------------------------
+// Inline manual redactions on execute_and_screenshot / render_ansi
+// -------------------------------------------------------------------------
+
+/// `execute_and_screenshot` parameters with everything at its default, so a
+/// test only spells out what it is about.
+fn exec_params(command: &str, output_name: &str) -> ExecuteAndScreenshotParams {
+    ExecuteAndScreenshotParams {
+        command: command.to_string(),
+        cols: Some(80),
+        rows: Some(10),
+        timeout_secs: Some(30),
+        show_prompt: Some(false),
+        theme: None,
+        commands: None,
+        chrome: None,
+        title: None,
+        timestamp: None,
+        rounded: None,
+        redact: None,
+        redaction_rules: None,
+        redactions: None,
+        redact_text: None,
+        show_labels: None,
+        strip_ansi: None,
+        output_name: Some(output_name.to_string()),
+        auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
+    }
+}
+
+/// `render_ansi` parameters with everything at its default.
+fn render_params(input_path: &Path, output_name: &str) -> RenderAnsiParams {
+    RenderAnsiParams {
+        input_path: input_path.display().to_string(),
+        cols: Some(80),
+        rows: Some(10),
+        theme: None,
+        chrome: None,
+        title: None,
+        timestamp: None,
+        rounded: None,
+        strip_ansi: None,
+        output_name: Some(output_name.to_string()),
+        auto_crop: None,
+        redact: None,
+        redaction_rules: None,
+        redactions: None,
+        redact_text: None,
+        show_labels: None,
+        head_lines: None,
+        tail_lines: None,
+    }
+}
+
+/// Write an ANSI capture file for `render_ansi`.
+fn ansi_file(dir: &Path, name: &str, contents: &str) -> PathBuf {
+    std::fs::create_dir_all(dir).expect("create dir");
+    let path = dir.join(name);
+    std::fs::write(&path, contents).expect("write ansi file");
+    path
+}
+
+/// Decode manual redaction specifications from the JSON an MCP client sends,
+/// through the same parser the tool schema describes.
+fn specs(json: &[&str]) -> Vec<ManualRedactionSpec> {
+    json.iter()
+        .map(|spec| ManualRedactionSpec::from_json(spec).expect("shared parser"))
+        .collect()
+}
+
+/// Every pixel painted in `color`.
+fn pixels_of_color(png: &Path, color: [u8; 3]) -> usize {
+    image::open(png)
+        .unwrap_or_else(|e| panic!("open {}: {e}", png.display()))
+        .to_rgba8()
+        .pixels()
+        .filter(|px| px[0] == color[0] && px[1] == color[1] && px[2] == color[2])
+        .count()
+}
+
+/// The `Redacted: ...` audit line of a tool result.
+fn audit_line(text: &str) -> String {
+    text.lines()
+        .find(|line| line.starts_with("Redacted: "))
+        .unwrap_or_else(|| panic!("no audit summary in:\n{}", text))
+        .to_string()
+}
+
+/// Test 1: an inline pattern on `execute_and_screenshot` masks the image
+/// without any `redact` flag, keeps its prefix, and paints its own color.
+#[tokio::test]
+async fn execute_applies_an_inline_pattern_with_keep_prefix_and_color() {
+    let dir = Path::new("target/mcp-int/inline-exec-pattern");
+    let server = make_server(dir);
+
+    let mut params = exec_params(
+        "printf 'hash 8846f7eaee8fb117ad06bdd830b7586c\\n'",
+        "inline-exec-pattern",
+    );
+    params.redactions = Some(specs(&[
+        r##"{"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_prefix":4,"color":"#ff6600"}"##,
+    ]));
+    params.redact_text = Some(true);
+
+    let result = server
+        .execute_and_screenshot(Parameters(params))
+        .await
+        .expect("inline redactions need no `redact` flag");
+    let text = result_text(&result);
+    let png = screenshot_path(&text);
+
+    assert_eq!(audit_line(&text), "Redacted: 1x custom_0");
+    assert!(
+        !text.contains("8846f7eaee8fb117ad06bdd830b7586c"),
+        "the returned text still leaks the hash:\n{text}"
+    );
+
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    assert!(
+        description.contains(&format!("8846{}", "\u{2588}".repeat(28))),
+        "the prefix should survive and the rest be masked: {description}"
+    );
+
+    assert!(
+        pixels_of_color(&png, [0xff, 0x66, 0x00]) > 0,
+        "the requested block color was never painted"
+    );
+    assert_eq!(
+        pixels_of_color(&png, [212, 25, 25]),
+        0,
+        "the default red was painted instead of the requested color"
+    );
+}
+
+/// Test 2: `render_ansi` takes the same specifications inline, including
+/// `keep_suffix`.
+#[tokio::test]
+async fn render_ansi_applies_an_inline_pattern_with_keep_suffix() {
+    let dir = Path::new("target/mcp-int/inline-render-pattern");
+    let input = ansi_file(
+        dir,
+        "suffix.ansi",
+        "hash 8846f7eaee8fb117ad06bdd830b7586c\n",
+    );
+    let server = make_server(dir);
+
+    let mut params = render_params(&input, "inline-render-pattern");
+    params.redactions = Some(specs(&[
+        r#"{"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_suffix":4}"#,
+    ]));
+    params.redact_text = Some(true);
+
+    let result = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect("render_ansi takes inline redactions");
+    let text = result_text(&result);
+    let png = screenshot_path(&text);
+
+    assert_eq!(audit_line(&text), "Redacted: 1x custom_0");
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    assert!(
+        description.contains(&format!("{}586c", "\u{2588}".repeat(28))),
+        "the suffix should survive and the rest be masked: {description}"
+    );
+    assert!(
+        !description.contains("8846f7eaee8fb117ad06bdd830b7586c"),
+        "the description still leaks the hash: {description}"
+    );
+}
+
+/// Test 3: several specifications apply in one call, in order - patterns first,
+/// then cell ranges, each with its own label and color.
+#[tokio::test]
+async fn inline_redactions_apply_several_specs_in_one_call() {
+    let dir = Path::new("target/mcp-int/inline-multiple");
+    let input = ansi_file(
+        dir,
+        "multi.ansi",
+        "host 10.20.30.40 key AKIAIOSFODNN7EXAMPLE\nhash 8846f7eaee8fb117ad06bdd830b7586c\n",
+    );
+    let server = make_server(dir);
+
+    let mut params = render_params(&input, "inline-multiple");
+    params.redactions = Some(specs(&[
+        r#"{"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_prefix":4}"#,
+        r#"{"pattern":"AKIA[0-9A-Z]{16}","replacement":"AWS"}"#,
+        r##"{"row":0,"col_start":0,"col_end":4,"label":"SECRET","color":"#00ff00"}"##,
+    ]));
+    params.redact_text = Some(true);
+
+    let result = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect("render_ansi");
+    let text = result_text(&result);
+    let png = screenshot_path(&text);
+
+    assert_eq!(
+        audit_line(&text),
+        "Redacted: 1x custom_0, 1x custom_1, 1x manual:SECRET"
+    );
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    assert!(
+        !description.contains("AKIAIOSFODNN7EXAMPLE")
+            && !description.contains("8846f7eaee8fb117ad06bdd830b7586c"),
+        "a specification was dropped: {description}"
+    );
+    assert_eq!(
+        description.lines().next().unwrap(),
+        format!(
+            "{} 10.20.30.40 key {}",
+            "\u{2588}".repeat(4),
+            "\u{2588}".repeat(20)
+        ),
+        "the coordinate range should mask exactly the first four cells: {description}"
+    );
+    assert!(
+        pixels_of_color(&png, [0x00, 0xff, 0x00]) > 0,
+        "the coordinate redaction's own color was never painted"
+    );
+}
+
+/// Inline specifications compose with the built-in rules rather than replacing
+/// them: `redact: true` runs both.
+#[tokio::test]
+async fn inline_redactions_compose_with_the_builtin_rules() {
+    let dir = Path::new("target/mcp-int/inline-plus-rules");
+    let input = ansi_file(
+        dir,
+        "both.ansi",
+        "host 10.20.30.40\nhash 8846f7eaee8fb117ad06bdd830b7586c\n",
+    );
+    let server = make_server(dir);
+
+    let mut params = render_params(&input, "inline-plus-rules");
+    params.redact = Some(true);
+    params.redaction_rules = Some(vec!["ipv4".to_string()]);
+    params.redactions = Some(specs(&[
+        r#"{"pattern":"[a-f0-9]{32}","replacement":"HASH"}"#,
+    ]));
+    params.redact_text = Some(true);
+
+    let result = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect("render_ansi");
+    let text = result_text(&result);
+    let png = screenshot_path(&text);
+
+    let audit = audit_line(&text);
+    assert!(
+        audit.contains("1x ipv4") && audit.contains("1x custom_0"),
+        "rule-based and manual redactions must both run: {audit}"
+    );
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    assert!(
+        !description.contains("10.20.30.40")
+            && !description.contains("8846f7eaee8fb117ad06bdd830b7586c"),
+        "something went unmasked: {description}"
+    );
+}
+
+/// Test 4: a coordinate specification addresses the rendered image, and one
+/// outside it is refused with the dimensions it should have used.
+#[tokio::test]
+async fn inline_coordinates_are_validated_against_the_rendered_image() {
+    let dir = Path::new("target/mcp-int/inline-coordinates");
+    let input = ansi_file(dir, "coords.ansi", "alpha bravo\ncharlie delta\n");
+    let server = make_server(dir);
+
+    let mut params = render_params(&input, "inline-coordinates");
+    params.redactions = Some(specs(&[r#"{"row":1,"col_start":0,"col_end":7}"#]));
+    params.redact_text = Some(true);
+    let result = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect("an in-bounds range applies");
+    let text = result_text(&result);
+    let png = screenshot_path(&text);
+    assert_eq!(audit_line(&text), "Redacted: 1x manual:REDACTED");
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    assert_eq!(
+        description.lines().nth(1).unwrap(),
+        format!("{} delta", "\u{2588}".repeat(7)),
+        "the range should mask `charlie` only: {description}"
+    );
+
+    // The image renders three rows (two of content plus the cursor row), so
+    // row 3 is not addressable.
+    let mut params = render_params(&input, "inline-coordinates-oob");
+    params.redactions = Some(specs(&[r#"{"row":3,"col_start":0,"col_end":4}"#]));
+    let err = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect_err("a row past the rendered image must be refused");
+    let message = format!("{err}");
+    assert!(
+        message.contains("renders 3 row(s) x 13 column(s)"),
+        "the error must name the rendered bounds: {message}"
+    );
+
+    // A column past the auto-cropped width is refused the same way.
+    let mut params = render_params(&input, "inline-coordinates-wide");
+    params.redactions = Some(specs(&[r#"{"row":0,"col_start":0,"col_end":40}"#]));
+    let err = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect_err("a column past the cropped width must be refused");
+    assert!(
+        format!("{err}").contains("past the last rendered column"),
+        "unexpected error: {err}"
+    );
+
+    // An empty interval is refused the same way, before anything is drawn.
+    let mut params = render_params(&input, "inline-coordinates-empty");
+    params.redactions = Some(specs(&[r#"{"row":0,"col_start":4,"col_end":4}"#]));
+    let err = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect_err("an empty range must be refused");
+    assert!(
+        format!("{err}").contains("the range is empty"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Test 5: asking for manual masking and for redaction to be off at once is
+/// refused, exactly as the CLI refuses `--redaction` with `--no-redact`.
+#[tokio::test]
+async fn inline_redactions_conflict_with_redact_false() {
+    let dir = Path::new("target/mcp-int/inline-conflict");
+    let input = ansi_file(
+        dir,
+        "conflict.ansi",
+        "hash 8846f7eaee8fb117ad06bdd830b7586c\n",
+    );
+    let server = make_server(dir);
+
+    let inline = specs(&[r#"{"pattern":"[a-f0-9]{32}"}"#]);
+
+    let mut params = exec_params("printf 'hi\\n'", "inline-conflict-exec");
+    params.redact = Some(false);
+    params.redactions = Some(inline.clone());
+    let err = server
+        .execute_and_screenshot(Parameters(params))
+        .await
+        .expect_err("execute_and_screenshot must refuse the conflict");
+    let message = format!("{err}");
+    assert!(
+        message.contains("conflicts with `redact: false`"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("--no-redact"),
+        "the error should point at the CLI equivalent: {message}"
+    );
+
+    let mut params = render_params(&input, "inline-conflict-render");
+    params.redact = Some(false);
+    params.redactions = Some(inline);
+    let err = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect_err("render_ansi must refuse the conflict too");
+    assert!(
+        format!("{err}").contains("conflicts with `redact: false`"),
+        "unexpected error: {err}"
+    );
+
+    // Nothing to conflict with: an empty list leaves `redact: false` alone.
+    let mut params = render_params(&input, "inline-conflict-empty");
+    params.redact = Some(false);
+    params.redactions = Some(Vec::new());
+    let result = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect("an empty list is not a request to redact");
+    assert!(
+        !result_text(&result).contains("Redacted: "),
+        "nothing should have been redacted"
+    );
+}
+
+/// An invalid regex is refused before the command runs, not after.
+#[tokio::test]
+async fn an_invalid_inline_pattern_is_refused_before_execution() {
+    let dir = Path::new("target/mcp-int/inline-bad-regex");
+    let server = make_server(dir);
+    let marker = dir.join("ran.txt");
+    std::fs::create_dir_all(dir).expect("create dir");
+    std::fs::remove_file(&marker).ok();
+
+    let mut params = exec_params(&format!("touch {}", marker.display()), "inline-bad-regex");
+    params.redactions = Some(specs(&[r#"{"pattern":"([a-"}"#]));
+    let err = server
+        .execute_and_screenshot(Parameters(params))
+        .await
+        .expect_err("an invalid regex must be refused");
+    assert!(
+        format!("{err}").contains("invalid regex"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !marker.exists(),
+        "the command ran despite the invalid redaction"
+    );
+}
+
+/// `show_labels: false` draws plain blocks for inline redactions too.
+#[tokio::test]
+async fn inline_redactions_honor_show_labels() {
+    let dir = Path::new("target/mcp-int/inline-show-labels");
+    let input = ansi_file(
+        dir,
+        "labels.ansi",
+        "hash 8846f7eaee8fb117ad06bdd830b7586c\n",
+    );
+    let server = make_server(dir);
+
+    let mut labelled = render_params(&input, "inline-labels-on");
+    labelled.redactions = Some(specs(&[
+        r#"{"pattern":"[a-f0-9]{32}","replacement":"HASH"}"#,
+    ]));
+    let with_labels = screenshot_path(&result_text(
+        &server
+            .render_ansi(Parameters(labelled))
+            .await
+            .expect("render_ansi"),
+    ));
+
+    let mut plain = render_params(&input, "inline-labels-off");
+    plain.show_labels = Some(false);
+    plain.redactions = Some(specs(&[
+        r#"{"pattern":"[a-f0-9]{32}","replacement":"HASH"}"#,
+    ]));
+    let without_labels = screenshot_path(&result_text(
+        &server
+            .render_ansi(Parameters(plain))
+            .await
+            .expect("render_ansi"),
+    ));
+
+    assert!(
+        pixels_of_color(&without_labels, [212, 25, 25])
+            > pixels_of_color(&with_labels, [212, 25, 25]),
+        "a plain block should carry more block color than a labelled one"
+    );
+}
+
+/// Test 7: `tools/list` publishes `redactions` on the capture tools too,
+/// described by exactly the shared `ManualRedactionSpec` the redact tool
+/// publishes.
+#[test]
+fn the_capture_tools_publish_the_shared_redaction_schema() {
+    let reference = redaction_spec_definition("redact_screenshot");
+    for tool in ["execute_and_screenshot", "render_ansi"] {
+        let schema = tool_schema(tool);
+        let redactions = &schema["properties"]["redactions"];
+        assert_eq!(
+            redactions["type"],
+            serde_json::json!(["array", "null"]),
+            "'{tool}' does not publish `redactions` as an optional array: {redactions}"
+        );
+        assert_eq!(
+            redactions["items"]["$ref"], "#/$defs/ManualRedactionSpec",
+            "'{tool}' does not reference the shared specification: {redactions}"
+        );
+        assert_eq!(
+            redaction_spec_definition(tool),
+            reference,
+            "'{tool}' publishes a different specification than redact_screenshot"
+        );
+    }
+
+    // The shared definition itself: two mutually exclusive variants, each
+    // closed to anything it does not name.
+    let variants = reference["oneOf"]
+        .as_array()
+        .expect("the specification is a oneOf of its two variants");
+    assert_eq!(variants.len(), 2, "expected two variants: {reference}");
+    for (variant, fields, required) in [
+        (
+            &variants[0],
+            vec![
+                "color",
+                "keep_prefix",
+                "keep_suffix",
+                "label",
+                "pattern",
+                "replacement",
+            ],
+            vec!["pattern"],
+        ),
+        (
+            &variants[1],
+            vec!["col_end", "col_start", "color", "label", "row"],
+            vec!["row", "col_start", "col_end"],
+        ),
+    ] {
+        assert_eq!(
+            variant.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false)),
+            "a published variant accepts unknown fields: {variant}"
+        );
+        let published: Vec<&str> = variant["properties"]
+            .as_object()
+            .expect("properties is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(published, fields, "wrong fields in {variant}");
+        let published_required: Vec<&str> = variant["required"]
+            .as_array()
+            .expect("required is an array")
+            .iter()
+            .map(|value| value.as_str().expect("a field name"))
+            .collect();
+        assert_eq!(published_required, required, "wrong required in {variant}");
+    }
+}
+
+/// Test 8: the capture tools still refuse anything they do not publish - a
+/// stray top-level parameter, and an unknown field inside a redaction.
+#[test]
+fn inline_redactions_do_not_open_the_door_to_unknown_fields() {
+    // Known: a `redactions` array decodes through the shared parser.
+    serde_json::from_value::<ExecuteAndScreenshotParams>(serde_json::json!({
+        "command": "echo hi",
+        "redactions": [{"pattern": "[a-f0-9]{32}", "replacement": "HASH", "keep_prefix": 4,
+                        "color": "#ff6600"}],
+    }))
+    .expect("the live MCP request from the report must decode");
+    serde_json::from_value::<RenderAnsiParams>(serde_json::json!({
+        "input_path": "x.ansi",
+        "redactions": [{"row": 0, "col_start": 0, "col_end": 4, "label": "SECRET"}],
+    }))
+    .expect("render_ansi takes the same array");
+
+    // Unknown, at the top level and inside a specification.
+    for params in [
+        serde_json::json!({"command": "echo hi", "redaction": []}),
+        serde_json::json!({"command": "echo hi", "embed_description": false}),
+    ] {
+        assert!(
+            serde_json::from_value::<ExecuteAndScreenshotParams>(params.clone()).is_err(),
+            "execute_and_screenshot accepted unknown field: {params}"
+        );
+    }
+    for bad in [
+        serde_json::json!({"pattern": "x", "not_a_field": 1}),
+        serde_json::json!({"row": 0, "col_start": 0}),
+        serde_json::json!({"replacement": "TAG"}),
+    ] {
+        let err = serde_json::from_value::<ExecuteAndScreenshotParams>(serde_json::json!({
+            "command": "echo hi",
+            "redactions": [bad],
+        }))
+        .expect_err("a malformed redaction must be refused");
+        assert!(
+            !err.to_string().is_empty(),
+            "the error must explain the refusal"
+        );
+    }
+    assert!(
+        serde_json::from_value::<RenderAnsiParams>(serde_json::json!({
+            "input_path": "x.ansi",
+            "redactions": [{"row": 0, "col_start": 0, "col_end": 4, "nope": true}],
+        }))
+        .is_err(),
+        "render_ansi accepted an unknown redaction field"
+    );
+}
+
+/// The published input schema of one tool.
+fn tool_schema(name: &str) -> serde_json::Value {
+    let tool = ScreenshotServer::tool_definitions()
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .unwrap_or_else(|| panic!("{name} is published"));
+    serde_json::to_value(&tool.input_schema).expect("schema serializes")
+}
+
+/// The `ManualRedactionSpec` definition a tool's schema carries.
+fn redaction_spec_definition(name: &str) -> serde_json::Value {
+    tool_schema(name)["$defs"]["ManualRedactionSpec"].clone()
+}
+
+/// An inline pattern catches a secret split by a soft wrap, exactly as the
+/// CLI's `--redaction` does: the match is found on the capture, not on the
+/// drawn rows.
+#[tokio::test]
+async fn an_inline_pattern_catches_a_secret_split_by_a_soft_wrap() {
+    let dir = Path::new("target/mcp-int/inline-soft-wrap");
+    let server = make_server(dir);
+
+    // At 40 columns the hash crosses the right margin onto the next row.
+    let mut params = exec_params(
+        "printf 'padding padding padding hash 8846f7eaee8fb117ad06bdd830b7586c\\n'",
+        "inline-soft-wrap",
+    );
+    params.cols = Some(40);
+    params.redactions = Some(specs(&[r#"{"pattern":"[a-f0-9]{32}","keep_prefix":4}"#]));
+    params.redact_text = Some(true);
+
+    let result = server
+        .execute_and_screenshot(Parameters(params))
+        .await
+        .expect("exec");
+    let text = result_text(&result);
+    let png = screenshot_path(&text);
+    assert_eq!(audit_line(&text), "Redacted: 1x custom_0");
+
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    for leak in [
+        "8846f7eaee8fb117ad06bdd830b7586c",
+        "8846f7eaee8fb117ad06",
+        "bdd830b7586c",
+    ] {
+        assert!(
+            !description.contains(leak),
+            "the description still leaks {leak:?}: {description}"
+        );
+    }
+
+    // The mask reaches the right margin, so the wrapped half was covered too.
+    let width = image::open(&png).expect("open png").to_rgba8().width();
+    let pixels = redaction_pixels(&png);
+    assert!(!pixels.is_empty(), "no redaction block was painted");
+    assert!(
+        pixels.iter().any(|&(x, _)| x as f32 >= 0.75 * width as f32),
+        "no redaction ink near the right margin: the wrapped half was missed"
+    );
+}
+
+/// Inline coordinates follow a `head_lines` / `tail_lines` selection, the way
+/// the CLI's do: row 0 is the first row the image shows, and the bounds are the
+/// selection's.
+#[tokio::test]
+async fn inline_coordinates_follow_a_head_or_tail_selection() {
+    let dir = Path::new("target/mcp-int/inline-selection");
+    let content: String = (1..=300).map(|i| format!("line {}\n", i)).collect();
+    let input = ansi_file(dir, "many.ansi", &content);
+    let server = make_server(dir);
+
+    let mut params = render_params(&input, "inline-tail");
+    params.cols = Some(40);
+    params.tail_lines = Some(3);
+    params.redactions = Some(specs(&[r#"{"row":0,"col_start":0,"col_end":8}"#]));
+    params.redact_text = Some(true);
+    let result = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect("render_ansi");
+    let text = result_text(&result);
+    let png = screenshot_path(&text);
+    assert_eq!(audit_line(&text), "Redacted: 1x manual:REDACTED");
+
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    let lines: Vec<&str> = description.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "the tail selection renders 3 rows: {lines:?}"
+    );
+    assert_eq!(
+        lines[0],
+        "\u{2588}".repeat(8),
+        "row 0 must be the first tail row"
+    );
+    assert_eq!(lines[1], "line 299");
+
+    let mut params = render_params(&input, "inline-tail-oob");
+    params.cols = Some(40);
+    params.tail_lines = Some(3);
+    params.redactions = Some(specs(&[r#"{"row":3,"col_start":0,"col_end":4}"#]));
+    let err = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect_err("row 3 is past a three-row selection");
+    assert!(
+        format!("{err}").contains("renders 3 row(s) x 8 column(s)"),
+        "the bounds must describe the selection, not the capture: {err}"
+    );
+}

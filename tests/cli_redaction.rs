@@ -18,7 +18,9 @@ use rmcp::model::CallToolResult;
 use termshot::config::{ChromeConfig, Config, LoadedConfig, ThemeConfig};
 use termshot::redaction::{ManualRedactionSpec, RedactionConfig};
 use termshot::renderer::{FontSelection, Renderer, RendererOptions, read_png_description};
-use termshot::server::{RedactScreenshotRequest, RenderAnsiParams, ScreenshotServer};
+use termshot::server::{
+    ExecuteAndScreenshotParams, RedactScreenshotRequest, RenderAnsiParams, ScreenshotServer,
+};
 
 /// The `termshot` binary this test run built.
 const BIN: &str = env!("CARGO_BIN_EXE_termshot");
@@ -792,4 +794,288 @@ fn coordinates_follow_a_head_or_tail_selection() {
     let lines: Vec<&str> = head_description.lines().collect();
     assert_eq!(lines[0], "line 1");
     assert_eq!(lines[2], "\u{2588}".repeat(6));
+}
+
+// -------------------------------------------------------------------------
+// 11. Parity with the capture tools' inline `redactions`
+// -------------------------------------------------------------------------
+
+/// `execute_and_screenshot` / `render_ansi` parameters built for a parity
+/// comparison: chrome and timestamp off, fixed theme and geometry, so the only
+/// thing that can differ between the two entry points is the redaction.
+fn parity_render_params(
+    input: &Path,
+    output_name: &str,
+    redactions: Vec<ManualRedactionSpec>,
+) -> RenderAnsiParams {
+    RenderAnsiParams {
+        input_path: input.display().to_string(),
+        cols: Some(60),
+        rows: Some(8),
+        theme: Some("dark".to_string()),
+        chrome: Some("none".to_string()),
+        title: None,
+        timestamp: Some(false),
+        rounded: None,
+        strip_ansi: None,
+        output_name: Some(output_name.to_string()),
+        auto_crop: None,
+        redact: None,
+        redaction_rules: None,
+        redactions: Some(redactions),
+        redact_text: Some(true),
+        show_labels: None,
+        head_lines: None,
+        tail_lines: None,
+    }
+}
+
+/// The `Redacted: ...` line of a tool result.
+fn mcp_audit_line(text: &str) -> String {
+    text.lines()
+        .find(|line| line.starts_with("Redacted: "))
+        .unwrap_or_else(|| panic!("no audit summary in:\n{}", text))
+        .to_string()
+}
+
+/// The terminal text a tool result carries.
+fn mcp_terminal_text(text: &str) -> String {
+    text.split("--- Terminal Output ---")
+        .nth(1)
+        .expect("terminal output")
+        .trim()
+        .to_string()
+}
+
+/// The `--- Terminal Output ---` section the CLI prints to stderr.
+fn cli_terminal_text(stderr: &str) -> String {
+    stderr
+        .split("--- Terminal Output ---")
+        .nth(1)
+        .expect("terminal output")
+        .trim()
+        .to_string()
+}
+
+/// The same specifications, given to `termshot render --redaction` and to
+/// `render_ansi`'s inline `redactions`, produce the very same image: same
+/// pixels, same `Description` metadata, same audit, same returned text.
+#[tokio::test]
+async fn cli_render_matches_the_equivalent_inline_mcp_redactions() {
+    let case = Case::new("inline-parity-render");
+    let content =
+        "host 10.20.30.40 key AKIAIOSFODNN7EXAMPLE\nhash 8846f7eaee8fb117ad06bdd830b7586c\n";
+    let input = case.ansi_file("parity.ansi", content);
+
+    let json = [
+        r##"{"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_prefix":4,"color":"#ff6600"}"##,
+        r#"{"pattern":"AKIA[0-9A-Z]{16}","keep_suffix":4}"#,
+        r#"{"row":0,"col_start":0,"col_end":4,"label":"SECRET"}"#,
+    ];
+
+    let (cli_png, cli_stderr) = case.run_ok(&[
+        "render",
+        "--cols",
+        "60",
+        "--rows",
+        "8",
+        "--theme",
+        "dark",
+        "--chrome",
+        "none",
+        "--redact-text",
+        "--redaction",
+        json[0],
+        "--redaction",
+        json[1],
+        "--redaction",
+        json[2],
+        input.to_str().unwrap(),
+    ]);
+
+    let server = mcp_server(&case.dir.join("mcp"));
+    let redactions: Vec<ManualRedactionSpec> = json
+        .iter()
+        .map(|spec| ManualRedactionSpec::from_json(spec).expect("shared parser"))
+        .collect();
+    let result = server
+        .render_ansi(Parameters(parity_render_params(
+            &input, "parity", redactions,
+        )))
+        .await
+        .expect("render_ansi takes the same specifications inline");
+    let mcp_text = result_text(&result);
+    let mcp_png = PathBuf::from(
+        mcp_text
+            .lines()
+            .find_map(|l| l.strip_prefix("Screenshot saved to: "))
+            .expect("screenshot path")
+            .trim()
+            .to_string(),
+    );
+
+    assert_eq!(
+        audit_line(&cli_stderr),
+        mcp_audit_line(&mcp_text),
+        "audits differ"
+    );
+    assert_eq!(
+        description(&cli_png),
+        description(&mcp_png),
+        "the descriptions differ"
+    );
+    assert_eq!(
+        cli_terminal_text(&cli_stderr),
+        mcp_terminal_text(&mcp_text),
+        "the returned texts differ"
+    );
+
+    let cli_pixels = image::open(&cli_png).unwrap().to_rgba8();
+    let mcp_pixels = image::open(&mcp_png).unwrap().to_rgba8();
+    assert_eq!(cli_pixels.dimensions(), mcp_pixels.dimensions());
+    assert_eq!(
+        cli_pixels.into_raw(),
+        mcp_pixels.into_raw(),
+        "the rendered images differ"
+    );
+}
+
+/// The same, through `exec` / `execute_and_screenshot`: a command run without a
+/// prompt renders identically from either entry point, redactions included.
+#[tokio::test]
+async fn cli_exec_matches_the_equivalent_inline_mcp_redactions() {
+    let case = Case::new("inline-parity-exec");
+    let command = "printf 'host 10.20.30.40\\nhash 8846f7eaee8fb117ad06bdd830b7586c\\n'";
+    let json = [
+        r##"{"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_prefix":4,"color":"#ff6600"}"##,
+        r#"{"row":0,"col_start":0,"col_end":4,"label":"SECRET"}"#,
+    ];
+
+    let (cli_png, cli_stderr) = case.run_ok(&[
+        "exec",
+        "--no-prompt",
+        "--cols",
+        "60",
+        "--rows",
+        "8",
+        "--theme",
+        "dark",
+        "--chrome",
+        "none",
+        "--redact",
+        "--redact-text",
+        "--redaction",
+        json[0],
+        "--redaction",
+        json[1],
+        command,
+    ]);
+
+    let server = mcp_server(&case.dir.join("mcp"));
+    let redactions: Vec<ManualRedactionSpec> = json
+        .iter()
+        .map(|spec| ManualRedactionSpec::from_json(spec).expect("shared parser"))
+        .collect();
+    let result = server
+        .execute_and_screenshot(Parameters(ExecuteAndScreenshotParams {
+            command: command.to_string(),
+            cols: Some(60),
+            rows: Some(8),
+            timeout_secs: Some(30),
+            show_prompt: Some(false),
+            theme: Some("dark".to_string()),
+            commands: None,
+            chrome: Some("none".to_string()),
+            title: None,
+            timestamp: Some(false),
+            rounded: None,
+            // `--redact` on the CLI: the built-in rules run beside the inline
+            // specifications on both sides.
+            redact: Some(true),
+            redaction_rules: None,
+            redactions: Some(redactions),
+            redact_text: Some(true),
+            show_labels: None,
+            strip_ansi: None,
+            output_name: Some("parity-exec".to_string()),
+            auto_crop: None,
+            head_lines: None,
+            tail_lines: None,
+        }))
+        .await
+        .expect("execute_and_screenshot takes the same specifications inline");
+    let mcp_text = result_text(&result);
+    let mcp_png = PathBuf::from(
+        mcp_text
+            .lines()
+            .find_map(|l| l.strip_prefix("Screenshot saved to: "))
+            .expect("screenshot path")
+            .trim()
+            .to_string(),
+    );
+
+    // The built-in `ipv4` rule and the manual specifications both ran, and both
+    // sides report them the same way.
+    let cli_audit = audit_line(&cli_stderr);
+    assert!(
+        cli_audit.contains("ipv4") && cli_audit.contains("custom_0"),
+        "the rules and the manual specifications must both run: {cli_audit}"
+    );
+    assert_eq!(cli_audit, mcp_audit_line(&mcp_text), "audits differ");
+    assert_eq!(
+        description(&cli_png),
+        description(&mcp_png),
+        "the descriptions differ"
+    );
+    assert_eq!(
+        cli_terminal_text(&cli_stderr),
+        mcp_terminal_text(&mcp_text),
+        "the returned texts differ"
+    );
+
+    let cli_pixels = image::open(&cli_png).unwrap().to_rgba8();
+    let mcp_pixels = image::open(&mcp_png).unwrap().to_rgba8();
+    assert_eq!(cli_pixels.dimensions(), mcp_pixels.dimensions());
+    assert_eq!(
+        cli_pixels.into_raw(),
+        mcp_pixels.into_raw(),
+        "the rendered images differ"
+    );
+}
+
+/// The MCP conflict mirrors the CLI's: `--redaction` with `--no-redact` is a
+/// parse error, and `redactions` with `redact: false` is `invalid_params`.
+#[tokio::test]
+async fn the_mcp_conflict_mirrors_the_cli_conflict() {
+    let case = Case::new("inline-parity-conflict");
+    let input = case.ansi_file("conflict.ansi", "secret\n");
+
+    let cli_message = case.run_err(&[
+        "render",
+        "--no-redact",
+        "--redaction",
+        r#"{"pattern":"secret"}"#,
+        input.to_str().unwrap(),
+    ]);
+    assert!(
+        cli_message.contains("cannot be used with"),
+        "unhelpful CLI conflict error: {cli_message}"
+    );
+
+    let server = mcp_server(&case.dir.join("mcp"));
+    let mut params = parity_render_params(
+        &input,
+        "conflict",
+        vec![ManualRedactionSpec::from_json(r#"{"pattern":"secret"}"#).expect("shared parser")],
+    );
+    params.redact = Some(false);
+    let err = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect_err("the MCP side must refuse the same pairing");
+    let message = format!("{err}");
+    assert!(
+        message.contains("conflicts with `redact: false`") && message.contains("--no-redact"),
+        "unhelpful MCP conflict error: {message}"
+    );
 }

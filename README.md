@@ -199,7 +199,8 @@ termshot render --redaction '{"row":3,"col_start":12,"col_end":44,"label":"SECRE
 
 Passing it redacts the screenshot even without `--redact` (add `--redact` to
 run the built-in rules as well), and it conflicts with `--no-redact` rather
-than being silently ignored. See
+than being silently ignored. The MCP `execute_and_screenshot` and `render_ansi`
+tools take the same specifications inline, as a `redactions` array. See
 [docs/redaction.md](./docs/redaction.md#manual-redaction-cli-and-mcp).
 
 ## Tips
