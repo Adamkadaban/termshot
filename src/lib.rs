@@ -4,6 +4,7 @@
 //! so integration tests can drive the MCP tool handlers and rendering pipeline
 //! directly.
 
+pub mod capture;
 pub mod config;
 pub mod executor;
 pub mod redaction;

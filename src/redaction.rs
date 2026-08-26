@@ -6,9 +6,12 @@
 //! raw PTY bytes -> vt100 parser -> redaction pass -> render to PNG
 //! ```
 //!
-//! It scans the parsed [`vt100::Screen`] cell by cell, runs a set of regex
-//! rules against each row's text, and produces a [`RedactionMap`] describing
-//! which cells must be masked. The renderer consults that map and draws bright
+//! It scans the parsed screen ([`crate::capture::CapturedScreen`], or any
+//! [`ScreenView`]) cell
+//! by cell -- every retained row, scrollback included, not just the last
+//! screenful -- runs a set of regex rules against each row's text, and produces
+//! a [`RedactionMap`] describing which cells must be masked. The renderer
+//! consults that map and draws bright
 //! red blocks (with an optional short label such as `[IP]`) in place of the
 //! sensitive characters. The vt100 buffer itself is never mutated, which keeps
 //! the pass side-effect free and avoids re-parsing fragile ANSI streams.
@@ -17,11 +20,11 @@
 //! per-rule match counts -- so audit logs cannot leak the very data they are
 //! meant to protect.
 
+use crate::capture::ScreenView;
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use vt100::Screen;
 
 /// A single user-configurable redaction rule as read from `config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,7 +374,11 @@ impl RedactionEngine {
     ///
     /// When `only` is `Some`, only rules whose name appears in the list are
     /// applied; otherwise every enabled rule runs.
-    pub fn redact_screen(&self, screen: &Screen, only: Option<&[String]>) -> RedactionMap {
+    pub fn redact_screen<S: ScreenView + ?Sized>(
+        &self,
+        screen: &S,
+        only: Option<&[String]>,
+    ) -> RedactionMap {
         let mut map = RedactionMap::default();
         self.redact_screen_into(screen, only, &mut map);
         map
@@ -384,9 +391,9 @@ impl RedactionEngine {
     /// before matching, so a secret that crosses the right margin is still
     /// recognized. Every byte of the joined line keeps a `(row, column)`
     /// back-reference, so a match spanning the wrap masks cells on both rows.
-    pub fn redact_screen_into(
+    pub fn redact_screen_into<S: ScreenView + ?Sized>(
         &self,
-        screen: &Screen,
+        screen: &S,
         only: Option<&[String]>,
         map: &mut RedactionMap,
     ) {
@@ -466,7 +473,7 @@ impl RedactionEngine {
 /// Returns, for each logical line, its text and a parallel vector mapping every
 /// *byte* of that text back to the `(row, column)` cell it came from. Wide
 /// characters and empty cells both contribute exactly one cell.
-fn logical_lines(screen: &Screen) -> Vec<(String, Vec<(u16, u16)>)> {
+fn logical_lines<S: ScreenView + ?Sized>(screen: &S) -> Vec<(String, Vec<(u16, u16)>)> {
     let (rows, cols) = screen.size();
     let mut lines = Vec::new();
     let mut row = 0u16;
@@ -491,8 +498,8 @@ fn logical_lines(screen: &Screen) -> Vec<(String, Vec<(u16, u16)>)> {
 }
 
 /// Append one physical row's text (and its byte -> cell mapping) to `line`.
-fn append_row(
-    screen: &Screen,
+fn append_row<S: ScreenView + ?Sized>(
+    screen: &S,
     row: u16,
     cols: u16,
     line: &mut String,
@@ -617,7 +624,7 @@ impl RedactionMap {
     /// Produce a redaction-safe plain-text rendering of the screen, replacing
     /// masked cells with the full-block glyph so returned text never leaks the
     /// original values while preserving column alignment.
-    pub fn redacted_plain_text(&self, screen: &Screen) -> String {
+    pub fn redacted_plain_text<S: ScreenView + ?Sized>(&self, screen: &S) -> String {
         let (rows, cols) = screen.size();
         let mut out_rows: Vec<String> = Vec::with_capacity(rows as usize);
         for row in 0..rows {
@@ -1010,21 +1017,20 @@ pub fn load_rules_from_dir(dir: &std::path::Path) -> Vec<RedactionRuleConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::{CapturedScreen, DEFAULT_MAX_SCROLLBACK_LINES};
 
     fn engine() -> RedactionEngine {
         RedactionEngine::from_config(&RedactionConfig::default()).unwrap()
     }
 
-    /// Parse text into a screen so rules can be exercised end to end.
-    fn screen_of(text: &str, cols: u16, rows: u16) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(rows, cols, 0);
-        parser.process(text.as_bytes());
-        parser
+    /// Parse text into a capture so rules can be exercised end to end.
+    fn screen_of(text: &str, cols: u16, rows: u16) -> CapturedScreen {
+        CapturedScreen::parse(text.as_bytes(), rows, cols, DEFAULT_MAX_SCROLLBACK_LINES)
     }
 
     fn redact(text: &str) -> RedactionMap {
         let parser = screen_of(text, 120, 10);
-        engine().redact_screen(parser.screen(), None)
+        engine().redact_screen(&parser, None)
     }
 
     fn count_of(map: &RedactionMap, name: &str) -> usize {
@@ -1075,9 +1081,9 @@ mod tests {
     fn aws_secret_matches_in_context() {
         let input = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
         let parser = screen_of(input, 120, 3);
-        let map = engine().redact_screen(parser.screen(), None);
+        let map = engine().redact_screen(&parser, None);
         assert_eq!(count_of(&map, "aws_secret"), 1);
-        let text = map.redacted_plain_text(parser.screen());
+        let text = map.redacted_plain_text(&parser);
         assert!(text.contains("AWS_SECRET_ACCESS_KEY="));
         assert!(!text.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
     }
@@ -1090,8 +1096,8 @@ mod tests {
             "CONNECTION_STRING=postgresql://user:secret@db.example/app"
         );
         let parser = screen_of(input, 120, 5);
-        let map = engine().redact_screen(parser.screen(), None);
-        let text = map.redacted_plain_text(parser.screen());
+        let map = engine().redact_screen(&parser, None);
+        let text = map.redacted_plain_text(&parser);
         assert!(text.contains("API_KEY="));
         assert!(text.contains("Authorization="));
         assert!(text.contains("CONNECTION_STRING="));
@@ -1196,7 +1202,7 @@ mod tests {
     fn wrapped_secret_is_redacted_across_rows() {
         // 24 columns forces "AKIAIOSFODNN7EXAMPLE" to straddle two rows.
         let parser = screen_of("token: AKIAIOSFODNN7EXAMPLE done", 24, 6);
-        let map = engine().redact_screen(parser.screen(), None);
+        let map = engine().redact_screen(&parser, None);
         assert_eq!(count_of(&map, "aws_key"), 1, "wrapped key missed");
 
         let rows: Vec<u16> = (0..6)
@@ -1207,7 +1213,7 @@ mod tests {
             "expected redaction on both wrapped rows, got {:?}",
             rows
         );
-        assert!(!map.redacted_plain_text(parser.screen()).contains("AKIA"));
+        assert!(!map.redacted_plain_text(&parser).contains("AKIA"));
     }
 
     /// Only *soft* wraps are joined. Two hard-separated lines whose text would
@@ -1219,7 +1225,7 @@ mod tests {
         let engine = RedactionEngine::from_rules(&[rule]).unwrap();
         // Each half fits well inside the row, so neither line wrapped.
         let parser = screen_of("8846f7eaee8fb117ad06\r\nbdd830b7586c\r\n", 60, 6);
-        let map = engine.redact_screen(parser.screen(), None);
+        let map = engine.redact_screen(&parser, None);
         assert!(
             map.is_empty(),
             "hard-separated lines were joined into a match: {}",
@@ -1235,7 +1241,7 @@ mod tests {
         let engine = RedactionEngine::from_rules(&[rule]).unwrap();
         // 20 columns splits the 32-character hash across two rows.
         let parser = screen_of("8846f7eaee8fb117ad06bdd830b7586c\r\n", 20, 6);
-        let map = engine.redact_screen(parser.screen(), None);
+        let map = engine.redact_screen(&parser, None);
         assert_eq!(count_of(&map, "hash"), 1, "wrapped hash missed");
         assert!(map.get(0, 19).is_some(), "first row not masked");
         assert!(map.get(1, 0).is_some(), "second row not masked");
@@ -1247,7 +1253,7 @@ mod tests {
     fn only_the_redact_group_is_masked() {
         // "ip 10.0.0.9" -> the leading space is context, not part of the match.
         let parser = screen_of("ip 10.0.0.9!", 120, 3);
-        let map = engine().redact_screen(parser.screen(), None);
+        let map = engine().redact_screen(&parser, None);
         assert!(map.get(0, 2).is_none(), "context space was masked");
         assert!(map.get(0, 3).is_some(), "address start not masked");
         assert!(map.get(0, 10).is_some(), "address end not masked");
@@ -1265,7 +1271,7 @@ mod tests {
     fn map_marks_correct_columns() {
         // "ip 10.0.0.9" -> address starts at column 3.
         let parser = screen_of("ip 10.0.0.9", 120, 3);
-        let map = engine().redact_screen(parser.screen(), None);
+        let map = engine().redact_screen(&parser, None);
         assert!(map.get(0, 2).is_none()); // the space before
         for col in 3..11 {
             assert!(
@@ -1284,7 +1290,7 @@ mod tests {
         let engine = RedactionEngine::from_rules(&[rule]).unwrap();
         let hash = "8846f7eaee8fb117ad06bdd830b7586c";
         let parser = screen_of(&format!("h: {}", hash), 120, 3);
-        let map = engine.redact_screen(parser.screen(), None);
+        let map = engine.redact_screen(&parser, None);
         // Columns 3..7 (the first 4 hash chars) stay visible.
         for col in 3..7 {
             assert!(map.get(0, col).is_none(), "prefix col {} redacted", col);
@@ -1301,7 +1307,7 @@ mod tests {
         rule.keep_prefix = Some(4);
         let engine = RedactionEngine::from_rules(&[rule]).unwrap();
         let parser = screen_of("abcd", 120, 3);
-        let map = engine.redact_screen(parser.screen(), None);
+        let map = engine.redact_screen(&parser, None);
         assert!(map.is_empty(), "nothing should be redacted");
     }
 
@@ -1311,7 +1317,7 @@ mod tests {
         rule.keep_suffix = Some(2);
         let engine = RedactionEngine::from_rules(&[rule]).unwrap();
         let parser = screen_of("123456", 120, 3);
-        let map = engine.redact_screen(parser.screen(), None);
+        let map = engine.redact_screen(&parser, None);
         // First 4 masked, last 2 visible.
         for col in 0..4 {
             assert!(map.get(0, col).is_some(), "col {} not redacted", col);
@@ -1324,7 +1330,7 @@ mod tests {
     #[test]
     fn label_is_placed_over_block() {
         let parser = screen_of("ip 10.11.12.13 up", 120, 3);
-        let map = engine().redact_screen(parser.screen(), None);
+        let map = engine().redact_screen(&parser, None);
         // "10.11.12.13" spans 11 columns starting at 3, so "[IP]" fits.
         let tag: String = (3..7)
             .filter_map(|c| map.get(0, c).and_then(|rc| rc.label_char))
@@ -1336,7 +1342,7 @@ mod tests {
     fn only_filter_limits_rules() {
         let parser = screen_of("192.168.0.1 admin@example.com", 120, 3);
         let only = vec!["ipv4".to_string()];
-        let map = engine().redact_screen(parser.screen(), Some(&only));
+        let map = engine().redact_screen(&parser, Some(&only));
         assert_eq!(count_of(&map, "ipv4"), 1);
         assert_eq!(count_of(&map, "email"), 0);
     }
@@ -1355,8 +1361,8 @@ mod tests {
     #[test]
     fn redacted_plain_text_hides_value() {
         let parser = screen_of("secret 203.0.113.7 host", 120, 3);
-        let map = engine().redact_screen(parser.screen(), None);
-        let text = map.redacted_plain_text(parser.screen());
+        let map = engine().redact_screen(&parser, None);
+        let text = map.redacted_plain_text(&parser);
         assert!(!text.contains("203.0.113.7"), "text still leaks: {}", text);
         assert!(text.contains('\u{2588}'));
     }
@@ -1442,7 +1448,7 @@ mod tests {
         ];
         for s in samples {
             let parser = screen_of(s, 120, 3);
-            let map = engine.redact_screen(parser.screen(), None);
+            let map = engine.redact_screen(&parser, None);
             assert!(!map.is_empty(), "expected a redaction for sample: {}", s);
         }
     }
@@ -1466,7 +1472,7 @@ mod tests {
         };
         let engine = RedactionEngine::from_config(&cfg).unwrap();
         let parser = screen_of("admin@example.com", 120, 3);
-        let map = engine.redact_screen(parser.screen(), None);
+        let map = engine.redact_screen(&parser, None);
         assert_eq!(count_of(&map, "email"), 0);
     }
 
@@ -1491,7 +1497,7 @@ mod tests {
         };
         let engine = RedactionEngine::from_config(&cfg).unwrap();
         let parser = screen_of("AKIAIOSFODNN7EXAMPLE", 120, 3);
-        let map = engine.redact_screen(parser.screen(), None);
+        let map = engine.redact_screen(&parser, None);
         // First 4 columns ("AKIA") stay visible; the rest are masked.
         for col in 0..4 {
             assert!(map.get(0, col).is_none(), "prefix col {} redacted", col);
@@ -1520,7 +1526,7 @@ mod tests {
         };
         let engine = RedactionEngine::from_config(&cfg).unwrap();
         let parser = screen_of("see TICKET-1234", 120, 3);
-        let map = engine.redact_screen(parser.screen(), None);
+        let map = engine.redact_screen(&parser, None);
         assert_eq!(count_of(&map, "ticket"), 1);
     }
 
@@ -1534,7 +1540,7 @@ mod tests {
         };
         let engine = RedactionEngine::from_config(&cfg).unwrap();
         let parser = screen_of("ip 10.0.0.5 up", 120, 3);
-        let map = engine.redact_screen(parser.screen(), Some(&["ip".to_string()]));
+        let map = engine.redact_screen(&parser, Some(&["ip".to_string()]));
         let cell = map.get(0, 3).expect("redacted");
         assert_eq!(cell.block_color, [255, 102, 0]);
     }
@@ -1549,7 +1555,7 @@ mod tests {
         };
         let engine = RedactionEngine::from_config(&cfg).unwrap();
         let parser = screen_of("ip 192.168.1.9 up", 120, 3);
-        let map = engine.redact_screen(parser.screen(), None);
+        let map = engine.redact_screen(&parser, None);
         let cell = map.get(0, 3).expect("redacted");
         assert_eq!(cell.block_color, [0, 255, 0]);
         assert_eq!(cell.label_color, [17, 17, 17]);
@@ -1566,16 +1572,10 @@ mod tests {
         let engine = RedactionEngine::from_config(&cfg).unwrap();
         // Low-entropy value is ignored...
         let low = screen_of("tok_aaaaaaaa", 120, 3);
-        assert_eq!(
-            count_of(&engine.redact_screen(low.screen(), None), "token"),
-            0
-        );
+        assert_eq!(count_of(&engine.redact_screen(&low, None), "token"), 0);
         // ...but a high-entropy value is redacted.
         let high = screen_of("tok_a8Xk2Qm9Zp", 120, 3);
-        assert_eq!(
-            count_of(&engine.redact_screen(high.screen(), None), "token"),
-            1
-        );
+        assert_eq!(count_of(&engine.redact_screen(&high, None), "token"), 1);
     }
 
     #[test]
@@ -1587,7 +1587,7 @@ mod tests {
             assert!(map.get(0, col).is_some(), "column {} redacted", col);
         }
         assert!(map.get(0, 6).is_none());
-        let text = map.redacted_plain_text(parser.screen());
+        let text = map.redacted_plain_text(&parser);
         assert!(!text.contains("secret"));
     }
 

@@ -2,13 +2,14 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Duration;
+use termshot::capture::LineSelection;
 use termshot::config::Config;
 use termshot::redaction::{
     REDACTION_DISABLED_MSG, RedactionEngine, explicit_request_is_blocked, resolve_should_redact,
 };
 use termshot::renderer::{
-    ChromeOptions, ComposeLayout, FontSelection, RedactionRequest, Renderer, TextOptions,
-    fallback_output_name,
+    ChromeOptions, ComposeLayout, FontSelection, RedactionRequest, RenderOptions, Renderer,
+    RendererOptions, TextOptions, fallback_output_name,
 };
 use termshot::{executor, server};
 
@@ -47,13 +48,27 @@ enum Commands {
         #[arg(short = 'c', long, default_value_t = 120, value_parser = clap::value_parser!(u16).range(1..=500))]
         cols: u16,
 
-        /// Terminal height in rows (1-500)
+        /// Terminal viewport height in rows (1-500). This is the terminal the
+        /// command runs in - it decides where long lines wrap - not a limit on
+        /// what the screenshot shows: output that scrolls off the top is kept
+        /// and rendered too.
         #[arg(short = 'r', long, default_value_t = 40, value_parser = clap::value_parser!(u16).range(1..=500))]
         rows: u16,
 
         /// Timeout in seconds
         #[arg(short, long, default_value_t = 30)]
         timeout: u64,
+
+        /// Show only the first N lines of the output. By default the
+        /// screenshot shows every line the command produced, including
+        /// everything that scrolled out of the --rows-high viewport.
+        #[arg(long, value_name = "N", conflicts_with = "tail_lines", value_parser = clap::value_parser!(u64).range(1..))]
+        head_lines: Option<u64>,
+
+        /// Show only the last N lines of the output, like `tail -n`.
+        /// Mutually exclusive with --head-lines.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        tail_lines: Option<u64>,
 
         /// Chrome preset: none, minimal, gnome, macos, report
         #[arg(long)]
@@ -146,9 +161,21 @@ enum Commands {
         #[arg(short = 'c', long, default_value_t = 120, value_parser = clap::value_parser!(u16).range(1..=500))]
         cols: u16,
 
-        /// Terminal height in rows (1-500)
+        /// Terminal viewport height in rows (1-500). Decides where long lines
+        /// wrap; input taller than the viewport is still rendered whole.
         #[arg(short = 'r', long, default_value_t = 40, value_parser = clap::value_parser!(u16).range(1..=500))]
         rows: u16,
+
+        /// Render only the first N lines of the input. By default every line
+        /// is rendered, including everything that scrolled out of the
+        /// --rows-high viewport.
+        #[arg(long, value_name = "N", conflicts_with = "tail_lines", value_parser = clap::value_parser!(u64).range(1..))]
+        head_lines: Option<u64>,
+
+        /// Render only the last N lines of the input, like `tail -n`.
+        /// Mutually exclusive with --head-lines.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        tail_lines: Option<u64>,
 
         /// Theme name
         #[arg(long)]
@@ -267,14 +294,18 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = Config::load(cli.config.as_deref(), cli.rules_path.as_deref())?;
+    // `Config` is frozen at its 1.0.0 shape, so the scrollback capacity - a
+    // setting added since - travels beside it in the loaded configuration.
+    let loaded = Config::load_with_options(cli.config.as_deref(), cli.rules_path.as_deref())?;
+    let max_scrollback_lines = loaded.max_scrollback_lines;
+    let config = loaded.into_config();
 
     match cli.command {
         Commands::Mcp => {
             // One renderer serves every request: it holds a font chain per
             // theme, so a request that selects another theme gets that theme's
             // fonts without rebuilding anything.
-            let renderer = build_renderer(&config, None, None)?;
+            let renderer = build_renderer(&config, max_scrollback_lines, None, None)?;
             server::run_mcp_server(config, renderer).await?;
         }
         Commands::Exec {
@@ -282,6 +313,8 @@ async fn main() -> anyhow::Result<()> {
             cols,
             rows,
             timeout,
+            head_lines,
+            tail_lines,
             no_prompt,
             theme,
             chrome,
@@ -304,8 +337,14 @@ async fn main() -> anyhow::Result<()> {
             // each theme uses the fonts it declares, then any globally
             // configured font, then the embedded font. The renderer resolves
             // that chain per theme, exactly as the MCP server does.
-            let renderer = build_renderer(&config, font.as_deref(), font_bold.as_deref())?;
+            let renderer = build_renderer(
+                &config,
+                max_scrollback_lines,
+                font.as_deref(),
+                font_bold.as_deref(),
+            )?;
 
+            let lines = line_selection(head_lines, tail_lines)?;
             let timeout = Duration::from_secs(timeout);
 
             let exec_result = if !no_prompt {
@@ -342,26 +381,32 @@ async fn main() -> anyhow::Result<()> {
                 let cwd = std::env::current_dir().ok();
                 fallback_output_name(cwd.as_deref(), &command.join(" "))
             };
-            let (image_path, terminal_text, redactions, _meta) = renderer.render_bytes(
-                &exec_result.raw_output,
-                cols,
-                rows,
-                &config.output_dir,
-                Some(output_name.as_str()),
-                theme_name,
-                chrome_options.as_ref(),
-                redaction_request.as_ref(),
-                TextOptions {
-                    strip_ansi: plain_text,
-                    redact_text,
-                    embed_description: config.embed_description && !no_description,
-                    // An interactive capture's raw stream is a terminal
-                    // session, not a document: its text comes from the screen
-                    // so it matches the image exactly.
-                    from_screen: !no_prompt,
-                },
-                auto_crop,
-            )?;
+            let (image_path, terminal_text, redactions, meta) = renderer
+                .render_bytes_with_options(
+                    &exec_result.raw_output,
+                    cols,
+                    rows,
+                    &config.output_dir,
+                    Some(output_name.as_str()),
+                    theme_name,
+                    chrome_options.as_ref(),
+                    redaction_request.as_ref(),
+                    TextOptions {
+                        strip_ansi: plain_text,
+                        redact_text,
+                        embed_description: config.embed_description && !no_description,
+                        // An interactive capture's raw stream is a terminal
+                        // session, not a document: its text comes from the screen
+                        // so it matches the image exactly.
+                        from_screen: !no_prompt,
+                    },
+                    auto_crop,
+                    RenderOptions { lines },
+                )?;
+
+            if meta.truncated {
+                eprintln!("{}", truncation_notice(&renderer, rows, cols));
+            }
 
             if !redactions.is_empty() {
                 let summary = redactions
@@ -397,6 +442,8 @@ async fn main() -> anyhow::Result<()> {
             input,
             cols,
             rows,
+            head_lines,
+            tail_lines,
             theme,
             chrome,
             title,
@@ -412,7 +459,8 @@ async fn main() -> anyhow::Result<()> {
             rounded,
             no_rounded,
         } => {
-            let renderer = build_renderer(&config, None, None)?;
+            let renderer = build_renderer(&config, max_scrollback_lines, None, None)?;
+            let lines = line_selection(head_lines, tail_lines)?;
 
             let data = if input == "-" {
                 use std::io::Read;
@@ -452,7 +500,7 @@ async fn main() -> anyhow::Result<()> {
                 rules: redact_rules.as_ref().map(|s| parse_rule_list(s)),
             });
 
-            let (image_path, plain_text, redactions, _meta) = renderer.render_bytes(
+            let (image_path, plain_text, redactions, meta) = renderer.render_bytes_with_options(
                 &data,
                 cols,
                 rows,
@@ -470,7 +518,12 @@ async fn main() -> anyhow::Result<()> {
                     from_screen: false,
                 },
                 auto_crop,
+                RenderOptions { lines },
             )?;
+
+            if meta.truncated {
+                eprintln!("{}", truncation_notice(&renderer, rows, cols));
+            }
 
             if !redactions.is_empty() {
                 let summary = redactions
@@ -500,7 +553,7 @@ async fn main() -> anyhow::Result<()> {
             title,
             output,
         } => {
-            let renderer = build_renderer(&config, None, None)?;
+            let renderer = build_renderer(&config, max_scrollback_lines, None, None)?;
             let layout = ComposeLayout::parse(&layout)?;
             let chrome_options =
                 chrome_options_from_args(&config, chrome, title, false, None, None);
@@ -518,7 +571,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", path.display());
         }
         Commands::Themes => {
-            let renderer = build_renderer(&config, None, None)?;
+            let renderer = build_renderer(&config, max_scrollback_lines, None, None)?;
             let names = renderer.theme_names();
             let default = &config.default_theme;
             for name in &names {
@@ -548,6 +601,7 @@ async fn main() -> anyhow::Result<()> {
 /// fonts.
 fn build_renderer(
     config: &Config,
+    max_scrollback_lines: usize,
     font: Option<&std::path::Path>,
     font_bold: Option<&std::path::Path>,
 ) -> anyhow::Result<Renderer> {
@@ -557,12 +611,13 @@ fn build_renderer(
         global_font: config.font_path.clone(),
         global_fallback_fonts: Vec::new(),
     };
-    Renderer::new(
+    Renderer::new_with_options(
         &selection,
         config.font_size,
         &config.themes,
         &config.default_theme,
         &config.chrome,
+        RendererOptions::default().with_max_scrollback_lines(max_scrollback_lines),
     )
 }
 
@@ -654,6 +709,39 @@ fn rounded_override(rounded: bool, no_rounded: bool) -> Option<bool> {
     }
 }
 
+/// Collapse the `--head-lines` / `--tail-lines` flag pair into a line
+/// selection. Clap already rejects passing both, so this only has to widen the
+/// counts and default to showing everything.
+fn line_selection(head: Option<u64>, tail: Option<u64>) -> anyhow::Result<LineSelection> {
+    LineSelection::from_head_tail(head.map(|n| n as usize), tail.map(|n| n as usize))
+}
+
+/// Warning printed when more output scrolled off than the capture could hold,
+/// so the screenshot is missing the oldest lines.
+///
+/// Reports the capacity that actually applied: a wide terminal is capped below
+/// the configured line count by the retained-cell budget, and saying "raise
+/// `max_scrollback_lines`" when raising it would change nothing is worse than
+/// no advice at all.
+fn truncation_notice(renderer: &Renderer, rows: u16, cols: u16) -> String {
+    let configured = renderer.max_scrollback_lines();
+    let effective = renderer.effective_scrollback_lines(rows, cols);
+    let advice = if effective < configured {
+        format!(
+            "the configured {} was capped to what {} columns can hold in memory, so keep \
+             fewer columns or select fewer lines",
+            configured, cols
+        )
+    } else {
+        "raise `max_scrollback_lines` in the config to keep more".to_string()
+    };
+    format!(
+        "(output exceeded the {}-line scrollback, so the oldest lines were dropped; {}, \
+         or use --head-lines/--tail-lines to pick the end you care about)",
+        effective, advice
+    )
+}
+
 /// Parse a comma-separated `--redact-rules` list into rule names, dropping
 /// empty entries and surrounding whitespace.
 fn parse_rule_list(s: &str) -> Vec<String> {
@@ -676,5 +764,101 @@ fn move_screenshot(src: &std::path::Path, dst: &str) -> anyhow::Result<PathBuf> 
             std::fs::remove_file(src).ok();
             Ok(dst)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// Extract the `exec` line selection a command line resolves to.
+    fn exec_selection(args: &[&str]) -> anyhow::Result<LineSelection> {
+        let cli = Cli::try_parse_from(args)?;
+        match cli.command {
+            Commands::Exec {
+                head_lines,
+                tail_lines,
+                ..
+            } => line_selection(head_lines, tail_lines),
+            _ => panic!("expected the exec subcommand"),
+        }
+    }
+
+    /// Showing everything is the default; `--head-lines` / `--tail-lines`
+    /// narrow it, and asking for both at once is refused by the parser rather
+    /// than silently picking one.
+    #[test]
+    fn head_and_tail_lines_are_mutually_exclusive() {
+        assert_eq!(
+            exec_selection(&["termshot", "exec", "--", "seq 1 200"]).unwrap(),
+            LineSelection::All
+        );
+        assert_eq!(
+            exec_selection(&["termshot", "exec", "--head-lines", "10", "--", "seq 1 200"]).unwrap(),
+            LineSelection::Head(10)
+        );
+        assert_eq!(
+            exec_selection(&["termshot", "exec", "--tail-lines", "10", "--", "seq 1 200"]).unwrap(),
+            LineSelection::Tail(10)
+        );
+
+        let err = Cli::try_parse_from([
+            "termshot",
+            "exec",
+            "--head-lines",
+            "10",
+            "--tail-lines",
+            "10",
+            "--",
+            "seq 1 200",
+        ])
+        .err()
+        .expect("--head-lines and --tail-lines must not be accepted together");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        // Zero lines is not a selection anyone can render.
+        assert!(
+            Cli::try_parse_from(["termshot", "exec", "--head-lines", "0", "--", "echo hi"])
+                .is_err()
+        );
+    }
+
+    /// `render` takes the same pair, with the same conflict.
+    #[test]
+    fn render_also_takes_head_and_tail_lines() {
+        let cli = Cli::try_parse_from(["termshot", "render", "--tail-lines", "5", "out.ansi"])
+            .expect("parses");
+        match cli.command {
+            Commands::Render {
+                head_lines,
+                tail_lines,
+                ..
+            } => {
+                assert_eq!(
+                    line_selection(head_lines, tail_lines).unwrap(),
+                    LineSelection::Tail(5)
+                );
+            }
+            _ => panic!("expected render"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "termshot",
+                "render",
+                "--head-lines",
+                "5",
+                "--tail-lines",
+                "5",
+                "out.ansi",
+            ])
+            .is_err()
+        );
     }
 }

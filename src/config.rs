@@ -1,3 +1,4 @@
+use crate::capture::{DEFAULT_MAX_SCROLLBACK_LINES, MAX_SCROLLBACK_LIMIT};
 use crate::redaction::RedactionConfig;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -5,6 +6,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Top-level config file structure (loaded from TOML).
+///
+/// This is the shape published in 1.0.0 and it stays that way: it is a public
+/// struct with public fields, so a dependant can (and does) build one with an
+/// exhaustive literal, and adding a field would break that code. Settings added
+/// after 1.0.0 are parsed alongside it by [`ConfigFileExtensions`] instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConfigFile {
@@ -51,6 +57,48 @@ impl Default for ConfigFile {
             themes: HashMap::new(),
             redaction: RedactionConfig::default(),
         }
+    }
+}
+
+/// Config-file keys added after 1.0.0.
+///
+/// Private, and deserialized from the same TOML document as [`ConfigFile`] -
+/// which ignores unknown keys - so new settings can be read without changing
+/// the published struct. Keep this in step with [`LoadedConfig`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct ConfigFileExtensions {
+    /// How many scrolled-off lines each capture retains, so a screenshot can
+    /// show output that never fit in the viewport. Capped at
+    /// [`MAX_SCROLLBACK_LIMIT`].
+    max_scrollback_lines: usize,
+}
+
+impl Default for ConfigFileExtensions {
+    fn default() -> Self {
+        Self {
+            max_scrollback_lines: DEFAULT_MAX_SCROLLBACK_LINES,
+        }
+    }
+}
+
+/// A parsed config file: the 1.0.0 [`ConfigFile`] plus the keys added since.
+///
+/// Parsing the document twice - once into each half - is what keeps the
+/// published struct exhaustively constructible. Neither half denies unknown
+/// fields, so each simply ignores the other's keys.
+#[derive(Debug, Clone, Default)]
+struct ParsedConfigFile {
+    file: ConfigFile,
+    extensions: ConfigFileExtensions,
+}
+
+impl ParsedConfigFile {
+    fn from_toml(contents: &str) -> Result<Self> {
+        Ok(Self {
+            file: toml::from_str(contents)?,
+            extensions: toml::from_str(contents)?,
+        })
     }
 }
 
@@ -147,6 +195,11 @@ impl ThemeConfig {
 }
 
 /// Resolved runtime configuration.
+///
+/// This is the shape published in 1.0.0 and it stays that way: external code
+/// builds it with exhaustive literals, so a new field here would be a
+/// source-breaking change. Settings added since ride along in [`LoadedConfig`],
+/// which [`Config::load_with_options`] returns.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub output_dir: PathBuf,
@@ -168,11 +221,103 @@ pub struct Config {
     pub redaction: RedactionConfig,
 }
 
+impl Default for Config {
+    /// The configuration a fresh install resolves to with no config file and no
+    /// environment overrides.
+    fn default() -> Self {
+        let file = ConfigFile::default();
+        Self {
+            output_dir: PathBuf::from(&file.output_dir),
+            font_path: file.font_path.as_ref().map(PathBuf::from),
+            font_size: file.font_size,
+            default_cols: file.cols,
+            default_rows: file.rows,
+            default_timeout_secs: file.timeout_secs,
+            shell: file.shell.unwrap_or_else(|| "/bin/bash".to_string()),
+            embed_description: file.embed_description,
+            default_theme: file.default_theme,
+            chrome: file.chrome,
+            themes: builtin_themes(),
+            user_theme_names: BTreeSet::new(),
+            redaction: file.redaction,
+        }
+    }
+}
+
+/// A fully loaded configuration: the 1.0.0 [`Config`] plus the settings added
+/// after it was published.
+///
+/// [`Config`] itself cannot grow fields without breaking every exhaustive
+/// struct literal compiled against 1.0.0, so this carries the extensions
+/// instead. Reach for it through [`Config::load_with_options`]; the 1.0.0
+/// [`Config::load`] still returns a plain [`Config`], with the newer settings
+/// left at their defaults.
+///
+/// It derefs to [`Config`], so `loaded.default_cols` and friends read exactly
+/// as they did before.
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    /// The published configuration, unchanged.
+    pub config: Config,
+    /// How many scrolled-off lines each capture retains, so a screenshot can
+    /// show output that never fit in the viewport. Clamped to
+    /// `1..=`[`MAX_SCROLLBACK_LIMIT`]; each capture clamps it again to what its
+    /// terminal width can hold in memory.
+    pub max_scrollback_lines: usize,
+}
+
+impl LoadedConfig {
+    /// The published configuration.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Discard the extensions and keep the published configuration.
+    pub fn into_config(self) -> Config {
+        self.config
+    }
+}
+
+impl Default for LoadedConfig {
+    fn default() -> Self {
+        Self {
+            config: Config::default(),
+            max_scrollback_lines: DEFAULT_MAX_SCROLLBACK_LINES,
+        }
+    }
+}
+
+impl std::ops::Deref for LoadedConfig {
+    type Target = Config;
+
+    fn deref(&self) -> &Config {
+        &self.config
+    }
+}
+
+impl std::ops::DerefMut for LoadedConfig {
+    fn deref_mut(&mut self) -> &mut Config {
+        &mut self.config
+    }
+}
+
 impl Config {
     /// Load config by merging (in order): defaults, config file, env vars.
     /// `rules_path` overrides the `[redaction] rules_path` directory (e.g. from
     /// the `--rules-path` CLI flag).
+    ///
+    /// This is the 1.0.0 entry point and its signature is unchanged. Settings
+    /// added after 1.0.0 do not fit in [`Config`], so they are not returned
+    /// here; use [`Config::load_with_options`] to read them.
     pub fn load(config_path: Option<&str>, rules_path: Option<&str>) -> Result<Self> {
+        Ok(Self::load_with_options(config_path, rules_path)?.config)
+    }
+
+    /// [`Config::load`], also returning the settings added after 1.0.0.
+    pub fn load_with_options(
+        config_path: Option<&str>,
+        rules_path: Option<&str>,
+    ) -> Result<LoadedConfig> {
         let config_dir = dirs_config().join("termshot");
 
         // Create the config directory and default config/theme files the first
@@ -185,7 +330,7 @@ impl Config {
         }
 
         // Start with defaults
-        let mut file_config = ConfigFile::default();
+        let mut parsed = ParsedConfigFile::default();
 
         // Try loading config file
         let paths_to_try = if let Some(p) = config_path {
@@ -201,12 +346,16 @@ impl Config {
         for path in &paths_to_try {
             if path.exists() {
                 let contents = std::fs::read_to_string(path)?;
-                file_config = toml::from_str(&contents)?;
+                parsed = ParsedConfigFile::from_toml(&contents)?;
                 tracing::info!("Loaded config from {:?}", path);
                 loaded_config_path = Some(path.clone());
                 break;
             }
         }
+        let ParsedConfigFile {
+            file: file_config,
+            extensions,
+        } = parsed;
 
         // Build the merged theme map. Resolution order (lowest to highest
         // priority): builtin compiled themes, inline `[themes.*]` config
@@ -265,6 +414,16 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(file_config.timeout_secs);
 
+        // Clamped so retained rows plus the viewport stay addressable as u16
+        // cell coordinates throughout the renderer and redaction map, and so a
+        // configured zero cannot turn every capture into a single screenful by
+        // accident. Each capture clamps this again to what its terminal width
+        // can hold in memory; see `capture::effective_scrollback_lines`.
+        let max_scrollback_lines = env_var("MAX_SCROLLBACK_LINES")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(extensions.max_scrollback_lines)
+            .clamp(1, MAX_SCROLLBACK_LIMIT);
+
         let shell = env_var("SHELL")
             .or(file_config.shell)
             .or_else(|| std::env::var("SHELL").ok())
@@ -293,20 +452,23 @@ impl Config {
         let mut redaction = file_config.redaction;
         merge_rule_dirs(&mut redaction, &config_dir, rules_path);
 
-        Ok(Self {
-            output_dir,
-            font_path,
-            font_size,
-            default_cols,
-            default_rows,
-            default_timeout_secs,
-            shell,
-            embed_description: file_config.embed_description,
-            default_theme,
-            chrome,
-            themes,
-            user_theme_names,
-            redaction,
+        Ok(LoadedConfig {
+            config: Self {
+                output_dir,
+                font_path,
+                font_size,
+                default_cols,
+                default_rows,
+                default_timeout_secs,
+                shell,
+                embed_description: file_config.embed_description,
+                default_theme,
+                chrome,
+                themes,
+                user_theme_names,
+                redaction,
+            },
+            max_scrollback_lines,
         })
     }
 
@@ -725,7 +887,12 @@ const DEFAULT_CONFIG_TOML: &str = r##"# termshot configuration
 default_theme = "dark"
 font_size = 16.0
 cols = 120
+# The terminal viewport a command runs in: `rows` decides where long lines wrap,
+# not how much of the output the screenshot shows. Everything that scrolls off
+# the top is kept and rendered, up to `max_scrollback_lines`. Use
+# --head-lines/--tail-lines to render only one end.
 rows = 40
+max_scrollback_lines = 10000
 timeout_secs = 30
 
 # Embed the terminal text (redacted, when redaction ran) in each PNG's UTF-8
@@ -801,6 +968,81 @@ auto = false
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The settings added after 1.0.0 are read from the same TOML document as
+    /// the frozen [`ConfigFile`], without appearing as fields on it.
+    #[test]
+    fn config_file_extensions_are_parsed_beside_the_published_struct() {
+        let toml_src = r##"
+output_dir = "/tmp/termshot-test"
+cols = 100
+rows = 30
+font_size = 14.5
+max_scrollback_lines = 4242
+default_theme = "light"
+
+[chrome]
+enabled = true
+preset = "gnome"
+
+[themes.custom]
+foreground = "#ffffff"
+background = "#000000"
+palette = ["#000000", "#111111", "#222222", "#333333", "#444444", "#555555", "#666666", "#777777", "#888888", "#999999", "#aaaaaa", "#bbbbbb", "#cccccc", "#dddddd", "#eeeeee", "#ffffff"]
+"##;
+        let parsed = ParsedConfigFile::from_toml(toml_src).expect("parses");
+
+        // Every published field still deserializes exactly as it did.
+        assert_eq!(parsed.file.output_dir, "/tmp/termshot-test");
+        assert_eq!(parsed.file.cols, 100);
+        assert_eq!(parsed.file.rows, 30);
+        assert_eq!(parsed.file.font_size, 14.5);
+        assert_eq!(parsed.file.default_theme, "light");
+        assert!(parsed.file.chrome.enabled);
+        assert_eq!(parsed.file.chrome.preset, "gnome");
+        assert!(parsed.file.themes.contains_key("custom"));
+
+        // And the newer key is read alongside it.
+        assert_eq!(parsed.extensions.max_scrollback_lines, 4242);
+    }
+
+    /// A config file that never mentions the newer key still resolves to the
+    /// default capacity, so a 1.0.0 config keeps behaving as it did.
+    #[test]
+    fn a_config_without_the_newer_key_falls_back_to_the_default() {
+        let parsed = ParsedConfigFile::from_toml("cols = 90\n").expect("parses");
+        assert_eq!(parsed.file.cols, 90);
+        assert_eq!(
+            parsed.extensions.max_scrollback_lines,
+            DEFAULT_MAX_SCROLLBACK_LINES
+        );
+    }
+
+    /// The whole configuration, loaded from an explicit path: the published
+    /// half lands in `Config`, the newer half in `LoadedConfig`.
+    #[test]
+    fn load_with_options_returns_both_halves() {
+        let dir = Path::new("target/config-test/load-with-options");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "output_dir = {:?}\ncols = 111\nmax_scrollback_lines = 777\n",
+                dir.join("out").display().to_string()
+            ),
+        )
+        .unwrap();
+
+        let loaded = Config::load_with_options(Some(path.to_str().unwrap()), None).unwrap();
+        assert_eq!(loaded.default_cols, 111);
+        assert_eq!(loaded.max_scrollback_lines, 777);
+
+        // The 1.0.0 entry point still hands back a plain `Config`.
+        let config: Config = Config::load(Some(path.to_str().unwrap()), None).unwrap();
+        assert_eq!(config.default_cols, 111);
+    }
 
     /// A rule file dropped into `<config>/rules` must be picked up with no
     /// configuration at all, the way `themes/` works.

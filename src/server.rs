@@ -1,3 +1,4 @@
+use crate::capture::LineSelection;
 use crate::config::Config;
 use crate::executor;
 use crate::redaction::{
@@ -5,8 +6,8 @@ use crate::redaction::{
     explicit_request_is_blocked, resolve_should_redact,
 };
 use crate::renderer::{
-    ChromeOptions, ComposeLayout, RedactionRequest, RenderMeta, Renderer, TextOptions,
-    fallback_output_name,
+    ChromeOptions, ComposeLayout, RedactionRequest, RenderContext, RenderOptions, Renderer,
+    TextOptions, fallback_output_name,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler, handler::server::router::tool::ToolRouter,
@@ -125,6 +126,18 @@ pub struct ExecuteAndScreenshotParams {
     /// width.
     #[serde(default)]
     pub auto_crop: Option<bool>,
+
+    /// Show only the FIRST N lines of the output. By default the screenshot
+    /// shows EVERY line the command produced, including everything that
+    /// scrolled out of the `rows`-high viewport (`rows` controls where lines
+    /// wrap, not how much is shown). Mutually exclusive with `tail_lines`.
+    #[serde(default)]
+    pub head_lines: Option<usize>,
+
+    /// Show only the LAST N lines of the output (like `tail -n`). By default
+    /// every retained line is shown. Mutually exclusive with `head_lines`.
+    #[serde(default)]
+    pub tail_lines: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -201,6 +214,17 @@ pub struct RenderAnsiParams {
     /// Defaults to true.
     #[serde(default)]
     pub show_labels: Option<bool>,
+
+    /// Render only the FIRST N lines of the file. By default every line is
+    /// rendered, including everything that scrolled out of the `rows`-high
+    /// viewport. Mutually exclusive with `tail_lines`.
+    #[serde(default)]
+    pub head_lines: Option<usize>,
+
+    /// Render only the LAST N lines of the file (like `tail -n`). By default
+    /// every line is rendered. Mutually exclusive with `head_lines`.
+    #[serde(default)]
+    pub tail_lines: Option<usize>,
 }
 
 /// A single selective redaction for `redact_screenshot`: either a regex
@@ -227,12 +251,22 @@ pub enum RedactionSpec {
         keep_suffix: Option<usize>,
     },
     /// Redact an explicit cell range on a single row (0-based).
+    ///
+    /// Coordinates are validated against the screenshot before anything is
+    /// drawn: a row at or past its last row, a column at or past its last
+    /// column, or a `col_start` that is not before `col_end` is rejected with
+    /// an error naming the screenshot's real dimensions.
     Coordinate {
-        /// Row index (0-based).
+        /// Row index (0-based), counted in the screenshot as rendered: row 0 is
+        /// the topmost line the PNG shows, which for a `head_lines` /
+        /// `tail_lines` capture is the first line of that selection. Must be
+        /// less than the number of rows the screenshot shows.
         row: u16,
-        /// First column to redact (0-based, inclusive).
+        /// First column to redact (0-based, inclusive). Must be less than both
+        /// `col_end` and the screenshot's width.
         col_start: u16,
-        /// One past the last column to redact (exclusive).
+        /// One past the last column to redact (exclusive). Must be greater than
+        /// `col_start` and no greater than the screenshot's width.
         col_end: u16,
         /// Short label drawn over the redaction block.
         #[serde(default)]
@@ -314,7 +348,10 @@ pub struct ComposeScreenshotsParams {
 #[derive(Clone)]
 struct CachedRender {
     data: Vec<u8>,
-    meta: RenderMeta,
+    /// The 1.0.0 [`RenderMeta`] plus the line selection and truncation flag the
+    /// screenshot was rendered with, so a re-render reproduces exactly the rows
+    /// the image shows.
+    context: RenderContext,
     /// Monotonic insertion counter, used to evict the oldest entries first.
     serial: u64,
 }
@@ -384,7 +421,7 @@ impl ScreenshotServer {
     /// image redacts), so it is bounded: the oldest entries are evicted once
     /// [`MAX_CACHE_ENTRIES`] or [`MAX_CACHE_BYTES`] is exceeded, rather than
     /// keeping every capture for the lifetime of the process.
-    fn remember_render(&self, path: &Path, data: &[u8], meta: RenderMeta) {
+    fn remember_render(&self, path: &Path, data: &[u8], context: RenderContext) {
         let mut cache = match self.render_cache.lock() {
             Ok(cache) => cache,
             Err(_) => {
@@ -398,7 +435,7 @@ impl ScreenshotServer {
             key,
             CachedRender {
                 data: data.to_vec(),
-                meta,
+                context,
                 serial,
             },
         );
@@ -490,6 +527,7 @@ impl ScreenshotServer {
                 .timeout_secs
                 .unwrap_or(self.config.default_timeout_secs),
         );
+        let lines = line_selection(params.head_lines, params.tail_lines)?;
         let show_prompt = params.show_prompt.unwrap_or(true);
         let commands = params
             .commands
@@ -557,9 +595,9 @@ impl ScreenshotServer {
             fallback_output_name(cwd.as_deref(), &commands.join(" "))
         });
 
-        let (image_path, plain_text, redactions, meta) = self
+        let (image_path, plain_text, redactions, context) = self
             .renderer
-            .render_bytes(
+            .render_bytes_with_options(
                 &exec_result.raw_output,
                 cols,
                 rows,
@@ -570,11 +608,13 @@ impl ScreenshotServer {
                 redaction_request.as_ref(),
                 text_options,
                 params.auto_crop.unwrap_or(true),
+                RenderOptions { lines },
             )
             .map_err(|e| McpError::internal_error(format!("Rendering failed: {}", e), None))?;
 
+        let truncated = context.truncated;
         // Keep the source bytes + metadata in memory for later re-rendering.
-        self.remember_render(&image_path, &exec_result.raw_output, meta);
+        self.remember_render(&image_path, &exec_result.raw_output, context);
 
         let exit_info = if exec_result.timed_out {
             "TIMED OUT".to_string()
@@ -597,6 +637,11 @@ impl ScreenshotServer {
                 .join(", ");
             content.push(ContentBlock::text(format!("Redacted: {}", summary)));
         }
+        if truncated {
+            content.push(ContentBlock::text(truncation_notice(
+                self.renderer.effective_scrollback_lines(rows, cols),
+            )));
+        }
         content.push(ContentBlock::text(format!(
             "--- Terminal Output ---\n{}",
             plain_text
@@ -618,6 +663,7 @@ impl ScreenshotServer {
         let cols = params.cols.unwrap_or(self.config.default_cols);
         let rows = params.rows.unwrap_or(self.config.default_rows);
         validate_dimensions(cols, rows)?;
+        let lines = line_selection(params.head_lines, params.tail_lines)?;
         let theme_name = params.theme.as_deref();
         let chrome_options = chrome_options_from_params(
             &self.config,
@@ -655,9 +701,9 @@ impl ScreenshotServer {
             rules: params.redaction_rules.clone(),
         });
 
-        let (image_path, plain_text, redactions, meta) = self
+        let (image_path, plain_text, redactions, context) = self
             .renderer
-            .render_bytes(
+            .render_bytes_with_options(
                 &data,
                 cols,
                 rows,
@@ -675,11 +721,13 @@ impl ScreenshotServer {
                     from_screen: false,
                 },
                 params.auto_crop.unwrap_or(true),
+                RenderOptions { lines },
             )
             .map_err(|e| McpError::internal_error(format!("Rendering failed: {}", e), None))?;
 
+        let truncated = context.truncated;
         // Keep the source bytes + metadata in memory for later re-rendering.
-        self.remember_render(&image_path, &data, meta);
+        self.remember_render(&image_path, &data, context);
 
         let mut content = vec![ContentBlock::text(format!(
             "Screenshot saved to: {}",
@@ -692,6 +740,11 @@ impl ScreenshotServer {
                 .collect::<Vec<_>>()
                 .join(", ");
             content.push(ContentBlock::text(format!("Redacted: {}", summary)));
+        }
+        if truncated {
+            content.push(ContentBlock::text(truncation_notice(
+                self.renderer.effective_scrollback_lines(rows, cols),
+            )));
         }
         content.push(ContentBlock::text(format!(
             "--- Terminal Output ---\n{}",
@@ -712,6 +765,11 @@ impl ScreenshotServer {
     /// applied, and the PNG is re-rendered. This only works for screenshots
     /// produced by this server instance since it last started.
     ///
+    /// The screenshot is re-rendered from the same capture and line selection it
+    /// was made with, so patterns match every line it shows - including output
+    /// that scrolled out of the terminal viewport - and `row` coordinates count
+    /// from the top of the image.
+    ///
     /// Each redaction is either a regex `pattern` (with optional `replacement`
     /// used as the on-image `[LABEL]` tag) or an explicit cell range (`row`,
     /// `col_start`, `col_end`, optional `label`). A pattern with no
@@ -724,6 +782,14 @@ impl ScreenshotServer {
     /// `8846f7eaee8fb117ad06bdd830b7586c`, `keep_prefix: 4` renders
     /// `8846████████████████████████████`, and for an AWS key `AKIA...`,
     /// `keep_prefix: 4` shows `AKIA████████████████`.
+    ///
+    /// Cell ranges are checked against what the screenshot actually renders
+    /// before anything is drawn: trailing blank rows are trimmed away and (with
+    /// `auto_crop`, the default) so are the empty columns to the right of the
+    /// output, so a row or column that the capture retains but the image never
+    /// paints is an error naming the requested coordinates and the rendered
+    /// dimensions, rather than a redaction that quietly covers nothing. An
+    /// empty `col_start`/`col_end` interval is refused the same way.
     ///
     /// By default the returned text is the ORIGINAL content; set `redact_text`
     /// to return the scrubbed text.
@@ -741,7 +807,7 @@ impl ScreenshotServer {
             })?;
             cache.get(&key).cloned()
         };
-        let CachedRender { data, meta, .. } = cached.ok_or_else(|| {
+        let CachedRender { data, context, .. } = cached.ok_or_else(|| {
             McpError::invalid_params(
                 format!(
                     "No in-memory record for screenshot '{}'. It must have been produced \
@@ -788,6 +854,16 @@ impl ScreenshotServer {
             }
         }
 
+        // The capture the re-render will draw, built once: patterns are matched
+        // against it and coordinates are validated against the part of it the
+        // renderer actually paints. Its size is what a `row`/`col` means here -
+        // a head/tail selection or a long scrollback makes it a different shape
+        // from the PTY viewport - so it has to exist before a single cell is
+        // masked.
+        let screen = self.renderer.capture_for(&data, &context);
+        let (rendered_rows, rendered_cols) = self.renderer.rendered_bounds_for(&screen, &context);
+        validate_coordinates(&coordinates, rendered_rows, rendered_cols)?;
+
         // Build the combined redaction map: regex matches first, then manual
         // coordinate ranges.
         let mut map = RedactionMap::default();
@@ -796,10 +872,12 @@ impl ScreenshotServer {
                 .map_err(|e| {
                     McpError::internal_error(format!("Invalid redaction pattern: {}", e), None)
                 })?;
-            let mut parser = vt100::Parser::new(meta.rows, meta.cols, 0);
-            parser.process(&data);
-            engine.redact_screen_into(parser.screen(), None, &mut map);
+            // Matched on the capture the renderer will draw, so a match found
+            // here masks the cell it draws - including rows that scrolled out
+            // of the viewport.
+            engine.redact_screen_into(&screen, None, &mut map);
         }
+        drop(screen);
         for (row, col_start, col_end, label) in &coordinates {
             let label = if show_labels {
                 label.as_deref().or(Some("REDACTED"))
@@ -811,9 +889,9 @@ impl ScreenshotServer {
 
         let (plain_text, audit) = self
             .renderer
-            .render_redaction_to(
+            .render_redaction_to_with_context(
                 &data,
-                &meta,
+                &context,
                 &map,
                 &png_path,
                 TextOptions {
@@ -822,7 +900,7 @@ impl ScreenshotServer {
                     embed_description: self.config.embed_description,
                     // Re-rendering returns text of the same kind the original
                     // capture did.
-                    from_screen: meta.from_screen,
+                    from_screen: context.meta.from_screen,
                 },
             )
             .map_err(|e| McpError::internal_error(format!("Rendering failed: {}", e), None))?;
@@ -930,6 +1008,95 @@ pub async fn run_mcp_server(config: Config, renderer: Renderer) -> anyhow::Resul
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// Turn a mutually exclusive `head_lines` / `tail_lines` pair into a line
+/// selection, rejecting a request that sets both.
+fn line_selection(head: Option<usize>, tail: Option<usize>) -> Result<LineSelection, McpError> {
+    LineSelection::from_head_tail(head, tail)
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))
+}
+
+/// Check every manual `row`/`col_start`/`col_end` range against the cells the
+/// screenshot will actually be re-rendered with.
+///
+/// A coordinate redaction is a promise to cover specific cells, so a range that
+/// lands outside the image must fail loudly: silently clamping it (or dropping
+/// it, as the redaction map does for an empty interval) would report "redacted"
+/// for a screenshot where the secret is still legible. The bounds are the
+/// *rendered* ones from [`Renderer::rendered_bounds_for`] - the retained
+/// capture, narrowed to the `head_lines`/`tail_lines` selection it was drawn
+/// with, then to the rows and columns that survive trailing-blank trimming and
+/// `auto_crop` - not the PTY viewport and not the raw grid. A cell the capture
+/// holds but the renderer never paints cannot be redacted, and saying so is
+/// better than accepting a redaction that leaves no mark.
+///
+/// This applies to manual coordinates only. Pattern redactions are matched
+/// against the capture itself, so a match on the rightmost content cell (or the
+/// continuation cell of a double-width character) is masked exactly as before:
+/// wherever text is drawn, the renderer is already inside these bounds.
+fn validate_coordinates(
+    coordinates: &[(u16, u16, u16, Option<String>)],
+    rendered_rows: u16,
+    rendered_cols: u16,
+) -> Result<(), McpError> {
+    for (row, col_start, col_end, _) in coordinates {
+        let invalid = |detail: String| {
+            Err(McpError::invalid_params(
+                format!(
+                    "invalid redaction coordinate (row {}, col_start {}, col_end {}): {}. \
+                     The screenshot renders {} row(s) x {} column(s); rows are 0..{} and \
+                     columns are 0..{} (col_end is exclusive). Cells outside that are \
+                     retained by the capture but never drawn, so redacting them would \
+                     change nothing.",
+                    row,
+                    col_start,
+                    col_end,
+                    detail,
+                    rendered_rows,
+                    rendered_cols,
+                    rendered_rows,
+                    rendered_cols
+                ),
+                None,
+            ))
+        };
+        if *row >= rendered_rows {
+            return invalid(format!("row {} is past the last rendered row", row));
+        }
+        if col_start >= col_end {
+            return invalid(format!(
+                "col_start {} is not before col_end {}, so the range is empty",
+                col_start, col_end
+            ));
+        }
+        if *col_start >= rendered_cols {
+            return invalid(format!(
+                "col_start {} is past the last rendered column",
+                col_start
+            ));
+        }
+        if *col_end > rendered_cols {
+            return invalid(format!(
+                "col_end {} is past the last rendered column boundary",
+                col_end
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Message returned alongside a screenshot that lost output, so the caller
+/// knows the image is not the whole story. `effective_lines` is the capacity
+/// that actually applied, which a wide terminal can drive below the configured
+/// one.
+fn truncation_notice(effective_lines: usize) -> String {
+    format!(
+        "Warning: output exceeded the {}-line scrollback, so the oldest lines were dropped \
+         before rendering. Raise `max_scrollback_lines` in the server config to keep more \
+         (a wide terminal caps it), or pass head_lines/tail_lines to select one end.",
+        effective_lines
+    )
 }
 
 /// Minimum and maximum allowed terminal dimensions. Zero panics the vt100

@@ -1,0 +1,413 @@
+//! Source compatibility with the public Rust API published in 1.0.0.
+//!
+//! Everything here is written the way a 1.0.0 dependant would have written it,
+//! with no knowledge of scrollback capture or line selection. It is really a
+//! compile-time test - if these calls stop building, the crate has broken a
+//! published signature - but the assertions also check that the old calls still
+//! *behave* the way they used to: whole-capture rendering, default scrollback,
+//! no surprises.
+
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use termshot::capture::LineSelection;
+use termshot::config::{ChromeConfig, Config, ThemeConfig};
+use termshot::config::{ConfigFile, LoadedConfig};
+use termshot::redaction::{RedactionConfig, RedactionEngine};
+use termshot::renderer::{
+    ChromeOptions, FontSelection, RedactionRequest, RenderContext, RenderMeta, RenderOptions,
+    Renderer, RendererOptions, TextOptions,
+};
+
+fn out_dir(name: &str) -> std::path::PathBuf {
+    let dir = Path::new("target/api-compat").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// The 1.0.0 constructor: fonts, size, themes, default theme, chrome.
+fn legacy_renderer() -> Renderer {
+    let themes: HashMap<String, ThemeConfig> = HashMap::new();
+    Renderer::new(
+        &FontSelection::default(),
+        16.0,
+        &themes,
+        "dark",
+        &ChromeConfig::default(),
+    )
+    .expect("Renderer::new keeps its 1.0.0 signature")
+}
+
+/// `Renderer::new` still takes five arguments and renders a whole capture.
+#[test]
+fn renderer_new_keeps_its_signature() {
+    let renderer = legacy_renderer();
+    assert!(renderer.theme_names().contains(&"dark".to_string()));
+}
+
+/// `render_bytes` still takes ten arguments and returns the same four-tuple.
+#[test]
+fn render_bytes_keeps_its_signature() {
+    let renderer = legacy_renderer();
+    let dir = out_dir("render-bytes");
+
+    let (path, text, audit, meta): (std::path::PathBuf, String, Vec<(String, usize)>, RenderMeta) =
+        renderer
+            .render_bytes(
+                b"hello legacy world\r\n",
+                80,
+                24,
+                &dir,
+                Some("legacy"),
+                Some("dark"),
+                None,
+                None,
+                TextOptions::default(),
+                true,
+            )
+            .expect("render_bytes keeps its 1.0.0 signature");
+
+    assert!(path.exists());
+    assert!(text.contains("hello legacy world"));
+    assert!(audit.is_empty());
+    assert_eq!(meta.cols, 80);
+    assert_eq!(meta.rows, 24);
+    assert!(meta.auto_crop);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The optional parameters a 1.0.0 caller could pass - a theme, chrome options,
+/// a redaction request, text options - all still take the same types.
+#[test]
+fn render_bytes_optional_arguments_keep_their_types() {
+    let renderer = legacy_renderer();
+    let dir = out_dir("render-bytes-options");
+    let engine = RedactionEngine::from_config(&RedactionConfig::default()).unwrap();
+    let chrome = ChromeOptions::from_config(&ChromeConfig::default());
+    let request = RedactionRequest {
+        engine: &engine,
+        rules: None,
+    };
+
+    let (path, text, audit, _meta) = renderer
+        .render_bytes(
+            b"ip 10.20.30.40 up\r\n",
+            80,
+            24,
+            &dir,
+            None,
+            None,
+            Some(&chrome),
+            Some(&request),
+            TextOptions {
+                strip_ansi: true,
+                redact_text: true,
+                embed_description: true,
+                from_screen: true,
+            },
+            false,
+        )
+        .expect("render_bytes keeps its 1.0.0 signature");
+
+    assert!(path.exists());
+    assert!(!text.contains("10.20.30.40"));
+    assert!(!audit.is_empty());
+    std::fs::remove_file(&path).ok();
+}
+
+/// New behaviour is opt-in through the options types, and the option-taking
+/// forms default to exactly what the legacy calls do.
+#[test]
+fn options_default_to_the_legacy_behaviour() {
+    let themes: HashMap<String, ThemeConfig> = HashMap::new();
+    let renderer = Renderer::new_with_options(
+        &FontSelection::default(),
+        16.0,
+        &themes,
+        "dark",
+        &ChromeConfig::default(),
+        RendererOptions::default(),
+    )
+    .unwrap();
+    let dir = out_dir("options");
+    let data: String = (1..=60).map(|i| format!("line {}\r\n", i)).collect();
+
+    let render = |options: RenderOptions| {
+        renderer
+            .render_bytes_with_options(
+                data.as_bytes(),
+                40,
+                10,
+                &dir,
+                Some("options"),
+                Some("dark"),
+                None,
+                None,
+                TextOptions {
+                    strip_ansi: true,
+                    ..TextOptions::default()
+                },
+                true,
+                options,
+            )
+            .unwrap()
+    };
+
+    let (default_path, default_text, _, _) = render(RenderOptions::default());
+    let (legacy_path, legacy_text, _, _) = renderer
+        .render_bytes(
+            data.as_bytes(),
+            40,
+            10,
+            &dir,
+            Some("options"),
+            Some("dark"),
+            None,
+            None,
+            TextOptions {
+                strip_ansi: true,
+                ..TextOptions::default()
+            },
+            true,
+        )
+        .unwrap();
+    assert_eq!(default_text, legacy_text);
+    assert!(default_text.contains("line 1\n"));
+    assert!(default_text.contains("line 60"));
+
+    for path in [&default_path, &legacy_path] {
+        std::fs::remove_file(path).ok();
+    }
+}
+
+/// `RendererOptions` is defaulted and has a builder, so setting one field never
+/// requires naming the others.
+#[test]
+fn renderer_options_can_be_built_field_by_field() {
+    assert_eq!(
+        RendererOptions::default().with_max_scrollback_lines(500),
+        RendererOptions {
+            max_scrollback_lines: 500,
+        }
+    );
+    // `..RendererOptions::default()` is how a caller stays source-compatible
+    // as fields are added; today there is only one, which clippy would rather
+    // see spelled out.
+    #[allow(clippy::needless_update)]
+    let spread = RendererOptions {
+        max_scrollback_lines: 42,
+        ..RendererOptions::default()
+    };
+    assert_eq!(spread.max_scrollback_lines, 42);
+}
+
+/// `Config` still has exactly the fields it was published with, so an
+/// exhaustive literal - which is how a 1.0.0 dependant with no `..Default`
+/// would have written it - still compiles. Adding a field here would break that
+/// code, so any setting termshot has gained since lives in `LoadedConfig`.
+#[test]
+fn config_still_has_exactly_its_1_0_0_fields() {
+    let config = Config {
+        output_dir: PathBuf::from("target/api-compat/config"),
+        font_path: None,
+        font_size: 16.0,
+        default_cols: 100,
+        default_rows: 30,
+        default_timeout_secs: 30,
+        shell: "/bin/bash".to_string(),
+        embed_description: true,
+        default_theme: "dark".to_string(),
+        chrome: ChromeConfig::default(),
+        themes: HashMap::new(),
+        user_theme_names: BTreeSet::new(),
+        redaction: RedactionConfig::default(),
+    };
+    assert_eq!(config.default_cols, 100);
+    assert_eq!(config.default_rows, 30);
+    assert!(config.themes.is_empty());
+}
+
+/// `RenderMeta` likewise: exactly the six fields 1.0.0 published, named
+/// exhaustively, with no spread.
+#[test]
+fn render_meta_still_has_exactly_its_1_0_0_fields() {
+    let meta = RenderMeta {
+        cols: 100,
+        rows: 30,
+        theme: Some("dark".to_string()),
+        chrome: None,
+        auto_crop: true,
+        from_screen: false,
+    };
+    assert_eq!(meta.cols, 100);
+    assert_eq!(meta.rows, 30);
+    assert!(meta.auto_crop, "auto_crop defaults to on, as it always has");
+    assert!(!meta.from_screen);
+}
+
+/// `ConfigFile` is the third exhaustive public struct: it deserializes the TOML
+/// a 1.0.0 user wrote, and keys added since are read alongside it rather than
+/// as new fields.
+#[test]
+fn config_file_still_has_exactly_its_1_0_0_fields() {
+    let file = ConfigFile {
+        output_dir: "target/api-compat/config-file".to_string(),
+        font_path: None,
+        font_size: 16.0,
+        cols: 120,
+        rows: 40,
+        timeout_secs: 30,
+        shell: None,
+        embed_description: true,
+        default_theme: "dark".to_string(),
+        chrome: ChromeConfig::default(),
+        themes: HashMap::new(),
+        redaction: RedactionConfig::default(),
+    };
+    assert_eq!(file.cols, 120);
+    assert_eq!(file.rows, 40);
+
+    // A config file carrying the newer key still parses into the 1.0.0 struct:
+    // unknown keys are ignored, so old code reading new config keeps working.
+    let parsed: ConfigFile = toml::from_str(
+        "output_dir = \"target/api-compat/config-file\"\nmax_scrollback_lines = 4242\n",
+    )
+    .expect("a 1.0.0 ConfigFile still parses a config file with newer keys");
+    assert_eq!(parsed.output_dir, "target/api-compat/config-file");
+}
+
+/// The settings added since 1.0.0 are reachable through the extension type,
+/// which is what termshot's own CLI and MCP server use.
+#[test]
+fn loaded_config_carries_the_settings_added_after_1_0_0() {
+    let loaded = LoadedConfig::default();
+    assert!(loaded.max_scrollback_lines >= 1);
+    // It derefs to `Config`, so the published fields read exactly as before.
+    assert_eq!(loaded.default_cols, Config::default().default_cols);
+    assert!(loaded.config().themes.contains_key("dark"));
+    assert!(loaded.into_config().themes.contains_key("dark"));
+}
+
+/// `RenderContext` is where the renderer records what it learned after 1.0.0,
+/// and it wraps an untouched `RenderMeta`.
+#[test]
+fn render_context_extends_meta_without_changing_it() {
+    let context = RenderContext::from_meta(RenderMeta {
+        cols: 80,
+        rows: 24,
+        theme: None,
+        chrome: None,
+        auto_crop: true,
+        from_screen: false,
+    });
+    assert_eq!(context.lines, LineSelection::All);
+    assert!(!context.truncated);
+    // It derefs to the metadata it carries.
+    assert_eq!(context.cols, 80);
+    assert_eq!(context.meta.rows, 24);
+}
+
+/// The option-taking render API returns the extended context, so new callers
+/// can see the line selection and truncation the 1.0.0 tuple cannot carry.
+#[test]
+fn the_option_taking_api_returns_the_extended_context() {
+    let renderer = legacy_renderer();
+    let dir = out_dir("render-context");
+    let data: String = (1..=200).map(|i| format!("line {}\r\n", i)).collect();
+
+    let (path, text, _, context) = renderer
+        .render_bytes_with_options(
+            data.as_bytes(),
+            40,
+            10,
+            &dir,
+            Some("context"),
+            Some("dark"),
+            None,
+            None,
+            TextOptions {
+                strip_ansi: true,
+                ..TextOptions::default()
+            },
+            true,
+            RenderOptions::default().with_lines(LineSelection::Head(5)),
+        )
+        .unwrap();
+
+    assert_eq!(context.lines, LineSelection::Head(5));
+    assert!(!context.truncated);
+    assert_eq!(context.meta.cols, 40);
+    assert_eq!(text.lines().count(), 5);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The redaction engine still takes a plain `vt100::Screen`, the way a 1.0.0
+/// caller with its own parser would hand one over.
+#[test]
+fn redaction_still_accepts_a_plain_vt100_screen() {
+    let engine = RedactionEngine::from_config(&RedactionConfig::default()).unwrap();
+    let mut parser = vt100::Parser::new(6, 60, 0);
+    parser.process(b"ip 10.20.30.40 up\r\n");
+
+    let map = engine.redact_screen(parser.screen(), None);
+    assert!(!map.is_empty(), "the IPv4 address should be redacted");
+    assert!(!map.audit_summary().is_empty());
+
+    let mut into = termshot::redaction::RedactionMap::default();
+    engine.redact_screen_into(parser.screen(), None, &mut into);
+    assert_eq!(into.cell_count(), map.cell_count());
+
+    let text = map.redacted_plain_text(parser.screen());
+    assert!(text.contains("ip "));
+    assert!(!text.contains("10.20.30.40"));
+}
+
+/// `RenderMeta` still serializes as the flat record 1.0.0 wrote, and the
+/// extended `RenderContext` flattens it, so a stored 1.0.0 record deserializes
+/// into either.
+#[test]
+fn render_meta_serialization_is_unchanged_and_context_flattens_it() {
+    let meta = RenderMeta {
+        cols: 100,
+        rows: 30,
+        theme: Some("dark".to_string()),
+        chrome: None,
+        auto_crop: false,
+        from_screen: true,
+    };
+    let json = serde_json::to_value(&meta).unwrap();
+    assert_eq!(json["cols"], 100);
+    assert_eq!(json["rows"], 30);
+    assert_eq!(json["auto_crop"], false);
+    assert_eq!(json["from_screen"], true);
+    assert!(
+        json.get("lines").is_none() && json.get("truncated").is_none(),
+        "RenderMeta must not carry the newer fields: {json}"
+    );
+
+    // A 1.0.0 record still reads back as a context, with the newer fields at
+    // their defaults.
+    let context: RenderContext = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(context.meta.cols, 100);
+    assert!(!context.meta.auto_crop);
+    assert_eq!(context.lines, LineSelection::All);
+    assert!(!context.truncated);
+
+    // And a context round-trips through the flattened form.
+    let extended = RenderContext {
+        meta,
+        lines: LineSelection::Tail(7),
+        truncated: true,
+    };
+    let round: RenderContext =
+        serde_json::from_value(serde_json::to_value(&extended).unwrap()).unwrap();
+    assert_eq!(round.lines, LineSelection::Tail(7));
+    assert!(round.truncated);
+    assert_eq!(round.meta.rows, 30);
+
+    // The flattened record still deserializes into the 1.0.0 struct, which
+    // ignores the fields it does not know.
+    let back: RenderMeta =
+        serde_json::from_value(serde_json::to_value(&extended).unwrap()).unwrap();
+    assert_eq!(back.cols, 100);
+    assert!(back.from_screen);
+}

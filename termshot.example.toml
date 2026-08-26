@@ -1,7 +1,12 @@
 output_dir = "/tmp/termshot"
 font_size = 16.0
 cols = 120
+# The terminal viewport a command runs in: `rows` decides where long lines wrap,
+# not how much of the output the screenshot shows. Everything that scrolls off
+# the top is kept and rendered, up to `max_scrollback_lines`. Use
+# --head-lines/--tail-lines to render only one end.
 rows = 40
+max_scrollback_lines = 10000
 timeout_secs = 30
 # Built-in themes use the bundled JetBrains Mono, so they work with no extra
 # fonts installed. Add your own themes as .toml files in

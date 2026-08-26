@@ -11,39 +11,47 @@ use std::path::{Path, PathBuf};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 
-use termshot::config::{ChromeConfig, Config, ThemeConfig};
+use termshot::config::{ChromeConfig, Config, LoadedConfig, ThemeConfig};
 use termshot::redaction::RedactionConfig;
-use termshot::renderer::{FontSelection, Renderer};
+use termshot::renderer::{FontSelection, Renderer, RendererOptions};
 use termshot::server::{
     ComposeScreenshotsParams, ExecuteAndScreenshotParams, RedactScreenshotParams, RedactionSpec,
     RenderAnsiParams, ScreenshotServer,
 };
 
 /// Base configuration for an isolated server whose screenshots land in
-/// `out_dir`.
-fn base_config(out_dir: &Path) -> Config {
+/// `out_dir`. The scrollback capacity rides in `LoadedConfig`, beside the
+/// 1.0.0 `Config`, exactly as `Config::load_with_options` returns it.
+fn base_config(out_dir: &Path) -> LoadedConfig {
     std::fs::create_dir_all(out_dir).unwrap();
-    Config {
-        output_dir: out_dir.to_path_buf(),
-        font_path: None,
-        font_size: 16.0,
-        default_cols: 80,
-        default_rows: 24,
-        default_timeout_secs: 30,
-        shell: "/bin/bash".to_string(),
-        embed_description: true,
-        default_theme: "dark".to_string(),
-        chrome: ChromeConfig::default(),
-        themes: HashMap::new(),
-        user_theme_names: BTreeSet::new(),
-        redaction: RedactionConfig::default(),
+    LoadedConfig {
+        config: Config {
+            output_dir: out_dir.to_path_buf(),
+            font_path: None,
+            font_size: 16.0,
+            default_cols: 80,
+            default_rows: 24,
+            default_timeout_secs: 30,
+            shell: "/bin/bash".to_string(),
+            embed_description: true,
+            default_theme: "dark".to_string(),
+            chrome: ChromeConfig::default(),
+            themes: HashMap::new(),
+            user_theme_names: BTreeSet::new(),
+            redaction: RedactionConfig::default(),
+        },
+        max_scrollback_lines: termshot::capture::DEFAULT_MAX_SCROLLBACK_LINES,
     }
 }
 
 /// Build a server from a config, exactly the way `termshot mcp` does: one
 /// renderer that owns a font chain per configured theme.
-fn server_from_config(config: Config) -> ScreenshotServer {
-    let renderer = Renderer::new(
+fn server_from_config(loaded: LoadedConfig) -> ScreenshotServer {
+    let LoadedConfig {
+        config,
+        max_scrollback_lines,
+    } = loaded;
+    let renderer = Renderer::new_with_options(
         &FontSelection {
             global_font: config.font_path.clone(),
             ..FontSelection::default()
@@ -52,6 +60,7 @@ fn server_from_config(config: Config) -> ScreenshotServer {
         &config.themes,
         &config.default_theme,
         &config.chrome,
+        RendererOptions::default().with_max_scrollback_lines(max_scrollback_lines),
     )
     .expect("renderer");
     ScreenshotServer::new(config, renderer)
@@ -118,6 +127,8 @@ async fn execute_and_screenshot_returns_png_and_text() {
         strip_ansi: Some(true),
         output_name: None,
         auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
     };
 
     let result = server
@@ -181,6 +192,8 @@ async fn execute_and_screenshot_redacts_image_only_by_default() {
         strip_ansi: None,
         output_name: None,
         auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
     };
 
     let result = server
@@ -227,6 +240,8 @@ async fn execute_and_screenshot_redacts_text_when_requested() {
         strip_ansi: None,
         output_name: None,
         auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
     };
 
     let result = server
@@ -272,6 +287,8 @@ async fn execute_and_screenshot_preserves_ansi_by_default() {
         strip_ansi: None,
         output_name: None,
         auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
     };
 
     let result = server
@@ -314,6 +331,8 @@ async fn redact_screenshot_pattern_and_coordinate_flow() {
         strip_ansi: None,
         output_name: None,
         auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
     };
     let first = server
         .execute_and_screenshot(Parameters(params))
@@ -398,6 +417,8 @@ async fn render_ansi_renders_sample_data() {
         redaction_rules: None,
         redact_text: None,
         show_labels: None,
+        head_lines: None,
+        tail_lines: None,
     };
 
     let result = server
@@ -451,6 +472,8 @@ async fn render_ansi_redacts_when_requested() {
         redaction_rules: None,
         redact_text: Some(true),
         show_labels: None,
+        head_lines: None,
+        tail_lines: None,
     };
 
     let result = server
@@ -613,6 +636,8 @@ async fn execute_and_screenshot_respects_output_name_override() {
         strip_ansi: Some(true),
         output_name: Some("My Custom Shot!".to_string()),
         auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
     };
 
     let result = server
@@ -651,6 +676,8 @@ async fn redact_screenshot_uses_in_memory_record_not_sidecars() {
         strip_ansi: None,
         output_name: None,
         auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
     };
     let first = server
         .execute_and_screenshot(Parameters(params))
@@ -724,6 +751,8 @@ async fn explicit_redaction_fails_when_master_switch_is_off() {
         redaction_rules: None,
         redact_text: None,
         show_labels: None,
+        head_lines: None,
+        tail_lines: None,
     };
 
     let err = server
@@ -793,6 +822,8 @@ async fn render_with_theme(
         redaction_rules: None,
         redact_text: None,
         show_labels: None,
+        head_lines: None,
+        tail_lines: None,
     };
     let result = server
         .render_ansi(Parameters(params))
@@ -952,6 +983,8 @@ async fn render_pane(server: &ScreenshotServer, dir: &Path, name: &str, text: &s
         redaction_rules: None,
         redact_text: None,
         show_labels: None,
+        head_lines: None,
+        tail_lines: None,
     };
     let result = server
         .render_ansi(Parameters(params))
@@ -1133,6 +1166,8 @@ async fn redact_screenshot_masks_a_secret_split_by_a_soft_wrap() {
         strip_ansi: None,
         output_name: Some("soft-wrap-capture".to_string()),
         auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
     };
     let captured = server
         .execute_and_screenshot(Parameters(params))
@@ -1279,6 +1314,8 @@ async fn auto_redaction_masks_a_secret_split_by_a_soft_wrap() {
         strip_ansi: None,
         output_name: Some("auto-soft-wrap".to_string()),
         auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
     };
     let result = server
         .execute_and_screenshot(Parameters(params))
@@ -1333,6 +1370,8 @@ async fn hard_newlines_are_not_joined_into_a_match() {
         strip_ansi: Some(true),
         output_name: Some("halves".to_string()),
         auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
     };
     let rendered = server
         .render_ansi(Parameters(params))
@@ -1377,4 +1416,820 @@ async fn hard_newlines_are_not_joined_into_a_match() {
         "nothing should have been masked:\n{}",
         terminal_out
     );
+}
+
+// -------------------------------------------------------------------------
+// Full-output capture: `rows` is the viewport, not a limit on what is shown
+// -------------------------------------------------------------------------
+
+/// How one `render_ansi` call in the tests below is set up. Defaults to a
+/// 10x80 viewport, no line selection (so every retained line is rendered), and
+/// redaction off.
+struct RenderCase<'a> {
+    name: &'a str,
+    text: &'a str,
+    rows: u16,
+    cols: u16,
+    head_lines: Option<usize>,
+    tail_lines: Option<usize>,
+    redact: Option<bool>,
+    auto_crop: Option<bool>,
+}
+
+impl Default for RenderCase<'_> {
+    fn default() -> Self {
+        Self {
+            name: "case",
+            text: "",
+            rows: 10,
+            cols: 80,
+            head_lines: None,
+            tail_lines: None,
+            redact: Some(false),
+            auto_crop: None,
+        }
+    }
+}
+
+/// Write `case.text` to a file and render it with `render_ansi`.
+async fn render_ansi_lines(
+    server: &ScreenshotServer,
+    dir: &Path,
+    case: RenderCase<'_>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let input_path = dir.join(format!("{}.ansi", case.name));
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(&input_path, case.text).unwrap();
+    let params = RenderAnsiParams {
+        input_path: input_path.display().to_string(),
+        cols: Some(case.cols),
+        rows: Some(case.rows),
+        theme: None,
+        chrome: None,
+        title: None,
+        timestamp: None,
+        rounded: None,
+        strip_ansi: None,
+        output_name: Some(case.name.to_string()),
+        auto_crop: case.auto_crop,
+        redact: case.redact,
+        redaction_rules: None,
+        redact_text: None,
+        show_labels: None,
+        head_lines: case.head_lines,
+        tail_lines: case.tail_lines,
+    };
+    server.render_ansi(Parameters(params)).await
+}
+
+/// A command whose output is far taller than the viewport must still be
+/// captured whole: the screenshot - and the `Description` metadata that
+/// mirrors it - has to hold the first line as well as the last.
+#[tokio::test]
+async fn execute_and_screenshot_captures_output_taller_than_the_viewport() {
+    let dir = Path::new("target/mcp-int/full-output");
+    let server = make_server(dir);
+
+    let params = ExecuteAndScreenshotParams {
+        command: "seq 1 200".to_string(),
+        cols: Some(80),
+        // Ten rows of viewport for two hundred lines of output.
+        rows: Some(10),
+        timeout_secs: Some(30),
+        show_prompt: Some(false),
+        theme: None,
+        commands: None,
+        chrome: None,
+        title: None,
+        timestamp: None,
+        rounded: None,
+        redact: Some(false),
+        redaction_rules: None,
+        redact_text: None,
+        show_labels: None,
+        strip_ansi: Some(true),
+        output_name: Some("full-output".to_string()),
+        auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
+    };
+    let result = server
+        .execute_and_screenshot(Parameters(params))
+        .await
+        .expect("execute_and_screenshot");
+    let text = result_text(&result);
+    let png = screenshot_path(&text);
+
+    let description =
+        termshot::renderer::read_png_description(&png).expect("screenshot carries a description");
+    let lines: Vec<&str> = description.lines().map(str::trim).collect();
+    assert!(
+        lines.contains(&"1"),
+        "the first line scrolled out of the capture:\n{}",
+        &description[..description.len().min(200)]
+    );
+    assert!(
+        lines.contains(&"200"),
+        "the last line is missing from the capture"
+    );
+    assert!(
+        text.contains("\n1\n") && text.contains("\n200"),
+        "returned text is missing the scrolled-off output"
+    );
+}
+
+/// `head_lines` shows the first N lines and nothing else.
+#[tokio::test]
+async fn render_ansi_head_lines_keeps_only_the_first_lines() {
+    let dir = Path::new("target/mcp-int/head-lines");
+    let server = make_server(dir);
+    let input: String = (1..=200).map(|i| format!("line {}\n", i)).collect();
+
+    let result = render_ansi_lines(
+        &server,
+        dir,
+        RenderCase {
+            name: "head",
+            text: &input,
+            head_lines: Some(10),
+            ..RenderCase::default()
+        },
+    )
+    .await
+    .expect("render_ansi");
+    let png = screenshot_path(&result_text(&result));
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+
+    let lines: Vec<&str> = description.lines().collect();
+    assert_eq!(lines.len(), 10, "expected ten lines, got:\n{description}");
+    assert_eq!(lines[0], "line 1");
+    assert_eq!(lines[9], "line 10");
+    assert!(
+        !description.contains("line 11"),
+        "head selection leaked later lines:\n{description}"
+    );
+}
+
+/// `tail_lines` shows the last N lines and nothing else.
+#[tokio::test]
+async fn render_ansi_tail_lines_keeps_only_the_last_lines() {
+    let dir = Path::new("target/mcp-int/tail-lines");
+    let server = make_server(dir);
+    let input: String = (1..=200).map(|i| format!("line {}\n", i)).collect();
+
+    let result = render_ansi_lines(
+        &server,
+        dir,
+        RenderCase {
+            name: "tail",
+            text: &input,
+            tail_lines: Some(10),
+            ..RenderCase::default()
+        },
+    )
+    .await
+    .expect("render_ansi");
+    let png = screenshot_path(&result_text(&result));
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+
+    let lines: Vec<&str> = description.lines().collect();
+    assert_eq!(lines.len(), 10, "expected ten lines, got:\n{description}");
+    assert_eq!(lines[0], "line 191");
+    assert_eq!(lines[9], "line 200");
+    assert!(
+        !description.contains("line 190"),
+        "tail selection leaked earlier lines:\n{description}"
+    );
+}
+
+/// Asking for both ends at once is a caller error, not a silent preference for
+/// one of them.
+#[tokio::test]
+async fn head_and_tail_lines_are_rejected_together() {
+    let dir = Path::new("target/mcp-int/head-tail-conflict");
+    let server = make_server(dir);
+
+    let err = render_ansi_lines(
+        &server,
+        dir,
+        RenderCase {
+            name: "both",
+            text: "one\ntwo\n",
+            head_lines: Some(5),
+            tail_lines: Some(5),
+            ..RenderCase::default()
+        },
+    )
+    .await
+    .expect_err("head_lines + tail_lines must be rejected");
+    assert!(
+        err.message.contains("mutually exclusive"),
+        "unhelpful error: {}",
+        err.message
+    );
+
+    let params = ExecuteAndScreenshotParams {
+        command: "echo hi".to_string(),
+        cols: Some(80),
+        rows: Some(10),
+        timeout_secs: Some(30),
+        show_prompt: Some(false),
+        theme: None,
+        commands: None,
+        chrome: None,
+        title: None,
+        timestamp: None,
+        rounded: None,
+        redact: Some(false),
+        redaction_rules: None,
+        redact_text: None,
+        show_labels: None,
+        strip_ansi: None,
+        output_name: None,
+        auto_crop: None,
+        head_lines: Some(5),
+        tail_lines: Some(5),
+    };
+    let err = server
+        .execute_and_screenshot(Parameters(params))
+        .await
+        .expect_err("head_lines + tail_lines must be rejected");
+    assert!(
+        err.message.contains("mutually exclusive"),
+        "unhelpful error: {}",
+        err.message
+    );
+}
+
+/// Redaction runs over the whole capture, so a secret that scrolled out of the
+/// viewport long ago is masked just like one still on screen - in the image, in
+/// the `Description` metadata, and in the audit counts.
+#[tokio::test]
+async fn redaction_covers_scrollback_and_the_current_viewport() {
+    let dir = Path::new("target/mcp-int/scrollback-redaction");
+    let server = make_server(dir);
+
+    let mut input = String::from("early key AKIAIOSFODNN7EXAMPLE\n");
+    for i in 1..=150 {
+        input.push_str(&format!("filler {}\n", i));
+    }
+    input.push_str("late key AKIAI44QH8DHBEXAMPLE\n");
+
+    let result = render_ansi_lines(
+        &server,
+        dir,
+        RenderCase {
+            name: "scrollback-secrets",
+            text: &input,
+            redact: Some(true),
+            ..RenderCase::default()
+        },
+    )
+    .await
+    .expect("render_ansi");
+    let text = result_text(&result);
+    let png = screenshot_path(&text);
+
+    // Two matches: one from the scrollback, one from the current screen.
+    assert!(
+        text.contains("2x aws_key"),
+        "both keys should be redacted, got:\n{}",
+        text.lines()
+            .find(|l| l.starts_with("Redacted:"))
+            .unwrap_or("(no audit line)")
+    );
+
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    assert!(
+        !description.contains("AKIAIOSFODNN7EXAMPLE"),
+        "the scrolled-off key leaked into the PNG metadata"
+    );
+    assert!(
+        !description.contains("AKIAI44QH8DHBEXAMPLE"),
+        "the on-screen key leaked into the PNG metadata"
+    );
+    assert!(
+        description.contains('\u{2588}'),
+        "nothing was masked in the metadata:\n{description}"
+    );
+}
+
+/// A composed image carries the descriptions of the panes as they were
+/// rendered, so head/tail selections survive into the composite's metadata.
+#[tokio::test]
+async fn composed_description_preserves_each_panes_selection() {
+    let dir = Path::new("target/mcp-int/compose-selection");
+    let server = make_server(dir);
+    let input: String = (1..=100).map(|i| format!("line {}\n", i)).collect();
+
+    let head = render_ansi_lines(
+        &server,
+        dir,
+        RenderCase {
+            name: "sel-head",
+            text: &input,
+            rows: 5,
+            cols: 40,
+            head_lines: Some(3),
+            ..RenderCase::default()
+        },
+    )
+    .await
+    .expect("render_ansi");
+    let head_png = screenshot_path(&result_text(&head));
+    let tail = render_ansi_lines(
+        &server,
+        dir,
+        RenderCase {
+            name: "sel-tail",
+            text: &input,
+            rows: 5,
+            cols: 40,
+            tail_lines: Some(3),
+            ..RenderCase::default()
+        },
+    )
+    .await
+    .expect("render_ansi");
+    let tail_png = screenshot_path(&result_text(&tail));
+
+    let out = dir.join("selection.png");
+    let composed = compose(&server, &[head_png, tail_png], &out).await;
+    let description =
+        termshot::renderer::read_png_description(&composed).expect("composed description");
+
+    let (first, second) = description
+        .split_once("--- Pane 2 ---")
+        .expect("panes are separated");
+    assert_eq!(
+        first.trim().lines().collect::<Vec<_>>(),
+        vec!["line 1", "line 2", "line 3"],
+        "first pane lost its head selection:\n{description}"
+    );
+    assert_eq!(
+        second.trim().lines().collect::<Vec<_>>(),
+        vec!["line 98", "line 99", "line 100"],
+        "second pane lost its tail selection:\n{description}"
+    );
+}
+
+/// Output that never overflows the viewport must render exactly as before:
+/// the capture is the screen, and the image is the same size it always was.
+#[tokio::test]
+async fn short_output_renders_the_same_as_before() {
+    let dir = Path::new("target/mcp-int/short-output");
+    let server = make_server(dir);
+
+    let result = render_ansi_lines(
+        &server,
+        dir,
+        RenderCase {
+            name: "short",
+            text: "alpha\nbeta\n",
+            rows: 24,
+            ..RenderCase::default()
+        },
+    )
+    .await
+    .expect("render_ansi");
+    let png = screenshot_path(&result_text(&result));
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    assert_eq!(description, "alpha\nbeta");
+}
+
+/// `redact_screenshot` re-renders from the same capture the screenshot was made
+/// from, so the line selection is preserved and cell coordinates still address
+/// the rows the image actually shows.
+#[tokio::test]
+async fn redact_screenshot_preserves_the_original_line_selection() {
+    let dir = Path::new("target/mcp-int/redact-selection");
+    let server = make_server(dir);
+    let mut input: String = (1..=100).map(|i| format!("line {}\n", i)).collect();
+    input.push_str("token AKIAIOSFODNN7EXAMPLE\n");
+
+    let result = render_ansi_lines(
+        &server,
+        dir,
+        RenderCase {
+            name: "sel-redact",
+            text: &input,
+            tail_lines: Some(3),
+            ..RenderCase::default()
+        },
+    )
+    .await
+    .expect("render_ansi");
+    let png = screenshot_path(&result_text(&result));
+    assert_eq!(
+        termshot::renderer::read_png_description(&png).expect("description"),
+        "line 99\nline 100\ntoken AKIAIOSFODNN7EXAMPLE"
+    );
+
+    let params = RedactScreenshotParams {
+        screenshot_path: png.display().to_string(),
+        redactions: vec![
+            RedactionSpec::Pattern {
+                pattern: r"AKIA[0-9A-Z]{16}".to_string(),
+                replacement: Some("[KEY]".to_string()),
+                keep_prefix: None,
+                keep_suffix: None,
+            },
+            // Row 0 of the *selection*, i.e. the first line the image shows.
+            RedactionSpec::Coordinate {
+                row: 0,
+                col_start: 0,
+                col_end: 7,
+                label: Some("L".to_string()),
+            },
+        ],
+        redact_text: Some(true),
+        show_labels: Some(true),
+        strip_ansi: Some(true),
+    };
+    let result = server
+        .redact_screenshot(Parameters(params))
+        .await
+        .expect("redact_screenshot");
+    let text = result_text(&result);
+
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    let lines: Vec<&str> = description.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "the tail selection was lost on re-render:\n{description}"
+    );
+    assert_eq!(
+        lines[0],
+        "\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}"
+    );
+    assert!(
+        !description.contains("AKIAIOSFODNN7EXAMPLE"),
+        "the key survived re-rendering:\n{description}"
+    );
+    assert!(!text.contains("AKIAIOSFODNN7EXAMPLE"));
+}
+
+// -------------------------------------------------------------------------
+// Coordinate redactions are validated against the cells the render paints
+// -------------------------------------------------------------------------
+
+/// Render three short lines and return the screenshot path.
+///
+/// The capture is 6 rows x 20 columns, but the image is not: the renderer stops
+/// one row past the last row with content and (by default) one column past the
+/// last column with content, so the pixels are 4 rows x 5 columns. Everything
+/// below tests coordinates against *that*.
+async fn coordinate_fixture(server: &ScreenshotServer, dir: &Path, name: &str) -> PathBuf {
+    coordinate_fixture_cropped(server, dir, name, None).await
+}
+
+/// [`coordinate_fixture`] with an explicit `auto_crop` setting.
+async fn coordinate_fixture_cropped(
+    server: &ScreenshotServer,
+    dir: &Path,
+    name: &str,
+    auto_crop: Option<bool>,
+) -> PathBuf {
+    let result = render_ansi_lines(
+        server,
+        dir,
+        RenderCase {
+            name,
+            text: "alpha\nbeta\ngamma\n",
+            rows: 6,
+            cols: 20,
+            auto_crop,
+            ..RenderCase::default()
+        },
+    )
+    .await
+    .expect("render_ansi");
+    screenshot_path(&result_text(&result))
+}
+
+/// Apply a single coordinate redaction to `png`.
+async fn redact_coordinate(
+    server: &ScreenshotServer,
+    png: &Path,
+    row: u16,
+    col_start: u16,
+    col_end: u16,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let params = RedactScreenshotParams {
+        screenshot_path: png.display().to_string(),
+        redactions: vec![RedactionSpec::Coordinate {
+            row,
+            col_start,
+            col_end,
+            label: Some("X".to_string()),
+        }],
+        redact_text: Some(true),
+        show_labels: Some(false),
+        strip_ansi: Some(true),
+    };
+    server.redact_screenshot(Parameters(params)).await
+}
+
+/// Decode a rendered PNG into `(width, height, rgba bytes)`.
+fn png_pixels(path: &Path) -> (u32, u32, Vec<u8>) {
+    let img = image::open(path)
+        .unwrap_or_else(|e| panic!("decode {}: {e}", path.display()))
+        .to_rgba8();
+    (img.width(), img.height(), img.into_raw())
+}
+
+/// A row the capture retains but the render never paints is refused, not
+/// silently ignored: the caller asked for cells to be covered, and a blank
+/// trailing row is trimmed off the image before a single pixel is drawn.
+#[tokio::test]
+async fn redact_screenshot_rejects_a_trailing_blank_row() {
+    let dir = Path::new("target/mcp-int/coord-row-oob");
+    let server = make_server(dir);
+    let png = coordinate_fixture(&server, dir, "coord-row").await;
+
+    // Rows 4 and 5 are inside the 6-row capture and blank, so the render stops
+    // before them: accepting them would report a redaction that never appeared.
+    for row in [4u16, 5] {
+        let message = redact_coordinate(&server, &png, row, 0, 3)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("blank row {row} must be refused"))
+            .to_string();
+        assert!(
+            message.contains(&format!("row {row}"))
+                && message.contains("past the last rendered row"),
+            "unhelpful error: {message}"
+        );
+        assert!(
+            message.contains("renders 4 row(s) x 5 column(s)"),
+            "the error must report the rendered dimensions: {message}"
+        );
+    }
+
+    // A row past the capture entirely is refused the same way.
+    assert!(redact_coordinate(&server, &png, 6, 0, 3).await.is_err());
+    assert!(redact_coordinate(&server, &png, 5_000, 0, 3).await.is_err());
+}
+
+/// Columns are checked against the auto-cropped width, at both ends of the
+/// range: the image is trimmed to the rightmost column with content, so the
+/// empty ones the capture still holds cannot be redacted.
+#[tokio::test]
+async fn redact_screenshot_rejects_columns_past_the_rendered_width() {
+    let dir = Path::new("target/mcp-int/coord-col-oob");
+    let server = make_server(dir);
+    let png = coordinate_fixture(&server, dir, "coord-col").await;
+
+    // Inside the 20-column capture, past the 5 columns auto_crop leaves.
+    let err = redact_coordinate(&server, &png, 0, 10, 15)
+        .await
+        .expect_err("a column past the cropped width must be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("col_start 10") && message.contains("past the last rendered column"),
+        "unhelpful error: {message}"
+    );
+    assert!(
+        message.contains("renders 4 row(s) x 5 column(s)"),
+        "the error must report the rendered dimensions: {message}"
+    );
+
+    // Past the capture altogether.
+    let err = redact_coordinate(&server, &png, 0, 20, 25)
+        .await
+        .expect_err("col_start past the grid must be refused");
+    assert!(
+        err.to_string().contains("col_start 20"),
+        "unhelpful error: {err}"
+    );
+
+    // col_start inside the rendered width but col_end past its right edge: the
+    // range would only be partly covered, which is exactly the silent failure
+    // the check exists to prevent.
+    let err = redact_coordinate(&server, &png, 0, 3, 8)
+        .await
+        .expect_err("col_end past the rendered width must be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("col_end 8") && message.contains("past the last rendered column boundary"),
+        "unhelpful error: {message}"
+    );
+}
+
+/// An empty or reversed column interval covers nothing, so accepting it would
+/// report a redaction that never happened.
+#[tokio::test]
+async fn redact_screenshot_rejects_an_empty_or_reversed_column_range() {
+    let dir = Path::new("target/mcp-int/coord-empty");
+    let server = make_server(dir);
+    let png = coordinate_fixture(&server, dir, "coord-empty").await;
+
+    for (col_start, col_end) in [(3u16, 3u16), (5, 2)] {
+        let err = redact_coordinate(&server, &png, 0, col_start, col_end)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("an empty range ({col_start}..{col_end}) must be refused"));
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("col_start {}", col_start))
+                && message.contains("the range is empty"),
+            "unhelpful error for {col_start}..{col_end}: {message}"
+        );
+    }
+}
+
+/// The same column that auto_crop puts out of reach is redactable when the
+/// screenshot was rendered without it: the image really is the full grid then,
+/// so the cell really is painted.
+#[tokio::test]
+async fn a_column_past_the_crop_is_accepted_without_auto_crop() {
+    let dir = Path::new("target/mcp-int/coord-no-crop");
+    let server = make_server(dir);
+    let png = coordinate_fixture_cropped(&server, dir, "coord-no-crop", Some(false)).await;
+
+    let before = png_pixels(&png);
+    let result = redact_coordinate(&server, &png, 0, 10, 15)
+        .await
+        .expect("without auto_crop the full grid width is rendered");
+    let text = result_text(&result);
+    assert!(
+        text.contains("Redacted: 1x manual"),
+        "the audit must count the redaction: {text}"
+    );
+
+    let after = png_pixels(&png);
+    assert_eq!(
+        (before.0, before.1),
+        (after.0, after.1),
+        "the re-render must keep the same geometry"
+    );
+    assert_ne!(
+        before.2, after.2,
+        "no pixels were painted for the redaction"
+    );
+
+    // Trailing blank rows are trimmed whatever auto_crop says, so the row bound
+    // is unchanged.
+    let err = redact_coordinate(&server, &png, 4, 0, 3)
+        .await
+        .expect_err("a blank trailing row is trimmed even without auto_crop");
+    assert!(
+        err.to_string().contains("renders 4 row(s) x 20 column(s)"),
+        "unhelpful error: {err}"
+    );
+}
+
+/// The boundary itself is valid: the last rendered row and a range ending
+/// exactly at the last rendered column are accepted, counted in the audit, and
+/// actually painted.
+#[tokio::test]
+async fn redact_screenshot_accepts_the_last_rendered_cell() {
+    let dir = Path::new("target/mcp-int/coord-boundary");
+    let server = make_server(dir);
+    let png = coordinate_fixture(&server, dir, "coord-boundary").await;
+
+    // Last rendered row (3 of 4) and last rendered column (4 of 5) - blank
+    // cells, but ones the image draws.
+    let before = png_pixels(&png);
+    let result = redact_coordinate(&server, &png, 3, 4, 5)
+        .await
+        .expect("the last rendered row and column are inside the image");
+    let text = result_text(&result);
+    assert!(text.contains("Redacted screenshot saved to"));
+    assert!(
+        text.contains("Redacted: 1x manual"),
+        "the audit must count the redaction: {text}"
+    );
+
+    let after = png_pixels(&png);
+    assert_eq!((before.0, before.1), (after.0, after.1));
+    assert_ne!(
+        before.2, after.2,
+        "the last visible cell was accepted but never painted"
+    );
+
+    // Row 0, columns 0..5, covers "alpha" and really removes it.
+    let result = redact_coordinate(&server, &png, 0, 0, 5)
+        .await
+        .expect("a range inside the rendered image is accepted");
+    let text = result_text(&result);
+    let terminal_out = text
+        .split("--- Terminal Output ---")
+        .nth(1)
+        .expect("terminal output section");
+    assert!(
+        !terminal_out.contains("alpha"),
+        "the covered cells were not masked: {terminal_out}"
+    );
+    assert!(terminal_out.contains("beta"));
+
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    assert!(
+        description.starts_with("\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}"),
+        "the image no longer shows the mask: {description}"
+    );
+}
+
+/// A pattern redaction is matched against the capture, not against the manual
+/// coordinate bounds, so it still reaches the rightmost content cell - and the
+/// continuation cell of a double-width character sitting there.
+#[tokio::test]
+async fn pattern_redaction_still_reaches_the_rightmost_content_cell() {
+    let dir = Path::new("target/mcp-int/coord-pattern-edge");
+    let server = make_server(dir);
+    let result = render_ansi_lines(
+        &server,
+        dir,
+        RenderCase {
+            name: "pattern-edge",
+            // The secret ends the longest line, so its last cell is the
+            // rightmost column auto_crop keeps; the wide characters below it
+            // push the crop out to a continuation cell.
+            text: "user AKIAIOSFODNN7EXAMPLE\n\u{5e83}\u{5e83}\u{5e83}\n",
+            rows: 6,
+            cols: 40,
+            ..RenderCase::default()
+        },
+    )
+    .await
+    .expect("render_ansi");
+    let png = screenshot_path(&result_text(&result));
+
+    let params = RedactScreenshotParams {
+        screenshot_path: png.display().to_string(),
+        redactions: vec![RedactionSpec::Pattern {
+            pattern: "AKIA[0-9A-Z]{16}".to_string(),
+            replacement: None,
+            keep_prefix: None,
+            keep_suffix: None,
+        }],
+        redact_text: Some(true),
+        show_labels: Some(false),
+        strip_ansi: Some(true),
+    };
+    let result = server
+        .redact_screenshot(Parameters(params))
+        .await
+        .expect("pattern redaction");
+    let text = result_text(&result);
+    assert!(
+        text.contains("Redacted: 1x custom_0"),
+        "the pattern must still match: {text}"
+    );
+    assert!(
+        !text.contains("AKIAIOSFODNN7EXAMPLE"),
+        "the key survived: {text}"
+    );
+
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    assert!(
+        description.contains(&"\u{2588}".repeat(20)),
+        "the whole key must be masked in the image: {description}"
+    );
+    assert!(
+        description.contains('\u{5e83}'),
+        "the wide characters must survive: {description}"
+    );
+}
+
+/// Coordinates are validated against the *selected* capture as it is rendered,
+/// not the PTY viewport: a `tail_lines` screenshot is three rows tall no matter
+/// how much output scrolled past, and auto_crop narrows it to the width of the
+/// lines it shows.
+#[tokio::test]
+async fn coordinate_bounds_follow_the_rendered_line_selection() {
+    let dir = Path::new("target/mcp-int/coord-selection");
+    let server = make_server(dir);
+    let input: String = (1..=300).map(|i| format!("line {}\n", i)).collect();
+
+    let result = render_ansi_lines(
+        &server,
+        dir,
+        RenderCase {
+            name: "coord-sel",
+            text: &input,
+            rows: 10,
+            cols: 40,
+            tail_lines: Some(3),
+            ..RenderCase::default()
+        },
+    )
+    .await
+    .expect("render_ansi");
+    let png = screenshot_path(&result_text(&result));
+
+    let err = redact_coordinate(&server, &png, 3, 0, 4)
+        .await
+        .expect_err("row 3 is past a three-row selection");
+    let message = err.to_string();
+    assert!(
+        message.contains("renders 3 row(s) x 8 column(s)"),
+        "the bounds must describe the rendered selection, not the viewport: {message}"
+    );
+
+    // The last row of the selection is in bounds.
+    redact_coordinate(&server, &png, 2, 0, 4)
+        .await
+        .expect("row 2 is the last row of a three-row selection");
 }

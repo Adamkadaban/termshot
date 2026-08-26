@@ -1,3 +1,7 @@
+use crate::capture::{
+    CapturedScreen, DEFAULT_MAX_SCROLLBACK_LINES, LineSelection, cell_has_content,
+    effective_scrollback_lines,
+};
 use crate::config::{ChromeConfig, ThemeConfig};
 use crate::redaction::{RedactionEngine, RedactionMap};
 use anyhow::{Context, Result};
@@ -7,7 +11,6 @@ use image::{ImageBuffer, Rgba, RgbaImage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use vt100::Screen;
 
 /// JetBrains Mono font compiled directly into the binary so that release
 /// archives and `cargo install` builds always have a working font, even when
@@ -31,11 +34,38 @@ const RENDER_SCALE: u32 = 2;
 /// PNG. Any real content is trimmed to its exact bound.
 const MIN_CONTENT_COLS: u32 = 1;
 
+/// Largest image, in pixels, that will be rendered.
+///
+/// A capture of a command that printed tens of thousands of lines would
+/// otherwise ask the allocator for gigabytes. 64 megapixels is one 256 MB RGBA
+/// buffer, and at a standard 120-column terminal it is still several hundred
+/// lines of output - far more than fits on any screen. Past it the error points
+/// at `--head-lines` / `--tail-lines`.
+const MAX_IMAGE_PIXELS: u64 = 64_000_000;
+
+/// Peak bytes of image buffer a single render may hold at once.
+///
+/// The pixel ceiling alone does not bound memory: composing window chrome holds
+/// the framed window and the shadowed canvas at the same time, so the peak is a
+/// multiple of the final image. This budget is checked against *all* the
+/// full-size buffers a render will hold simultaneously, so a shadowed window is
+/// held to roughly half the bare ceiling instead of quietly costing twice as
+/// much.
+const MAX_RENDER_BYTES: u64 = 320 * 1024 * 1024;
+
+/// Bytes per pixel in the RGBA buffers the renderer allocates.
+const BYTES_PER_PIXEL: u64 = 4;
+
 /// Metadata describing how a screenshot was rendered, so it can later be
 /// re-rendered (e.g. by the `redact_screenshot` MCP tool) with identical
 /// geometry and styling. The MCP server keeps this in memory (alongside the
 /// raw terminal bytes) for the lifetime of the process; it is not written to
 /// disk.
+///
+/// This is the shape published in 1.0.0 and it stays that way: it is a public
+/// struct with public fields that external code builds with exhaustive
+/// literals, so a new field here would be a source-breaking change. Anything
+/// the renderer has learned to record since travels in [`RenderContext`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RenderMeta {
     pub cols: u16,
@@ -55,6 +85,60 @@ pub struct RenderMeta {
     pub from_screen: bool,
 }
 
+impl Default for RenderMeta {
+    fn default() -> Self {
+        Self {
+            cols: 80,
+            rows: 24,
+            theme: None,
+            chrome: None,
+            auto_crop: default_auto_crop(),
+            from_screen: false,
+        }
+    }
+}
+
+/// A [`RenderMeta`] plus everything the renderer learned about a capture after
+/// 1.0.0 froze that struct's shape.
+///
+/// Returned by the option-taking APIs ([`Renderer::render_bytes_with_options`])
+/// and kept by the MCP server's render cache, so a re-render reproduces not
+/// only the original geometry and styling but the same lines of the same
+/// capture - and so its cell coordinates mean the same thing.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RenderContext {
+    /// The 1.0.0 metadata, unchanged.
+    #[serde(flatten)]
+    pub meta: RenderMeta,
+    /// Which of the retained lines the screenshot showed.
+    #[serde(default)]
+    pub lines: LineSelection,
+    /// Whether more output scrolled off than the scrollback could hold while
+    /// capturing, so the oldest lines were dropped before rendering.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl RenderContext {
+    /// A context around metadata with no line selection, which is what a 1.0.0
+    /// [`RenderMeta`] describes: the whole capture, nothing dropped.
+    pub fn from_meta(meta: RenderMeta) -> Self {
+        Self {
+            meta,
+            lines: LineSelection::All,
+            truncated: false,
+        }
+    }
+}
+
+impl std::ops::Deref for RenderContext {
+    type Target = RenderMeta;
+
+    fn deref(&self) -> &RenderMeta {
+        &self.meta
+    }
+}
+
 fn default_auto_crop() -> bool {
     true
 }
@@ -63,6 +147,10 @@ fn default_auto_crop() -> bool {
 /// audit counts (empty when no redaction was applied), and the render metadata
 /// needed to later re-render (e.g. for `redact_screenshot`).
 pub type RenderOutput = (PathBuf, String, Vec<(String, usize)>, RenderMeta);
+
+/// [`RenderOutput`] with the extended [`RenderContext`] in place of the 1.0.0
+/// [`RenderMeta`], as the option-taking render APIs return it.
+pub type RenderOutputWithContext = (PathBuf, String, Vec<(String, usize)>, RenderContext);
 
 /// How [`compose_images`] arranges multiple source screenshots on the canvas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,9 +393,10 @@ pub struct TextOptions {
     /// screenshot deliberately drops. Reading those bytes as text shows things
     /// that were never on screen, so the screen itself is the honest source.
     ///
-    /// Left unset for `render`, where the bytes *are* the document and a log
-    /// longer than the terminal would otherwise be truncated to its last
-    /// screenful.
+    /// Left unset for `render`, where the bytes *are* the document, so the
+    /// text returned is the file itself rather than a re-rendering of it.
+    /// A head/tail line selection overrides this: text that does not match the
+    /// picture would only mislead.
     pub from_screen: bool,
 }
 
@@ -552,9 +641,12 @@ pub fn save_png(img: &RgbaImage, path: &Path, description: Option<&str>) -> Resu
     Ok(())
 }
 
-/// Maximum size of an embedded `Description` text chunk. Long captures are
+/// Maximum size of an embedded `Description` text chunk. Sized so the text of
+/// a full capture - which is every retained line, not just the last screenful -
+/// fits: at ~60 bytes a line that covers several thousand lines, well past the
+/// point where the image itself dominates the file. Longer captures are
 /// truncated so a screenshot's metadata never dwarfs its pixels.
-const MAX_DESCRIPTION_BYTES: usize = 16 * 1024;
+const MAX_DESCRIPTION_BYTES: usize = 256 * 1024;
 
 /// Read the UTF-8 `Description` text embedded in a PNG by [`save_png`].
 ///
@@ -622,7 +714,7 @@ fn composed_description(paths: &[PathBuf]) -> Option<String> {
 /// what a capture destined for the renderer must not do (it would erase the
 /// terminal's soft-wrap information, and with it the ability to redact a value
 /// that crossed the right margin).
-fn screen_ansi_text(screen: &Screen, cols: u16) -> String {
+fn screen_ansi_text(screen: &CapturedScreen, cols: u16) -> String {
     let (rows, _) = screen.size();
     let mut out = String::new();
 
@@ -893,6 +985,59 @@ impl FontSelection {
     }
 }
 
+/// Capture settings for a [`Renderer`].
+///
+/// A struct rather than another constructor parameter so later settings can be
+/// added without changing anyone's call: build one with
+/// [`RendererOptions::default`] and override only what you need, either through
+/// the builder method or with `..RendererOptions::default()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RendererOptions {
+    /// How many scrolled-off lines a capture retains. See [`crate::capture`]:
+    /// the viewport height decides where lines wrap, this decides how much of
+    /// the output survives to be rendered. Clamped per capture to what the
+    /// retained-cell budget allows for the terminal's width.
+    ///
+    /// This is a *tail*-retention bound. A [`LineSelection::Head`] render
+    /// ignores it and streams the beginning of the output as it scrolls past,
+    /// so `Head(n)` is lines 1..n at any capacity.
+    pub max_scrollback_lines: usize,
+}
+
+impl Default for RendererOptions {
+    fn default() -> Self {
+        Self {
+            max_scrollback_lines: DEFAULT_MAX_SCROLLBACK_LINES,
+        }
+    }
+}
+
+impl RendererOptions {
+    /// Set how many scrolled-off lines a capture retains.
+    pub fn with_max_scrollback_lines(mut self, lines: usize) -> Self {
+        self.max_scrollback_lines = lines;
+        self
+    }
+}
+
+/// Per-render settings for [`Renderer::render_bytes_with_options`].
+///
+/// Defaults to rendering every retained line, which is exactly what the
+/// 1.0.0 [`Renderer::render_bytes`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RenderOptions {
+    /// Which of the retained lines to render.
+    pub lines: LineSelection,
+}
+
+impl RenderOptions {
+    /// Render only the lines `selection` names.
+    pub fn with_lines(mut self, selection: LineSelection) -> Self {
+        self.lines = selection;
+        self
+    }
+}
+
 /// Renders a vt100 screen buffer to a PNG image.
 pub struct Renderer {
     /// Font chain per theme name, so a screenshot rendered with theme `x`
@@ -907,15 +1052,43 @@ pub struct Renderer {
     default_theme: String,
     default_chrome: ChromeOptions,
     padding: u32,
+    /// How many scrolled-off lines a capture retains. See
+    /// [`crate::capture`]: the viewport height decides where lines wrap, this
+    /// decides how much of the output survives to be rendered.
+    max_scrollback_lines: usize,
 }
 
 impl Renderer {
+    /// Build a renderer with the default capture settings.
+    ///
+    /// This is the constructor published in 1.0.0 and its behaviour is
+    /// unchanged. Use [`Renderer::new_with_options`] to set how much
+    /// scrolled-off output a capture retains.
     pub fn new(
         fonts: &FontSelection,
         font_size: f32,
         theme_configs: &HashMap<String, ThemeConfig>,
         default_theme: &str,
         chrome_config: &ChromeConfig,
+    ) -> Result<Self> {
+        Self::new_with_options(
+            fonts,
+            font_size,
+            theme_configs,
+            default_theme,
+            chrome_config,
+            RendererOptions::default(),
+        )
+    }
+
+    /// [`Renderer::new`] with explicit capture options.
+    pub fn new_with_options(
+        fonts: &FontSelection,
+        font_size: f32,
+        theme_configs: &HashMap<String, ThemeConfig>,
+        default_theme: &str,
+        chrome_config: &ChromeConfig,
+        options: RendererOptions,
     ) -> Result<Self> {
         // Parse all themes
         let mut themes = HashMap::new();
@@ -976,6 +1149,7 @@ impl Renderer {
             default_theme: default_theme.to_string(),
             default_chrome: ChromeOptions::from_config(chrome_config),
             padding: 16,
+            max_scrollback_lines: options.max_scrollback_lines,
         })
     }
 
@@ -1033,9 +1207,16 @@ impl Renderer {
     /// output with ANSI colors intact; set `redact_text` to also scrub it, or
     /// `strip_ansi` to return plain (color-free) text.
     ///
+    /// `rows` is the PTY viewport height - it decides where lines wrap - not a
+    /// limit on how much output is shown: the capture keeps everything that
+    /// scrolled off (up to the renderer's scrollback capacity) and renders all
+    /// of it. Use [`render_bytes_with_options`] to render only one end of it.
+    ///
     /// No sidecar files are written; callers that need to re-render (e.g. the
     /// MCP server) should keep the raw bytes and returned [`RenderMeta`] in
     /// memory.
+    ///
+    /// [`render_bytes_with_options`]: Self::render_bytes_with_options
     #[allow(clippy::too_many_arguments)]
     pub fn render_bytes(
         &self,
@@ -1050,15 +1231,61 @@ impl Renderer {
         text: TextOptions,
         auto_crop: bool,
     ) -> Result<RenderOutput> {
-        // Normalize bare LF to CRLF before feeding the terminal parser so raw,
-        // non-TTY captured ANSI (piped output or redirected logs passed to
-        // `render`) lands on proper lines instead of staircasing. This is a
-        // no-op for PTY-sourced bytes (from `exec`), which already use CRLF,
-        // and the original `data` is still used for the returned text.
-        let normalized = normalize_newlines(data);
-        let mut parser = vt100::Parser::new(rows, cols, 0);
-        parser.process(&normalized);
-        let screen = parser.screen();
+        let (path, text, audit, context) = self.render_bytes_with_options(
+            data,
+            cols,
+            rows,
+            output_dir,
+            output_name,
+            theme_name,
+            chrome,
+            redaction,
+            text,
+            auto_crop,
+            RenderOptions::default(),
+        )?;
+        Ok((path, text, audit, context.meta))
+    }
+
+    /// [`Renderer::render_bytes`], rendering only the lines `options` selects.
+    ///
+    /// A head or tail selection also decides what the returned text and the
+    /// PNG's `Description` metadata contain: text that does not match the
+    /// picture would only mislead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_bytes_with_options(
+        &self,
+        data: &[u8],
+        cols: u16,
+        rows: u16,
+        output_dir: &Path,
+        output_name: Option<&str>,
+        theme_name: Option<&str>,
+        chrome: Option<&ChromeOptions>,
+        redaction: Option<&RedactionRequest>,
+        text: TextOptions,
+        auto_crop: bool,
+        options: RenderOptions,
+    ) -> Result<RenderOutputWithContext> {
+        let lines = options.lines;
+        let capture = self.capture(data, rows, cols, lines);
+        let screen = &capture;
+        if capture.truncated() {
+            tracing::warn!(
+                "capture truncated: more output scrolled off than the {}-line scrollback \
+                 could hold, so the oldest lines were dropped; raise `max_scrollback_lines` \
+                 (a wide terminal caps it below the configured value) or render one end with \
+                 a head/tail selection",
+                self.effective_scrollback_lines(rows, cols)
+            );
+        }
+
+        // A caller that asked for specific lines wants text that matches them,
+        // so the text comes from the capture rather than from the source bytes.
+        let text = TextOptions {
+            from_screen: text.from_screen || !lines.is_all(),
+            ..text
+        };
 
         // Redaction pass: scan the parsed buffer before rendering.
         if let Some(req) = redaction {
@@ -1099,17 +1326,99 @@ impl Renderer {
         let description = self.description_text(screen, cols, redaction_map.as_ref(), text);
         save_png(&image, &path, description.as_deref())?;
 
-        let meta = RenderMeta {
-            cols,
-            rows,
-            theme: theme_name.map(str::to_owned),
-            chrome: Some(chrome.clone()),
-            auto_crop,
-            from_screen: text.from_screen,
+        let context = RenderContext {
+            meta: RenderMeta {
+                cols,
+                rows,
+                theme: theme_name.map(str::to_owned),
+                chrome: Some(chrome.clone()),
+                auto_crop,
+                from_screen: text.from_screen,
+            },
+            lines,
+            truncated: capture.truncated(),
         };
 
         let audit = redaction_map.map(|m| m.counts).unwrap_or_default();
-        Ok((path, plain_text, audit, meta))
+        Ok((path, plain_text, audit, context))
+    }
+
+    /// Capture the terminal session in `data` exactly the way
+    /// [`render_bytes_with_options`] does, so a redaction map built from the
+    /// returned capture addresses the same cells the renderer will draw.
+    ///
+    /// [`render_bytes_with_options`]: Self::render_bytes_with_options
+    pub fn capture(
+        &self,
+        data: &[u8],
+        rows: u16,
+        cols: u16,
+        lines: LineSelection,
+    ) -> CapturedScreen {
+        // Normalize bare LF to CRLF before feeding the terminal parser so raw,
+        // non-TTY captured ANSI (piped output or redirected logs passed to
+        // `render`) lands on proper lines instead of staircasing. This is a
+        // no-op for PTY-sourced bytes (from `exec`), which already use CRLF,
+        // and the original `data` is still used for the returned text.
+        let normalized = normalize_newlines(data);
+        CapturedScreen::parse_selected(&normalized, rows, cols, self.max_scrollback_lines, lines)
+    }
+
+    /// How many scrolled-off lines a capture of a `rows` x `cols` terminal
+    /// actually retains: the configured limit, capped by the retained-cell
+    /// budget that keeps a wide terminal from turning a line count into
+    /// gigabytes. See [`crate::capture::effective_scrollback_lines`].
+    pub fn effective_scrollback_lines(&self, rows: u16, cols: u16) -> usize {
+        effective_scrollback_lines(rows, cols, self.max_scrollback_lines)
+    }
+
+    /// Capture the session behind an already rendered screenshot, using the
+    /// geometry and line selection it was rendered with.
+    pub fn capture_for(&self, data: &[u8], context: &RenderContext) -> CapturedScreen {
+        self.capture(data, context.meta.rows, context.meta.cols, context.lines)
+    }
+
+    /// The `(rows, cols)` of `screen` a render with these settings actually
+    /// paints.
+    ///
+    /// Not the same as [`CapturedScreen::size`]: the renderer stops at one row
+    /// past the last row holding content, and with `auto_crop` it stops at the
+    /// rightmost column holding content too, so a retained grid is routinely
+    /// taller and wider than the image made from it. Callers that address cells
+    /// in a finished screenshot - a coordinate redaction, say - have to be
+    /// checked against *these* bounds, because a cell outside them is counted
+    /// by the capture but never drawn.
+    pub fn rendered_bounds(
+        &self,
+        screen: &CapturedScreen,
+        theme_name: Option<&str>,
+        auto_crop: bool,
+    ) -> (u16, u16) {
+        let layout = self.screen_layout(screen, self.fonts_for(theme_name), auto_crop);
+        (
+            u16::try_from(layout.content_rows).unwrap_or(u16::MAX),
+            u16::try_from(layout.content_cols).unwrap_or(u16::MAX),
+        )
+    }
+
+    /// [`Renderer::rendered_bounds`] for the theme and `auto_crop` setting a
+    /// screenshot was rendered with, so a re-render draws exactly these cells.
+    pub fn rendered_bounds_for(
+        &self,
+        screen: &CapturedScreen,
+        context: &RenderContext,
+    ) -> (u16, u16) {
+        self.rendered_bounds(
+            screen,
+            context.meta.theme.as_deref(),
+            context.meta.auto_crop,
+        )
+    }
+
+    /// How many scrolled-off lines a capture retains before the terminal starts
+    /// dropping the oldest ones.
+    pub fn max_scrollback_lines(&self) -> usize {
+        self.max_scrollback_lines
     }
 
     /// Re-render a screenshot from its original raw terminal bytes and
@@ -1124,9 +1433,33 @@ impl Renderer {
         out_path: &Path,
         text: TextOptions,
     ) -> Result<(String, Vec<(String, usize)>)> {
-        let mut parser = vt100::Parser::new(meta.rows, meta.cols, 0);
-        parser.process(data);
-        let screen = parser.screen();
+        self.render_redaction_to_with_context(
+            data,
+            &RenderContext::from_meta(meta.clone()),
+            map,
+            out_path,
+            text,
+        )
+    }
+
+    /// [`Renderer::render_redaction_to`], re-rendering the same line selection
+    /// the screenshot was made with rather than the whole capture.
+    ///
+    /// This is what a caller holding a [`RenderContext`] - the MCP server's
+    /// render cache, say - should use: a redaction map is addressed in the
+    /// coordinates of the rows the image actually shows, so re-rendering a
+    /// different set of rows would move every block.
+    pub fn render_redaction_to_with_context(
+        &self,
+        data: &[u8],
+        context: &RenderContext,
+        map: &RedactionMap,
+        out_path: &Path,
+        text: TextOptions,
+    ) -> Result<(String, Vec<(String, usize)>)> {
+        let meta = &context.meta;
+        let capture = self.capture_for(data, context);
+        let screen = &capture;
 
         let plain_text = self.output_text(data, screen, meta.cols, Some(map), text);
         let theme = self.get_theme(meta.theme.as_deref());
@@ -1219,7 +1552,7 @@ impl Renderer {
     fn output_text(
         &self,
         data: &[u8],
-        screen: &Screen,
+        screen: &CapturedScreen,
         cols: u16,
         redaction: Option<&RedactionMap>,
         opts: TextOptions,
@@ -1252,7 +1585,7 @@ impl Renderer {
     /// the pixels hide.
     fn description_text(
         &self,
-        screen: &Screen,
+        screen: &CapturedScreen,
         cols: u16,
         redaction: Option<&RedactionMap>,
         opts: TextOptions,
@@ -1279,39 +1612,51 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn render_to_image(
         &self,
-        screen: &Screen,
+        screen: &CapturedScreen,
         theme: &Theme,
         fonts: &ThemeFonts,
         chrome: &ChromeOptions,
         redaction: Option<&RedactionMap>,
         auto_crop: bool,
     ) -> Result<RgbaImage> {
-        let terminal_image = self.render_screen(screen, theme, fonts, redaction, auto_crop)?;
+        let layout = self.screen_layout(screen, fonts, auto_crop);
         if chrome.enabled {
-            // With chrome the frame is rounded (or squared when `rounded` is
-            // off); see `compose_with_chrome`.
-            return Ok(self.compose_with_chrome(terminal_image, theme, fonts, chrome));
+            // The terminal is drawn straight into the window frame rather than
+            // into a buffer of its own that is then copied in: one full-size
+            // layer instead of two, for an image that is already the largest
+            // allocation in the process.
+            let metrics = ChromeMetrics::new(chrome, layout.width, layout.height);
+            metrics.check_budget(screen)?;
+            return Ok(self.compose_with_chrome_layer(
+                theme,
+                fonts,
+                chrome,
+                &metrics,
+                |renderer, frame, x, y| {
+                    renderer.draw_screen_into(frame, x, y, &layout, screen, theme, fonts, redaction)
+                },
+            ));
         }
         // No chrome: optionally round the terminal content itself so a bare
         // screenshot still has soft corners on a transparent background,
         // like macOS window captures or code-screenshot tools.
-        let mut img = terminal_image;
+        let mut img = self.render_screen(screen, theme, fonts, redaction, auto_crop)?;
         if chrome.rounded {
             self.round_image_corners(&mut img, chrome.radius * RENDER_SCALE);
         }
         Ok(img)
     }
 
-    /// Render a vt100 Screen to an RGBA image.
-    /// Renders at 2x resolution internally and downscales for sharper text.
-    fn render_screen(
+    /// Geometry of the terminal portion of a screenshot: how many rows and
+    /// columns actually hold content, and the pixel size they render to.
+    /// Computed before anything is allocated so the memory budget can be
+    /// checked against a number rather than against a failed allocation.
+    fn screen_layout(
         &self,
-        screen: &Screen,
-        theme: &Theme,
+        screen: &CapturedScreen,
         fonts: &ThemeFonts,
-        redaction: Option<&RedactionMap>,
         auto_crop: bool,
-    ) -> Result<RgbaImage> {
+    ) -> ScreenLayout {
         let rows = screen.size().0 as u32;
         let cols = screen.size().1 as u32;
 
@@ -1326,22 +1671,77 @@ impl Renderer {
             cols
         };
 
-        let scale: u32 = RENDER_SCALE;
+        let scale = RENDER_SCALE;
         let cell_w = fonts.cell_width * scale;
         let cell_h = fonts.cell_height * scale;
         let padding = self.padding * scale;
-        let hi_font_size = self.font_size * scale as f32;
 
-        let img_width = content_cols * cell_w + padding * 2;
-        let img_height = content_rows * cell_h + padding * 2;
+        ScreenLayout {
+            content_rows,
+            content_cols,
+            cell_w,
+            cell_h,
+            padding,
+            width: content_cols * cell_w + padding * 2,
+            height: content_rows * cell_h + padding * 2,
+        }
+    }
 
-        let mut img: RgbaImage = ImageBuffer::from_pixel(img_width, img_height, theme.background);
+    /// Render a capture to a standalone RGBA image.
+    /// Renders at 2x resolution for sharper text.
+    fn render_screen(
+        &self,
+        screen: &CapturedScreen,
+        theme: &Theme,
+        fonts: &ThemeFonts,
+        redaction: Option<&RedactionMap>,
+        auto_crop: bool,
+    ) -> Result<RgbaImage> {
+        let layout = self.screen_layout(screen, fonts, auto_crop);
+        // One buffer, allocated below and returned to the caller.
+        check_render_budget(layout.width, layout.height, 1, screen)?;
+        let mut img: RgbaImage =
+            ImageBuffer::from_pixel(layout.width, layout.height, theme.background);
+        self.draw_screen_into(&mut img, 0, 0, &layout, screen, theme, fonts, redaction);
+        Ok(img)
+    }
+
+    /// Draw a capture into `img` with its top-left corner at `(ox, oy)`.
+    ///
+    /// The background is painted here too, so a caller can hand over a buffer
+    /// it allocated for other reasons - the window frame, say - instead of
+    /// making one just for the terminal.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_screen_into(
+        &self,
+        img: &mut RgbaImage,
+        ox: u32,
+        oy: u32,
+        layout: &ScreenLayout,
+        screen: &CapturedScreen,
+        theme: &Theme,
+        fonts: &ThemeFonts,
+        redaction: Option<&RedactionMap>,
+    ) {
+        let ScreenLayout {
+            content_rows,
+            content_cols,
+            cell_w,
+            cell_h,
+            padding,
+            width,
+            height,
+        } = *layout;
+        let hi_font_size = self.font_size * RENDER_SCALE as f32;
+        let scale = RENDER_SCALE;
+
+        self.draw_rect(img, ox, oy, width, height, theme.background);
 
         for row in 0..content_rows {
             for col in 0..content_cols {
                 if let Some(cell) = screen.cell(row as u16, col as u16) {
-                    let x = col * cell_w + padding;
-                    let y = row * cell_h + padding;
+                    let x = ox + col * cell_w + padding;
+                    let y = oy + row * cell_h + padding;
 
                     // Redaction: draw a block (with an optional short label)
                     // in place of sensitive cell contents, using the color the
@@ -1349,7 +1749,7 @@ impl Renderer {
                     if let Some(rc) = redaction.and_then(|m| m.get(row as u16, col as u16)) {
                         let block =
                             Rgba([rc.block_color[0], rc.block_color[1], rc.block_color[2], 255]);
-                        self.draw_rect(&mut img, x, y, cell_w, cell_h, block);
+                        self.draw_rect(img, x, y, cell_w, cell_h, block);
                         if let Some(label_ch) = rc.label_char {
                             let label = Rgba([
                                 rc.label_color[0],
@@ -1358,7 +1758,7 @@ impl Renderer {
                                 255,
                             ]);
                             self.draw_char_with_font(
-                                &mut img,
+                                img,
                                 fonts,
                                 x,
                                 y,
@@ -1377,7 +1777,7 @@ impl Renderer {
 
                     // Draw background
                     if bg_color != theme.background {
-                        self.draw_rect(&mut img, x, y, cell_w, cell_h, bg_color);
+                        self.draw_rect(img, x, y, cell_w, cell_h, bg_color);
                     }
 
                     // Draw character(s) at 2x font size
@@ -1392,7 +1792,7 @@ impl Renderer {
                         for c in ch.chars() {
                             let chosen = self.font_for_char(fonts, c, bold, hi_font_size);
                             self.draw_char_with_font(
-                                &mut img,
+                                img,
                                 fonts,
                                 x,
                                 y,
@@ -1406,7 +1806,7 @@ impl Renderer {
                             // Faux bold only when no bold font is available
                             if bold && !has_bold_font {
                                 self.draw_char_with_font(
-                                    &mut img,
+                                    img,
                                     fonts,
                                     x + 1,
                                     y,
@@ -1424,16 +1824,19 @@ impl Renderer {
                     // Underline
                     if cell.underline() {
                         let uy = y + cell_h.saturating_sub(2 * scale);
-                        self.draw_rect(&mut img, x, uy, cell_w, scale, fg_color);
+                        self.draw_rect(img, x, uy, cell_w, scale, fg_color);
                     }
                 }
             }
         }
-
-        // Output at 2x resolution for crisp, retina-quality rendering
-        Ok(img)
     }
 
+    /// Compose a chrome-framed screenshot around a terminal image.
+    ///
+    /// Kept as the image-in, image-out form for callers that already hold a
+    /// rendered terminal; [`Renderer::render_to_image`] uses
+    /// [`Renderer::compose_with_chrome_layer`] instead so the terminal is drawn
+    /// straight into the frame and only one full-size layer exists at a time.
     fn compose_with_chrome(
         &self,
         terminal: RgbaImage,
@@ -1444,52 +1847,46 @@ impl Renderer {
         if !chrome.enabled {
             return terminal;
         }
+        let metrics = ChromeMetrics::new(chrome, terminal.width(), terminal.height());
+        self.compose_with_chrome_layer(theme, fonts, chrome, &metrics, |_, frame, ox, oy| {
+            for y in 0..terminal.height() {
+                for x in 0..terminal.width() {
+                    frame.put_pixel(ox + x, oy + y, *terminal.get_pixel(x, y));
+                }
+            }
+        })
+    }
 
+    /// Paint the window frame and let `draw_terminal` fill in the terminal
+    /// area, at the offset it is given, directly inside the frame layer.
+    ///
+    /// Only the frame exists while the terminal is drawn. The shadowed canvas
+    /// is allocated afterwards and only when there is a shadow to draw: without
+    /// one the frame *is* the finished image, since compositing it over an
+    /// empty transparent canvas would copy it pixel for pixel.
+    fn compose_with_chrome_layer(
+        &self,
+        theme: &Theme,
+        fonts: &ThemeFonts,
+        chrome: &ChromeOptions,
+        metrics: &ChromeMetrics,
+        draw_terminal: impl FnOnce(&Self, &mut RgbaImage, u32, u32),
+    ) -> RgbaImage {
         // Chrome is drawn at the same supersampling factor as the terminal so
         // the title bar, controls, and text stay proportional to the content.
         let scale = RENDER_SCALE;
-        let radius = if chrome.rounded {
-            chrome.radius * scale
-        } else {
-            0
-        };
-
-        let title_bar = match chrome.preset.as_str() {
-            "minimal" => 0,
-            _ => chrome.title_bar_height * scale,
-        };
-        let shadow = if chrome.shadow { 16 * scale } else { 0 };
-        let frame_pad = chrome.outer_padding * scale;
-        let bottom_pad = if chrome.timestamp {
-            frame_pad.max(18 * scale)
-        } else {
-            frame_pad
-        };
-
-        let frame_w = terminal.width() + frame_pad * 2;
-        let frame_h = terminal.height() + frame_pad + bottom_pad + title_bar;
-        let width = frame_w + shadow;
-        let height = frame_h + shadow;
-
-        // Transparent background so rounded corners don't have a colored border
-        let mut img: RgbaImage = ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0]));
-
-        let frame_x = shadow / 2;
-        let frame_y = shadow / 2;
-
-        if chrome.shadow {
-            self.draw_shadow(
-                &mut img,
-                frame_x,
-                frame_y,
-                frame_w,
-                frame_h,
-                radius,
-                4 * scale,
-                6 * scale,
-                12 * scale,
-            );
-        }
+        let &ChromeMetrics {
+            radius,
+            title_bar,
+            shadow,
+            frame_pad,
+            bottom_pad,
+            frame_w,
+            frame_h,
+            term_h,
+            width,
+            height,
+        } = metrics;
 
         // The window body is always the terminal's own background, for every
         // preset: a screenshot must not sit inside a mismatched gray (or
@@ -1541,18 +1938,13 @@ impl Renderer {
 
         let term_x = frame_pad;
         let term_y = frame_pad + title_bar;
-        for y in 0..terminal.height() {
-            for x in 0..terminal.width() {
-                let px = terminal.get_pixel(x, y);
-                frame.put_pixel(term_x + x, term_y + y, *px);
-            }
-        }
+        draw_terminal(self, &mut frame, term_x, term_y);
 
         if chrome.timestamp {
             let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
             let color = muted_text_color(theme);
             let right_x = frame_w.saturating_sub(frame_pad.max(6 * scale));
-            let center_y = term_y + terminal.height() + bottom_pad / 2;
+            let center_y = term_y + term_h + bottom_pad / 2;
             self.draw_text_right_aligned(
                 &mut frame,
                 fonts,
@@ -1568,9 +1960,34 @@ impl Renderer {
         // chrome-less screenshot gets.
         self.round_image_corners(&mut frame, radius);
 
-        // Composite the window over the (possibly shadowed) canvas source-over,
-        // so the shadow stays visible through the corner cut-outs and the area
-        // outside the window keeps the frame layer's own alpha.
+        if shadow == 0 {
+            // Nothing to composite onto: the canvas would be transparent
+            // everywhere the frame is not, and source-over onto a transparent
+            // pixel reproduces the source exactly. Return the layer itself
+            // rather than allocating a second image of the same size to copy
+            // it into.
+            return frame;
+        }
+
+        // Transparent background so rounded corners don't have a colored border
+        let mut img: RgbaImage = ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0]));
+        let frame_x = shadow / 2;
+        let frame_y = shadow / 2;
+        self.draw_shadow(
+            &mut img,
+            frame_x,
+            frame_y,
+            frame_w,
+            frame_h,
+            radius,
+            4 * scale,
+            6 * scale,
+            12 * scale,
+        );
+
+        // Composite the window over the shadowed canvas source-over, so the
+        // shadow stays visible through the corner cut-outs and the area outside
+        // the window keeps the frame layer's own alpha.
         for y in 0..frame.height() {
             for x in 0..frame.width() {
                 let px = *frame.get_pixel(x, y);
@@ -1993,21 +2410,19 @@ impl Renderer {
         }
     }
 
-    fn find_content_rows(&self, screen: &Screen, rows: u32, cols: u32) -> u32 {
+    fn find_content_rows(&self, screen: &CapturedScreen, rows: u32, cols: u32) -> u32 {
         let mut last_row_with_content = 0u32;
         for row in 0..rows {
             for col in 0..cols {
-                if let Some(cell) = screen.cell(row as u16, col as u16) {
-                    let contents = cell.contents();
-                    // A row counts as content if it has visible text or any
-                    // styled cell (e.g. a colored background block), so
-                    // background-only rows are not cropped away.
-                    let has_text = !contents.is_empty() && contents != " ";
-                    let styled = cell.bgcolor() != vt100::Color::Default || cell.inverse();
-                    if has_text || styled {
-                        last_row_with_content = row + 1;
-                        break;
-                    }
+                // A row counts as content if it has visible text or any styled
+                // cell (e.g. a colored background block), so background-only
+                // rows are not cropped away.
+                if screen
+                    .cell(row as u16, col as u16)
+                    .is_some_and(cell_has_content)
+                {
+                    last_row_with_content = row + 1;
+                    break;
                 }
             }
         }
@@ -2030,21 +2445,18 @@ impl Renderer {
     /// that reach past their advance - so nothing is clipped. A double-width
     /// character keeps its vt100 continuation cell, and a wrapped row reaches
     /// the last column, so neither is cut in half.
-    fn find_content_cols(&self, screen: &Screen, rows: u32, cols: u32) -> u32 {
+    fn find_content_cols(&self, screen: &CapturedScreen, rows: u32, cols: u32) -> u32 {
         let mut max_col = 0u32;
         for row in 0..rows {
             for col in (0..cols).rev() {
-                if let Some(cell) = screen.cell(row as u16, col as u16) {
-                    let contents = cell.contents();
-                    let has_text = !contents.is_empty() && contents != " ";
-                    let styled = cell.bgcolor() != vt100::Color::Default || cell.inverse();
-                    if has_text || styled {
-                        // A double-width character owns this cell and the
-                        // (blank) continuation cell after it.
-                        let end = if cell.is_wide() { col + 2 } else { col + 1 };
-                        max_col = max_col.max(end.min(cols));
-                        break;
-                    }
+                if let Some(cell) = screen.cell(row as u16, col as u16)
+                    && cell_has_content(cell)
+                {
+                    // A double-width character owns this cell and the
+                    // (blank) continuation cell after it.
+                    let end = if cell.is_wide() { col + 2 } else { col + 1 };
+                    max_col = max_col.max(end.min(cols));
+                    break;
                 }
             }
         }
@@ -2423,9 +2835,138 @@ fn muted_text_color(theme: &Theme) -> Rgba<u8> {
     }
 }
 
+/// Pixel geometry of the terminal portion of a screenshot, worked out before
+/// anything is allocated.
+#[derive(Debug, Clone, Copy)]
+struct ScreenLayout {
+    content_rows: u32,
+    content_cols: u32,
+    cell_w: u32,
+    cell_h: u32,
+    padding: u32,
+    /// Pixel size of the terminal image, padding included.
+    width: u32,
+    height: u32,
+}
+
+/// Pixel geometry of a chrome-framed screenshot, worked out before anything is
+/// allocated so [`ChromeMetrics::check_budget`] can refuse an impossible render
+/// instead of the allocator aborting on it.
+#[derive(Debug, Clone, Copy)]
+struct ChromeMetrics {
+    radius: u32,
+    title_bar: u32,
+    /// Extra canvas reserved for the drop shadow; zero when there is none, in
+    /// which case the frame layer is the finished image.
+    shadow: u32,
+    frame_pad: u32,
+    bottom_pad: u32,
+    frame_w: u32,
+    frame_h: u32,
+    /// Pixel height of the terminal area inside the frame; the timestamp is
+    /// laid out below it.
+    term_h: u32,
+    /// Final image size.
+    width: u32,
+    height: u32,
+}
+
+impl ChromeMetrics {
+    fn new(chrome: &ChromeOptions, term_w: u32, term_h: u32) -> Self {
+        let scale = RENDER_SCALE;
+        let radius = if chrome.rounded {
+            chrome.radius * scale
+        } else {
+            0
+        };
+        let title_bar = match chrome.preset.as_str() {
+            "minimal" => 0,
+            _ => chrome.title_bar_height * scale,
+        };
+        let shadow = if chrome.shadow { 16 * scale } else { 0 };
+        let frame_pad = chrome.outer_padding * scale;
+        let bottom_pad = if chrome.timestamp {
+            frame_pad.max(18 * scale)
+        } else {
+            frame_pad
+        };
+        let frame_w = term_w + frame_pad * 2;
+        let frame_h = term_h + frame_pad + bottom_pad + title_bar;
+        Self {
+            radius,
+            title_bar,
+            shadow,
+            frame_pad,
+            bottom_pad,
+            frame_w,
+            frame_h,
+            term_h,
+            width: frame_w + shadow,
+            height: frame_h + shadow,
+        }
+    }
+
+    /// Refuse a render that would not fit in the memory budget. With a shadow
+    /// the frame layer and the canvas it is composited onto are alive at the
+    /// same time; without one the frame is the only buffer.
+    fn check_budget(&self, screen: &CapturedScreen) -> Result<()> {
+        let layers = if self.shadow > 0 { 2 } else { 1 };
+        check_render_budget(self.width, self.height, layers, screen)
+    }
+}
+
+/// Refuse to render an image the machine should not be asked to allocate.
+///
+/// Retained output is unbounded in practice, so a capture can ask for an image
+/// of any size; `layers` is how many full-size RGBA buffers the render holds at
+/// once, so the check reflects peak memory rather than just the final PNG. The
+/// error names the limit that was actually reached, and the way out: render one
+/// end of the capture instead of all of it.
+fn check_render_budget(
+    width: u32,
+    height: u32,
+    layers: u64,
+    screen: &CapturedScreen,
+) -> Result<()> {
+    let pixels = u64::from(width) * u64::from(height);
+    let bytes = pixels * BYTES_PER_PIXEL * layers;
+    let reason = if pixels > MAX_IMAGE_PIXELS {
+        format!(
+            "{} megapixels, over the {} megapixel limit",
+            pixels / 1_000_000,
+            MAX_IMAGE_PIXELS / 1_000_000
+        )
+    } else if bytes > MAX_RENDER_BYTES {
+        format!(
+            "about {} MB of image buffers, over the {} MB limit",
+            bytes / (1024 * 1024),
+            MAX_RENDER_BYTES / (1024 * 1024)
+        )
+    } else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "the capture would render as a {}x{} px image, needing {}: it holds {} lines of \
+         output. Narrow it with --head-lines/--tail-lines (head_lines/tail_lines over MCP), \
+         or use fewer columns.",
+        width,
+        height,
+        reason,
+        screen.size().0
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse `data` into a single-screenful capture: no scrollback, so the
+    /// capture is exactly the `rows` x `cols` viewport. That is what the
+    /// geometry tests below measure; the scrollback-backed behaviour has its
+    /// own tests in [`crate::capture`] and below.
+    fn screen_of(data: &[u8], rows: u16, cols: u16) -> CapturedScreen {
+        CapturedScreen::parse(data, rows, cols, 0)
+    }
 
     #[test]
     fn chrome_options_from_config_respects_enabled_and_preset() {
@@ -2557,9 +3098,8 @@ mod tests {
         // Give the (chrome-less) default a real corner radius to round against.
         renderer.default_chrome.radius = 8;
         let theme = Theme::dark();
-        let mut parser = vt100::Parser::new(3, 20, 0);
-        parser.process(b"hello world");
-        let screen = parser.screen();
+        let captured = screen_of(b"hello world", 3, 20);
+        let screen = &captured;
 
         renderer.default_chrome.rounded = true;
         let rounded = renderer
@@ -2793,6 +3333,7 @@ mod tests {
             default_theme: "dark".to_string(),
             default_chrome,
             padding: 16,
+            max_scrollback_lines: crate::capture::DEFAULT_MAX_SCROLLBACK_LINES,
         }
     }
 
@@ -2821,9 +3362,8 @@ mod tests {
         // Fills 92% of the terminal: wide enough that an earlier "close
         // enough to full width" shortcut would have kept all 120 columns.
         let used = 110usize;
-        let mut parser = vt100::Parser::new(4, cols, 0);
-        parser.process("x".repeat(used).as_bytes());
-        let screen = parser.screen();
+        let captured = screen_of("x".repeat(used).as_bytes(), 4, cols);
+        let screen = &captured;
 
         let img = renderer
             .render_screen(screen, &theme, &renderer.default_fonts, None, true)
@@ -2864,11 +3404,10 @@ mod tests {
     fn width_trim_keeps_trailing_styled_cells() {
         let renderer = bare_renderer();
         let theme = Theme::dark();
-        let mut parser = vt100::Parser::new(4, 80, 0);
         // "hi" then a green background run of four blank cells.
-        parser.process(b"hi\x1b[42m    \x1b[0m");
+        let captured = screen_of(b"hi\x1b[42m    \x1b[0m", 4, 80);
         let img = renderer
-            .render_screen(parser.screen(), &theme, &renderer.default_fonts, None, true)
+            .render_screen(&captured, &theme, &renderer.default_fonts, None, true)
             .unwrap();
 
         let cell_w = renderer.default_fonts.cell_width * RENDER_SCALE;
@@ -2887,10 +3426,9 @@ mod tests {
     fn width_trim_keeps_a_wide_characters_continuation_cell() {
         let renderer = bare_renderer();
         let theme = Theme::dark();
-        let mut parser = vt100::Parser::new(4, 80, 0);
-        parser.process("ab\u{4f60}".as_bytes());
+        let captured = screen_of("ab\u{4f60}".as_bytes(), 4, 80);
         let img = renderer
-            .render_screen(parser.screen(), &theme, &renderer.default_fonts, None, true)
+            .render_screen(&captured, &theme, &renderer.default_fonts, None, true)
             .unwrap();
 
         let cell_w = renderer.default_fonts.cell_width * RENDER_SCALE;
@@ -2904,16 +3442,9 @@ mod tests {
     fn width_trim_can_be_disabled() {
         let renderer = bare_renderer();
         let theme = Theme::dark();
-        let mut parser = vt100::Parser::new(4, 80, 0);
-        parser.process(b"hi");
+        let captured = screen_of(b"hi", 4, 80);
         let img = renderer
-            .render_screen(
-                parser.screen(),
-                &theme,
-                &renderer.default_fonts,
-                None,
-                false,
-            )
+            .render_screen(&captured, &theme, &renderer.default_fonts, None, false)
             .unwrap();
 
         let cell_w = renderer.default_fonts.cell_width * RENDER_SCALE;
@@ -2929,9 +3460,8 @@ mod tests {
         let theme = Theme::dark();
         let engine = RedactionEngine::from_config(&RedactionConfig::default()).unwrap();
 
-        let mut parser = vt100::Parser::new(3, 40, 0);
-        parser.process(b"ip 10.20.30.40 up");
-        let screen = parser.screen();
+        let captured = screen_of(b"ip 10.20.30.40 up", 3, 40);
+        let screen = &captured;
 
         let map = engine.redact_screen(screen, None);
         assert!(!map.is_empty(), "expected the IPv4 address to be redacted");
@@ -3349,11 +3879,10 @@ mod tests {
 
     /// Render `text` through the normal terminal path and return the image.
     fn render_line(renderer: &Renderer, text: &str, cols: u16) -> RgbaImage {
-        let mut parser = vt100::Parser::new(2, cols, 0);
-        parser.process(text.as_bytes());
+        let captured = screen_of(text.as_bytes(), 2, cols);
         renderer
             .render_screen(
-                parser.screen(),
+                &captured,
                 &Theme::dark(),
                 &renderer.default_fonts,
                 None,
@@ -4211,11 +4740,12 @@ mod tests {
     /// titles, cursor motion, and the erased trailing prompt) does not.
     #[test]
     fn screen_text_keeps_colors_and_drops_terminal_bookkeeping() {
-        let mut parser = vt100::Parser::new(6, 40, 0);
-        parser.process(
+        let captured = screen_of(
             b"\x1b[?2004h$ echo hi\r\n\x1b[?2004l\r\x1b[1;36mhi\x1b[0m\r\n$ \r\x1b[0m\x1b[J",
+            6,
+            40,
         );
-        let text = screen_ansi_text(parser.screen(), 40);
+        let text = screen_ansi_text(&captured, 40);
 
         assert!(
             text.contains("$ echo hi"),
@@ -4241,9 +4771,8 @@ mod tests {
     /// line is closed with a reset so the style cannot bleed.
     #[test]
     fn screen_text_reemits_the_cells_own_sgr() {
-        let mut parser = vt100::Parser::new(3, 20, 0);
-        parser.process(b"\x1b[1;36mMCP\x1b[0m ok\r\n");
-        let text = screen_ansi_text(parser.screen(), 20);
+        let captured = screen_of(b"\x1b[1;36mMCP\x1b[0m ok\r\n", 3, 20);
+        let text = screen_ansi_text(&captured, 20);
         assert!(
             text.starts_with("\x1b[0;1;36mMCP"),
             "unexpected text: {:?}",
@@ -4256,11 +4785,437 @@ mod tests {
     /// becomes two, matching the image the reader is looking at.
     #[test]
     fn screen_text_is_one_line_per_row() {
-        let mut parser = vt100::Parser::new(4, 10, 0);
-        parser.process(b"abcdefghijklmno\r\n");
-        let text = screen_ansi_text(parser.screen(), 10);
+        let captured = screen_of(b"abcdefghijklmno\r\n", 4, 10);
+        let text = screen_ansi_text(&captured, 10);
         assert_eq!(text.lines().count(), 2);
         assert!(text.contains("abcdefghij"));
         assert!(text.contains("klmno"));
+    }
+
+    /// A screenshot shows every retained line, not the last screenful: the
+    /// image is as tall as the whole capture and its `Description` metadata
+    /// carries the first line as well as the last.
+    #[test]
+    fn render_bytes_renders_every_line_that_scrolled_off() {
+        let mut renderer = bare_renderer();
+        renderer.themes.insert("dark".to_string(), Theme::dark());
+        let out_dir = std::path::Path::new("target/full-capture-out");
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        let data: String = (1..=200).map(|i| format!("line {}\r\n", i)).collect();
+        let (path, text, _, context) = renderer
+            .render_bytes_with_options(
+                data.as_bytes(),
+                40,
+                10,
+                out_dir,
+                Some("full capture"),
+                Some("dark"),
+                None,
+                None,
+                TextOptions {
+                    strip_ansi: true,
+                    embed_description: true,
+                    ..TextOptions::default()
+                },
+                true,
+                RenderOptions::default(),
+            )
+            .unwrap();
+
+        assert!(!context.truncated);
+        assert!(
+            text.starts_with("line 1\n"),
+            "text starts: {:?}",
+            &text[..20]
+        );
+        assert!(text.trim_end().ends_with("line 200"));
+
+        let img = image::open(&path).unwrap().to_rgba8();
+        let cell_h = renderer.default_fonts.cell_height * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        // 200 printed lines plus the row the cursor rests on.
+        assert_eq!(img.height(), 201 * cell_h + padding * 2);
+
+        let description = read_png_description(&path).expect("description");
+        assert!(description.starts_with("line 1\n"));
+        assert!(description.ends_with("line 200"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Colors set on a line that has long since scrolled out of the viewport
+    /// are still the colors that line is drawn and re-emitted with.
+    #[test]
+    fn styling_survives_from_the_oldest_scrollback_rows() {
+        let renderer = bare_renderer();
+        let mut data = String::from("\x1b[1;31mALERT\x1b[0m first\r\n");
+        for i in 2..=100 {
+            data.push_str(&format!("line {}\r\n", i));
+        }
+        let captured = renderer.capture(data.as_bytes(), 10, 40, LineSelection::All);
+
+        let cell = captured.cell(0, 0).expect("first cell");
+        assert_eq!(cell.contents(), "A");
+        assert_eq!(cell.fgcolor(), vt100::Color::Idx(1));
+        assert!(cell.bold());
+
+        let text = screen_ansi_text(&captured, 40);
+        assert!(
+            text.starts_with("\x1b[0;1;31mALERT"),
+            "scrollback style lost: {:?}",
+            &text[..24]
+        );
+    }
+
+    /// A selection narrows the image to the lines it kept, and the returned
+    /// text follows it rather than reporting output the picture does not show.
+    #[test]
+    fn head_and_tail_selections_narrow_the_render() {
+        let mut renderer = bare_renderer();
+        renderer.themes.insert("dark".to_string(), Theme::dark());
+        let out_dir = std::path::Path::new("target/selection-out");
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        let data: String = (1..=200).map(|i| format!("line {}\r\n", i)).collect();
+        let render = |lines| {
+            renderer
+                .render_bytes_with_options(
+                    data.as_bytes(),
+                    40,
+                    10,
+                    out_dir,
+                    Some("selection"),
+                    Some("dark"),
+                    None,
+                    None,
+                    TextOptions {
+                        strip_ansi: true,
+                        ..TextOptions::default()
+                    },
+                    true,
+                    RenderOptions { lines },
+                )
+                .unwrap()
+        };
+
+        let (head_path, head_text, _, head_context) = render(LineSelection::Head(10));
+        assert_eq!(head_context.lines, LineSelection::Head(10));
+        assert_eq!(head_text.lines().count(), 10);
+        assert_eq!(head_text.lines().next().unwrap(), "line 1");
+        assert_eq!(head_text.lines().last().unwrap(), "line 10");
+
+        let (tail_path, tail_text, _, tail_context) = render(LineSelection::Tail(10));
+        assert_eq!(tail_context.lines, LineSelection::Tail(10));
+        assert_eq!(tail_text.lines().count(), 10);
+        assert_eq!(tail_text.lines().next().unwrap(), "line 191");
+        assert_eq!(tail_text.lines().last().unwrap(), "line 200");
+
+        let cell_h = renderer.default_fonts.cell_height * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        for path in [&head_path, &tail_path] {
+            let img = image::open(path).unwrap().to_rgba8();
+            assert_eq!(img.height(), 10 * cell_h + padding * 2);
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    /// A capture too tall to render is refused with an actionable error rather
+    /// than an allocation the machine cannot satisfy.
+    #[test]
+    fn an_oversized_capture_is_refused_with_advice() {
+        let mut renderer = bare_renderer();
+        renderer.themes.insert("dark".to_string(), Theme::dark());
+        let out_dir = std::path::Path::new("target/oversized-out");
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        // A full 10k-line scrollback, 200 columns wide, is well past the
+        // pixel ceiling.
+        let data: String = (1..=12_000).map(|i| format!("line {}\r\n", i)).collect();
+        let err = renderer
+            .render_bytes(
+                data.as_bytes(),
+                200,
+                10,
+                out_dir,
+                Some("oversized"),
+                Some("dark"),
+                None,
+                None,
+                TextOptions::default(),
+                false,
+            )
+            .expect_err("an image this size must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("--head-lines") && message.contains("megapixels"),
+            "unhelpful error: {message}"
+        );
+    }
+
+    /// The budget is a *memory* budget, not just a pixel count: adding chrome
+    /// keeps a second full-size layer alive, so the same capture that renders
+    /// bare can be over the line once it is framed and shadowed.
+    #[test]
+    fn the_render_budget_counts_every_simultaneous_buffer() {
+        let screen = screen_of(b"hi", 4, 80);
+
+        // One buffer at the pixel ceiling is allowed.
+        let side = (MAX_IMAGE_PIXELS as f64).sqrt() as u32;
+        assert!(check_render_budget(side, side, 1, &screen).is_ok());
+        // The same image with a second layer alive is over the byte budget.
+        let err = check_render_budget(side, side, 2, &screen)
+            .expect_err("two buffers of a 64 MP image exceed the budget");
+        assert!(
+            err.to_string().contains("MB of image buffers"),
+            "the error should name the memory cost: {err}"
+        );
+        // And one pixel too many is refused outright.
+        assert!(check_render_budget(side + 1, side + 1, 1, &screen).is_err());
+    }
+
+    /// A capture the machine cannot render is refused *before* anything is
+    /// allocated, whether the size comes from the number of rows or from the
+    /// width of the terminal.
+    #[test]
+    fn huge_geometry_is_refused_before_allocation() {
+        let mut renderer = bare_renderer();
+        renderer.themes.insert("dark".to_string(), Theme::dark());
+        let out_dir = std::path::Path::new("target/huge-geometry-out");
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        let render = |cols: u16, rows: u16, data: &str, chrome: Option<&ChromeOptions>| {
+            renderer.render_bytes(
+                data.as_bytes(),
+                cols,
+                rows,
+                out_dir,
+                Some("huge"),
+                Some("dark"),
+                chrome,
+                None,
+                TextOptions::default(),
+                false,
+            )
+        };
+
+        // Too many rows: a full scrollback of a narrow terminal.
+        let tall: String = (1..=12_000).map(|i| format!("line {}\r\n", i)).collect();
+        let err = render(200, 10, &tall, None).expect_err("a 12,000-line image must be refused");
+        assert!(err.to_string().contains("--head-lines"), "{err}");
+
+        // Too many columns: the widest terminal the CLI accepts, filled.
+        let wide = format!("{}\r\n", "x".repeat(500)).repeat(2_000);
+        let err = render(500, 10, &wide, None).expect_err("a 500-column wall must be refused");
+        assert!(err.to_string().contains("--head-lines"), "{err}");
+
+        // Selecting one end of the same capture renders fine, which is what
+        // the error tells the caller to do.
+        let (path, _, _, _) = renderer
+            .render_bytes_with_options(
+                tall.as_bytes(),
+                200,
+                10,
+                out_dir,
+                Some("huge-head"),
+                Some("dark"),
+                None,
+                None,
+                TextOptions::default(),
+                false,
+                RenderOptions::default().with_lines(LineSelection::Head(20)),
+            )
+            .expect("a twenty-line selection is renderable");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Head selection is the first lines of the *output*, even when far more
+    /// output was produced than the scrollback could hold - which is what makes
+    /// it usable as an escape hatch from the render budget.
+    #[test]
+    fn head_selection_survives_a_capture_larger_than_the_scrollback() {
+        let mut renderer = bare_renderer();
+        renderer.max_scrollback_lines = 100;
+        renderer.themes.insert("dark".to_string(), Theme::dark());
+        let out_dir = std::path::Path::new("target/head-overflow-out");
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        let data: String = (1..=20_000).map(|i| format!("line {}\r\n", i)).collect();
+        let (path, text, _, context) = renderer
+            .render_bytes_with_options(
+                data.as_bytes(),
+                80,
+                24,
+                out_dir,
+                Some("head-overflow"),
+                Some("dark"),
+                None,
+                None,
+                TextOptions {
+                    strip_ansi: true,
+                    ..TextOptions::default()
+                },
+                true,
+                RenderOptions::default().with_lines(LineSelection::Head(10)),
+            )
+            .unwrap();
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 10);
+        assert_eq!(lines[0], "line 1");
+        assert_eq!(lines[9], "line 10");
+        assert!(
+            !context.truncated,
+            "the head is complete, so nothing it shows was dropped"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The configured scrollback is a *tail*-retention setting, so a head
+    /// render must not be at its mercy: a one-line capacity still answers with
+    /// the first ten lines of a thousand-line run.
+    #[test]
+    fn head_selection_ignores_the_configured_scrollback_capacity() {
+        let mut renderer = bare_renderer();
+        renderer.max_scrollback_lines = 1;
+        renderer.themes.insert("dark".to_string(), Theme::dark());
+        let out_dir = std::path::Path::new("target/head-tiny-capacity-out");
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        let data: String = (1..=1_000).map(|i| format!("line {}\r\n", i)).collect();
+        let (path, text, _, context) = renderer
+            .render_bytes_with_options(
+                data.as_bytes(),
+                80,
+                40,
+                out_dir,
+                Some("head-tiny-capacity"),
+                Some("dark"),
+                None,
+                None,
+                TextOptions {
+                    strip_ansi: true,
+                    ..TextOptions::default()
+                },
+                true,
+                RenderOptions::default().with_lines(LineSelection::Head(10)),
+            )
+            .unwrap();
+
+        let lines: Vec<&str> = text.lines().collect();
+        let expected: Vec<String> = (1..=10).map(|i| format!("line {}", i)).collect();
+        assert_eq!(lines, expected);
+        assert!(!context.truncated);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A capture that lost output says so, and one that filled its scrollback
+    /// to the last row does not.
+    #[test]
+    fn render_meta_reports_truncation_exactly() {
+        let mut renderer = bare_renderer();
+        renderer.max_scrollback_lines = 10;
+        renderer.themes.insert("dark".to_string(), Theme::dark());
+        let out_dir = std::path::Path::new("target/truncation-meta-out");
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        let render = |lines: usize| {
+            let data: String = (1..=lines).map(|i| format!("line {}\r\n", i)).collect();
+            renderer
+                .render_bytes_with_options(
+                    data.as_bytes(),
+                    40,
+                    5,
+                    out_dir,
+                    Some("truncation"),
+                    Some("dark"),
+                    None,
+                    None,
+                    TextOptions::default(),
+                    true,
+                    RenderOptions::default(),
+                )
+                .unwrap()
+        };
+
+        // 14 lines through a 5-row viewport scroll exactly 10 rows off.
+        let (path, _, _, context) = render(14);
+        assert!(!context.truncated);
+        std::fs::remove_file(&path).ok();
+
+        let (path, _, _, context) = render(15);
+        assert!(context.truncated);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The renderer reports the capacity that actually applied, which the
+    /// retained-cell budget can push below the configured one.
+    #[test]
+    fn effective_scrollback_follows_the_terminal_width() {
+        let renderer = bare_renderer();
+        assert_eq!(
+            renderer.effective_scrollback_lines(40, 120),
+            DEFAULT_MAX_SCROLLBACK_LINES
+        );
+        assert!(renderer.effective_scrollback_lines(40, 500) < DEFAULT_MAX_SCROLLBACK_LINES);
+    }
+
+    /// Drawing the terminal straight into the window frame saves a full-size
+    /// buffer; it must not change a single pixel of the result. Both presets
+    /// and both shadow settings are checked against the copy-then-compose path
+    /// they replaced.
+    #[test]
+    fn chrome_composition_is_pixel_identical_with_one_fewer_buffer() {
+        let renderer = bare_renderer();
+        let theme = Theme::dark();
+        let captured = screen_of(b"\x1b[1;32mok\x1b[0m composed", 4, 40);
+
+        for (preset, shadow, rounded) in [
+            ("gnome", true, true),
+            ("macos", false, true),
+            ("minimal", true, false),
+            ("report", false, false),
+        ] {
+            let chrome = ChromeOptions {
+                enabled: true,
+                preset: preset.to_string(),
+                title: Some("demo".to_string()),
+                // A timestamp would differ between the two renders for reasons
+                // that have nothing to do with buffering.
+                timestamp: false,
+                shadow,
+                radius: 14,
+                rounded,
+                outer_padding: 18,
+                title_bar_height: 34,
+            };
+
+            let one_layer = renderer
+                .render_to_image(
+                    &captured,
+                    &theme,
+                    &renderer.default_fonts,
+                    &chrome,
+                    None,
+                    true,
+                )
+                .unwrap();
+
+            let terminal = renderer
+                .render_screen(&captured, &theme, &renderer.default_fonts, None, true)
+                .unwrap();
+            let copied =
+                renderer.compose_with_chrome(terminal, &theme, &renderer.default_fonts, &chrome);
+
+            assert_eq!(
+                one_layer.dimensions(),
+                copied.dimensions(),
+                "{preset} changed size"
+            );
+            assert!(
+                one_layer.as_raw() == copied.as_raw(),
+                "{preset} (shadow={shadow}) is no longer pixel identical"
+            );
+        }
     }
 }

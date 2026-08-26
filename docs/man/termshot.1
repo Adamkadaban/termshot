@@ -106,7 +106,22 @@ arguments are each executed on their own line, each with its own PS1 prompt.
 Terminal width in columns, 1\-500 (default: 120).
 .TP
 .BI \-r, \-\-rows " N"
-Terminal height in rows, 1\-500 (default: 40).
+Terminal viewport height in rows, 1\-500 (default: 40). This is the terminal the
+command runs in, not a limit on what the screenshot shows: output that scrolls
+off the top is retained and rendered. See
+.B VIEWPORT AND RETAINED OUTPUT
+below.
+.TP
+.BI \-\-head\-lines " N"
+Show only the first N lines of the output \- the first N lines the command
+printed, however much it went on to print afterwards. Mutually exclusive with
+.BR \-\-tail\-lines .
+.TP
+.BI \-\-tail\-lines " N"
+Show only the last N lines of the output, like
+.BR "tail \-n" .
+Mutually exclusive with
+.BR \-\-head\-lines .
 .TP
 .BI \-t, \-\-timeout " SECS"
 Maximum time to wait for the command to finish (default: 30).
@@ -204,7 +219,16 @@ to read from standard input (for example
 Terminal width in columns, 1\-500 (default: 120).
 .TP
 .BI \-r, \-\-rows " N"
-Terminal height in rows, 1\-500 (default: 40).
+Terminal viewport height in rows, 1\-500 (default: 40). A file taller than the
+viewport is rendered whole, not clipped to its last screenful.
+.TP
+.BI \-\-head\-lines " N"
+Render only the first N lines. Mutually exclusive with
+.BR \-\-tail\-lines .
+.TP
+.BI \-\-tail\-lines " N"
+Render only the last N lines. Mutually exclusive with
+.BR \-\-head\-lines .
 .TP
 .BI \-\-theme " NAME"
 Theme name.
@@ -522,6 +546,62 @@ keys accept
 .RB \(dq ~ \(dq
 and resolve relative entries against the theme file\(aqs directory. A user
 theme with the same name as a built\-in overrides it.
+.SH VIEWPORT AND RETAINED OUTPUT
+.B \-\-rows
+and
+.B \-\-cols
+describe the terminal a command runs in: they decide where long lines soft wrap
+and what a full\-screen program is told the window size is. They are not a limit
+on what the screenshot shows.
+.PP
+Every line that scrolls out of that viewport is retained and rendered, so
+.B termshot exec \-\-rows 10 \(aqseq 1 200\(aq
+produces an image with all 200 lines, and the embedded
+.B Description
+metadata matches it. Use
+.BI \-\-head\-lines " N"
+or
+.BI \-\-tail\-lines " N"
+to render only one end; passing both is an error.
+.PP
+Retention is bounded by
+.B max_scrollback_lines
+in the config file (10000 lines by default, at least 1, capped at 60000), and
+by a budget of 2000000 retained cells \- so a very wide terminal keeps fewer
+lines than a narrow one. A command that overruns whichever limit applied prints
+a warning naming it rather than silently dropping its oldest output.
+.PP
+.B \-\-head\-lines
+is captured as those lines scroll past, not filtered out of what survived, so
+it is the first N lines of the output even when the command printed a hundred
+times more than the scrollback holds.
+.B max_scrollback_lines
+does not apply to it: that setting bounds how much of the
+.I end
+of a run is retained, while the head is streamed into a staging area bounded
+only by the retained\-cell budget, so
+.B \-\-head\-lines 10
+returns lines 1\-10 at any configured capacity, down to 1.
+.PP
+Very tall captures also hit a rendering ceiling: 64 megapixels for the image and
+320 MB of image buffers held at once, which window chrome with a drop shadow
+reaches sooner because it needs two. Past it termshot fails with an error
+pointing at
+.B \-\-head\-lines
+and
+.BR \-\-tail\-lines .
+.PP
+Full\-screen (alternate\-screen) programs such as
+.BR vim ,
+.BR htop ,
+and
+.B less
+repaint the whole viewport, so only their active screen is captured: the
+scrollback from before they started is not part of what they are showing.
+.B \-\-head\-lines
+is the exception: output printed before such a program started is the head of
+the run, so those lines are returned rather than the screen it painted. A prefix
+shorter than the request falls back to the active screen.
 .SH CONFIGURATION
 On first run termshot bootstraps
 .I ~/.config/termshot/
@@ -536,7 +616,9 @@ directory. The config file
 by default, or the path given to
 .BR \-\-config )
 controls the output directory, default font and font size, default terminal
-size, shell, default theme, window chrome, and redaction behavior. A commented
+size, how many scrolled\-off lines a capture retains
+.RB ( max_scrollback_lines ),
+shell, default theme, window chrome, and redaction behavior. A commented
 example ships as
 .I termshot.example.toml
 in the source tree.
@@ -547,6 +629,7 @@ Several settings can also be overridden by environment variables:
 .BR TERMSHOT_FONT_SIZE ,
 .BR TERMSHOT_COLS ,
 .BR TERMSHOT_ROWS ,
+.BR TERMSHOT_MAX_SCROLLBACK_LINES ,
 .BR TERMSHOT_TIMEOUT ,
 .BR TERMSHOT_SHELL ,
 .BR TERMSHOT_THEME ,
@@ -571,6 +654,14 @@ Produce a redacted, timestamped finding image for a pentest report:
 .RS 4
 .EX
 termshot exec \-\-redact \-\-timestamp \-\-chrome report \-o finding\-01.png 'nmap \-sV target'
+.EE
+.RE
+.PP
+Capture a long build but show only its last 20 lines:
+.PP
+.RS 4
+.EX
+termshot exec \-\-tail\-lines 20 'cargo build 2>&1'
 .EE
 .RE
 .PP

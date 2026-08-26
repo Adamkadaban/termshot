@@ -113,6 +113,21 @@ termshot compose --layout horizontal --chrome gnome \
   --title 'git status - before / after staging' -o compose.png before.png after.png
 ```
 
+**Full output, not the last screenful** - `--rows` is the terminal *viewport*
+(it decides where lines wrap), not a limit on what you see. Everything that
+scrolls past is kept and rendered, so `termshot exec --rows 10 'seq 1 200'`
+gives you all 200 lines. Narrow it with `--head-lines N` or `--tail-lines N`
+when you only want one end; `--head-lines` is the first N lines of the output
+however long the run turned out to be. Full-screen programs (`vim`, `htop`) are
+the exception: they repaint the viewport, so only their active screen is
+captured.
+
+```sh
+termshot exec 'cargo build 2>&1'               # every line, however long
+termshot exec --tail-lines 20 'cargo test'     # just the summary
+termshot exec --head-lines 15 'dmesg'          # just the top
+```
+
 **Accessible by default** - every PNG embeds its terminal text (redacted, when
 redaction ran) in a UTF-8 `Description` chunk so screen readers can read the
 screenshot. Turn it off with `--no-description` or `embed_description = false`.
@@ -142,13 +157,29 @@ termshot exec 'ls --color=always -la'                          # basic screensho
 termshot exec --chrome gnome --theme dracula 'git log'         # chrome + theme
 termshot exec --redact 'cat credentials.txt'                   # mask secrets
 termshot exec --no-rounded 'ls --color=always'                 # square corners
+termshot exec --tail-lines 20 'cargo test'                     # last 20 lines
+termshot exec --head-lines 20 'dmesg'                          # first 20 lines
 termshot compose -o diff.png before.png after.png              # stack two shots
 termshot themes                                                # list themes
 
 # render pre-captured ANSI without executing anything, from a file or a pipe
 cmd --color=always | termshot render -
 termshot render output.log --redact
+termshot render --tail-lines 30 build.log
 ```
+
+`--rows`/`--cols` set the terminal the command believes it is running in, which
+is what makes long lines wrap the way they would on your screen. The screenshot
+shows every line the command produced, including the ones that scrolled out of
+that viewport, up to the `max_scrollback_lines` safety limit (10,000 by
+default, and lower on a very wide terminal - see
+[docs/config.md](./docs/config.md)). If a command overruns it, termshot says so
+instead of quietly dropping the start, and a capture too tall to render fails
+with an error pointing at `--head-lines` / `--tail-lines`.
+
+`--head-lines` is not subject to that limit: it is captured as those lines
+scroll past, so it is the first N lines of the output at any configured
+capacity.
 
 ## Tips
 
