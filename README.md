@@ -44,7 +44,7 @@ so an agent can inspect it and selectively redact.
 See [docs/redaction.md](./docs/redaction.md).
 
 <p align="center">
-  <img src="docs/assets/redaction.png" alt="Screenshot of an accidentally cat'd .env.staging file where the AWS key, secret, database URL, GitHub token, and Stripe key are each partially masked by red blocks labeled AWSKEY, SECRET, DBURL, GITHUB, and STRIPE - the identifying prefix stays visible so you can see the secret type but not its value" width="700">
+  <img src="docs/assets/redaction.png" alt="Screenshot of an accidentally cat'd .env.staging file in a GNOME window, where the AWS access key, the whole AWS secret access key line, the database host, the GitHub token, and the Stripe key are each masked by red blocks labeled KEY, HOST, and TOKEN - the identifying prefix (AWS_ACCESS_KEY_ID=, postgres://, GITHUB_TOKEN=, STRIPE_) stays visible so you can see the secret type but not its value" width="700">
 </p>
 
 ```sh
