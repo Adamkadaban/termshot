@@ -4,11 +4,13 @@ cols = 120
 rows = 40
 timeout_secs = 30
 # Built-in themes use the bundled JetBrains Mono, so they work with no extra
-# fonts installed. User themes live in ~/.config/termshot/themes/.
+# fonts installed. Add your own themes as .toml files in
+# ~/.config/termshot/themes/ (that directory is created empty on first run).
 default_theme = "dark"
 
-# Embed the terminal text (redacted, when redaction ran) in each PNG's
-# `Description` metadata so screenshots are readable by screen readers.
+# Embed the terminal text (redacted, when redaction ran) in each PNG's UTF-8
+# `Description` metadata (a PNG `iTXt` chunk, so box drawing and non-Latin
+# scripts survive) so screenshots are readable by screen readers.
 embed_description = true
 
 [chrome]
@@ -93,3 +95,13 @@ palette = [
   "#484f58", "#ffa198", "#56d364", "#e3b341",
   "#79c0ff", "#d2a8ff", "#56d4dd", "#f0f6fc",
 ]
+# Optional per-theme fonts. `~` and paths relative to this file are resolved.
+# font = "~/.local/share/fonts/MyMono-Regular.otf"
+# font_bold = "~/.local/share/fonts/MyMono-Bold.otf"
+# Extra faces searched, in order, for characters the fonts above lack. The
+# bundled JetBrains Mono is always tried first (it covers box drawing, arrows,
+# and symbols), so only list what it misses - CJK and Nerd Font glyphs.
+# Color-bitmap emoji fonts are not supported; use outline fonts only.
+# fallback_fonts = [
+#   "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+# ]

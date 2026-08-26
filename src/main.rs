@@ -7,7 +7,8 @@ use termshot::redaction::{
     explicit_request_is_blocked, resolve_should_redact, RedactionEngine, REDACTION_DISABLED_MSG,
 };
 use termshot::renderer::{
-    fallback_output_name, ChromeOptions, ComposeLayout, RedactionRequest, Renderer, TextOptions,
+    fallback_output_name, ChromeOptions, ComposeLayout, FontSelection, RedactionRequest, Renderer,
+    TextOptions,
 };
 use termshot::{executor, server};
 
@@ -72,7 +73,7 @@ enum Commands {
         #[arg(long = "no-prompt", default_value_t = false)]
         no_prompt: bool,
 
-        /// Theme name (e.g. dark, adamkadaban, catppuccin-mocha, dracula, nord)
+        /// Theme name (e.g. dark, catppuccin-mocha, dracula, nord)
         #[arg(long)]
         theme: Option<String>,
 
@@ -268,16 +269,10 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Mcp => {
-            let (theme_font, theme_font_bold) = config.theme_font_paths(&config.default_theme);
-            let font_path = theme_font.or_else(|| config.font_path.clone());
-            let renderer = Renderer::new(
-                font_path.as_deref(),
-                theme_font_bold.as_deref(),
-                config.font_size,
-                &config.themes,
-                &config.default_theme,
-                &config.chrome,
-            )?;
+            // One renderer serves every request: it holds a font chain per
+            // theme, so a request that selects another theme gets that theme's
+            // fonts without rebuilding anything.
+            let renderer = build_renderer(&config, None, None)?;
             server::run_mcp_server(config, renderer).await?;
         }
         Commands::Exec {
@@ -303,24 +298,11 @@ async fn main() -> anyhow::Result<()> {
             rounded,
             no_rounded,
         } => {
-            // Resolve fonts: an explicit --font/--font-bold always wins;
-            // otherwise use the fonts declared by the theme being rendered,
-            // then any globally configured font, then the embedded font.
-            let active_theme = theme.as_deref().unwrap_or(&config.default_theme);
-            let (theme_font, theme_font_bold) = config.theme_font_paths(active_theme);
-            let font_path = font
-                .clone()
-                .or(theme_font)
-                .or_else(|| config.font_path.clone());
-            let font_bold_path = font_bold.clone().or(theme_font_bold);
-            let renderer = Renderer::new(
-                font_path.as_deref(),
-                font_bold_path.as_deref(),
-                config.font_size,
-                &config.themes,
-                &config.default_theme,
-                &config.chrome,
-            )?;
+            // Fonts: an explicit --font/--font-bold always wins; otherwise
+            // each theme uses the fonts it declares, then any globally
+            // configured font, then the embedded font. The renderer resolves
+            // that chain per theme, exactly as the MCP server does.
+            let renderer = build_renderer(&config, font.as_deref(), font_bold.as_deref())?;
 
             let timeout = Duration::from_secs(timeout);
 
@@ -424,17 +406,7 @@ async fn main() -> anyhow::Result<()> {
             rounded,
             no_rounded,
         } => {
-            let active_theme = theme.as_deref().unwrap_or(&config.default_theme);
-            let (theme_font, theme_font_bold) = config.theme_font_paths(active_theme);
-            let font_path = theme_font.or_else(|| config.font_path.clone());
-            let renderer = Renderer::new(
-                font_path.as_deref(),
-                theme_font_bold.as_deref(),
-                config.font_size,
-                &config.themes,
-                &config.default_theme,
-                &config.chrome,
-            )?;
+            let renderer = build_renderer(&config, None, None)?;
 
             let data = if input == "-" {
                 use std::io::Read;
@@ -519,14 +491,7 @@ async fn main() -> anyhow::Result<()> {
             title,
             output,
         } => {
-            let renderer = Renderer::new(
-                config.font_path.as_deref(),
-                None,
-                config.font_size,
-                &config.themes,
-                &config.default_theme,
-                &config.chrome,
-            )?;
+            let renderer = build_renderer(&config, None, None)?;
             let layout = ComposeLayout::parse(&layout)?;
             let chrome_options =
                 chrome_options_from_args(&config, chrome, title, false, None, None);
@@ -539,18 +504,12 @@ async fn main() -> anyhow::Result<()> {
                 chrome_options.as_ref(),
                 &config.output_dir,
                 output_path.as_deref(),
+                config.embed_description,
             )?;
             println!("{}", path.display());
         }
         Commands::Themes => {
-            let renderer = Renderer::new(
-                config.font_path.as_deref(),
-                None,
-                config.font_size,
-                &config.themes,
-                &config.default_theme,
-                &config.chrome,
-            )?;
+            let renderer = build_renderer(&config, None, None)?;
             let names = renderer.theme_names();
             let default = &config.default_theme;
             for name in &names {
@@ -569,6 +528,33 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Build the renderer used by every subcommand.
+///
+/// The renderer owns one font chain per theme (resolved from each theme's
+/// `font`, `font_bold`, and `fallback_fonts`), so CLI and MCP render a given
+/// theme with exactly the same fonts. `font`/`font_bold` are the user's
+/// explicit `--font`/`--font-bold` overrides, which win over every theme's own
+/// fonts.
+fn build_renderer(
+    config: &Config,
+    font: Option<&std::path::Path>,
+    font_bold: Option<&std::path::Path>,
+) -> anyhow::Result<Renderer> {
+    let selection = FontSelection {
+        font_override: font.map(PathBuf::from),
+        font_bold_override: font_bold.map(PathBuf::from),
+        global_font: config.font_path.clone(),
+        global_fallback_fonts: Vec::new(),
+    };
+    Renderer::new(
+        &selection,
+        config.font_size,
+        &config.themes,
+        &config.default_theme,
+        &config.chrome,
+    )
 }
 
 /// Resolve whether redaction should run for this invocation and, if so, build

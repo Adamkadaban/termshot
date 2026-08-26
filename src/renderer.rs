@@ -6,6 +6,7 @@ use fontdue::{Font, FontSettings};
 use image::{ImageBuffer, Rgba, RgbaImage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use vt100::Screen;
 
 /// JetBrains Mono font compiled directly into the binary so that release
@@ -75,6 +76,14 @@ impl ComposeLayout {
         }
     }
 }
+
+/// macOS traffic-light geometry, in unscaled (1x) pixels: the radius of each
+/// button, the center of the leftmost one measured from the frame's left edge,
+/// and the distance between adjacent centers. All three buttons share the
+/// radius, so they are always identical circles.
+const TRAFFIC_LIGHT_RADIUS: u32 = 5;
+const TRAFFIC_LIGHT_FIRST_CENTER: u32 = 18;
+const TRAFFIC_LIGHT_PITCH: u32 = 16;
 
 /// Muted divider color drawn between panes on a dark background. Chosen to
 /// read like a tmux pane border (tmux's default `colour8` grey) so the seam is
@@ -408,13 +417,96 @@ fn font_line_height(font: &Font, size: f32) -> f32 {
         .unwrap_or(size * 1.2)
 }
 
-/// Save an RGBA image as a PNG, optionally embedding `description` as a
-/// `tEXt` chunk under the standard `Description` keyword so screen readers and
+/// Whether `font` genuinely covers `ch`.
+///
+/// A font that lacks a character maps it to glyph 0 (`.notdef`), which most
+/// faces draw as a tofu box. Rasterizing that box would "succeed" and hide the
+/// gap, so glyph 0 never counts as coverage - a character mapped to it must
+/// keep walking the fallback chain. Glyphs that exist but rasterize to nothing
+/// at this size (an empty outline in a broken font) are rejected the same way,
+/// while whitespace is accepted because an empty box is exactly right for it.
+fn font_covers(font: &Font, ch: char, size: f32) -> bool {
+    if !font.has_glyph(ch) {
+        return false;
+    }
+    if ch.is_whitespace() {
+        return true;
+    }
+    let metrics = font.metrics(ch, size);
+    metrics.width > 0 && metrics.height > 0
+}
+
+/// A font picked for one character, plus whether it came from the fallback
+/// chain. Fallback faces have their own metrics, so their glyphs are placed
+/// differently (see [`GlyphPlacement`]) to keep the monospace grid intact.
+struct ChosenFont<'a> {
+    font: &'a Font,
+    is_fallback: bool,
+}
+
+/// How a glyph is positioned inside its cell.
+///
+/// Primary-font glyphs use their own side bearing and their own font's ascent,
+/// exactly as before fallback existed. Fallback glyphs instead get the primary
+/// font's ascent (so every glyph on a line shares one baseline) and are
+/// centered inside the cell they occupy (so a face with different metrics
+/// cannot shift the monospace grid).
+#[derive(Clone, Copy, Default)]
+struct GlyphPlacement {
+    /// Baseline offset from the top of the line box. `None` means "use the
+    /// glyph's own font ascent".
+    ascent: Option<f32>,
+    /// When set, the glyph is centered horizontally in a box of this width
+    /// instead of being placed at its left side bearing.
+    center_width: Option<u32>,
+}
+
+impl GlyphPlacement {
+    /// Placement for a glyph drawn from the primary (or bold) face.
+    fn natural() -> Self {
+        Self::default()
+    }
+
+    /// Placement for a fallback glyph: primary baseline, centered in a cell
+    /// (or a wide character's two cells) of `width` pixels.
+    fn fallback(ascent: f32, width: u32) -> Self {
+        Self {
+            ascent: Some(ascent),
+            center_width: Some(width),
+        }
+    }
+}
+
+/// Rasterization size for a fallback glyph: `font_size` scaled so the glyph's
+/// advance matches `target_advance` (the width of the cell, or of both cells of
+/// a wide character, in device pixels).
+///
+/// Fonts disagree on how much of the em an advance takes - MonoLisa's is 0.64em
+/// against JetBrains Mono's 0.6em - so a fallback glyph drawn at the nominal
+/// size is narrower than the cell it lands in. That is invisible for a symbol
+/// but breaks box drawing, where every `─` would leave a gap and a `bat` frame
+/// would come out dashed. Matching the advance makes those runs tile.
+///
+/// The ratio is clamped so an unusual fallback face (a proportional font, or a
+/// glyph with no advance at all) cannot blow the glyph up or shrink it away.
+fn fallback_font_size(font: &Font, ch: char, font_size: f32, target_advance: u32) -> f32 {
+    let advance = font.metrics(ch, font_size).advance_width;
+    if advance <= 0.0 || target_advance == 0 {
+        return font_size;
+    }
+    let ratio = (target_advance as f32 / advance).clamp(0.5, 1.5);
+    font_size * ratio
+}
+
+/// Save an RGBA image as a PNG, optionally embedding `description` as an
+/// `iTXt` chunk under the standard `Description` keyword so screen readers and
 /// other assistive tooling can read the terminal text back out of the image.
 ///
-/// The text is normalized to the Latin-1 subset that PNG `tEXt` allows
-/// (non-representable characters become `?`) and capped at
-/// [`MAX_DESCRIPTION_BYTES`].
+/// `iTXt` (rather than `tEXt`) is used because it is the only PNG text chunk
+/// that carries UTF-8: terminal output routinely contains box drawing (`bat`,
+/// `tree`), Greek, CJK, and symbols, all of which `tEXt`'s Latin-1 encoding
+/// would destroy. The text is only sanitized of control characters and capped
+/// at [`MAX_DESCRIPTION_BYTES`] on a character boundary.
 pub fn save_png(img: &RgbaImage, path: &Path, description: Option<&str>) -> Result<()> {
     let file = std::fs::File::create(path)
         .with_context(|| format!("Failed to create image file {:?}", path))?;
@@ -423,10 +515,10 @@ pub fn save_png(img: &RgbaImage, path: &Path, description: Option<&str>) -> Resu
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     if let Some(text) = description {
-        let text = latin1_text_chunk(text);
+        let text = description_text_chunk(text);
         if !text.is_empty() {
             encoder
-                .add_text_chunk("Description".to_string(), text)
+                .add_itxt_chunk("Description".to_string(), text)
                 .with_context(|| format!("Failed to embed description in {:?}", path))?;
         }
     }
@@ -446,25 +538,87 @@ pub fn save_png(img: &RgbaImage, path: &Path, description: Option<&str>) -> Resu
 /// truncated so a screenshot's metadata never dwarfs its pixels.
 const MAX_DESCRIPTION_BYTES: usize = 16 * 1024;
 
-/// Convert arbitrary text into the Latin-1 subset PNG `tEXt` chunks accept:
-/// newlines are kept, other control characters are dropped, redaction blocks
-/// (`█`) become `#` so masked spans stay obvious, and any other codepoint
-/// above U+00FF becomes `?`. The result is capped at
-/// [`MAX_DESCRIPTION_BYTES`].
-fn latin1_text_chunk(text: &str) -> String {
+/// Read the UTF-8 `Description` text embedded in a PNG by [`save_png`].
+///
+/// Only the `iTXt` chunk is consulted: that is the only PNG text chunk that
+/// carries UTF-8, and it is the one termshot writes. A file without the chunk
+/// (or one that cannot be read or decoded) yields `None` - missing metadata is
+/// never an error, since composition must still work for foreign PNGs.
+pub fn read_png_description(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| tracing::debug!("No description read from {:?}: {}", path, e))
+        .ok()?;
+    let decoder = png::Decoder::new(std::io::BufReader::new(file));
+    let reader = decoder
+        .read_info()
+        .map_err(|e| tracing::debug!("No description read from {:?}: {}", path, e))
+        .ok()?;
+    let info = reader.info();
+    let chunk = info
+        .utf8_text
+        .iter()
+        .find(|c| c.keyword.eq_ignore_ascii_case("Description"))?;
+    let text = chunk
+        .get_text()
+        .map_err(|e| tracing::debug!("Undecodable description in {:?}: {}", path, e))
+        .ok()?;
+    let text = text.trim_end_matches('\n').to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Build the `Description` metadata for a composed image from the descriptions
+/// of the panes it was built from.
+///
+/// Each pane's text is separated by a clearly marked header so a reader can
+/// tell where one terminal ends and the next begins. Panes that carry no
+/// description are marked as such rather than silently dropped, so the pane
+/// numbering always matches the image. Returns `None` when no pane has a
+/// description at all - inventing one would only describe metadata that is not
+/// there.
+fn composed_description(paths: &[PathBuf]) -> Option<String> {
+    let descriptions: Vec<Option<String>> = paths
+        .iter()
+        .map(|p| read_png_description(p))
+        .collect::<Vec<_>>();
+    if descriptions.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut out = String::new();
+    for (idx, description) in descriptions.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(&format!("\n\n--- Pane {} ---\n\n", idx + 1));
+        }
+        match description {
+            Some(text) => out.push_str(text),
+            None => out.push_str("(no description)"),
+        }
+    }
+    Some(out)
+}
+
+/// Prepare terminal text for a PNG `iTXt` `Description` chunk.
+///
+/// The text stays UTF-8 - box drawing, Greek, CJK and symbols all survive
+/// verbatim - so a screen reader gets what the terminal actually showed.
+/// Newlines are kept because they carry the line structure of the capture;
+/// other control characters are dropped, since `iTXt` text is a plain string
+/// and stray escapes would only confuse a reader. The result is capped at
+/// [`MAX_DESCRIPTION_BYTES`], truncated on a character boundary so the chunk
+/// is never invalid UTF-8.
+fn description_text_chunk(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_DESCRIPTION_BYTES));
     for ch in text.chars() {
-        let mapped = match ch {
-            '\n' => '\n',
-            '\u{2588}' => '#',
-            c if (c as u32) < 0x20 || (c as u32 == 0x7f) => continue,
-            c if (c as u32) <= 0xff => c,
-            _ => '?',
-        };
-        if out.len() + mapped.len_utf8() > MAX_DESCRIPTION_BYTES {
+        if ch != '\n' && ((ch as u32) < 0x20 || (ch as u32) == 0x7f) {
+            continue;
+        }
+        if out.len() + ch.len_utf8() > MAX_DESCRIPTION_BYTES {
             break;
         }
-        out.push(mapped);
+        out.push(ch);
     }
     while out.ends_with('\n') {
         out.pop();
@@ -472,31 +626,42 @@ fn latin1_text_chunk(text: &str) -> String {
     out
 }
 
-/// Renders a vt100 screen buffer to a PNG image.
-pub struct Renderer {
+/// The fonts used to draw one theme: its primary face, an optional real bold
+/// face, and the fallback chain searched for characters the primary face does
+/// not cover. Cell metrics are derived from the primary face, so a theme with a
+/// wider font gets a proportionally wider grid.
+///
+/// One of these is built per distinct font chain when the [`Renderer`] is
+/// constructed and shared (behind an `Arc`) by every theme that resolves to the
+/// same files, so no font is ever parsed per screenshot - let alone per cell.
+pub struct ThemeFonts {
     font: Font,
     font_bold: Option<Font>,
-    font_size: f32,
+    /// Fonts searched, in order, for characters the primary face does not
+    /// have. The embedded JetBrains Mono is always first, followed by the
+    /// fonts a theme listed in `fallback_fonts`.
+    fallback_fonts: Vec<Font>,
     cell_width: u32,
     cell_height: u32,
-    themes: HashMap<String, Theme>,
-    default_theme: String,
-    default_chrome: ChromeOptions,
-    padding: u32,
 }
 
-impl Renderer {
-    pub fn new(
-        font_path: Option<&Path>,
-        font_bold_path: Option<&Path>,
-        font_size: f32,
-        theme_configs: &HashMap<String, ThemeConfig>,
-        default_theme: &str,
-        chrome_config: &ChromeConfig,
-    ) -> Result<Self> {
+/// The font files one theme resolves to. Doubles as the cache key that lets
+/// themes sharing a chain share one parsed [`ThemeFonts`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FontChainSpec {
+    primary: Option<PathBuf>,
+    bold: Option<PathBuf>,
+    fallbacks: Vec<PathBuf>,
+}
+
+impl ThemeFonts {
+    /// Load one font chain. The primary and bold faces are hard errors when
+    /// they cannot be read or parsed (the user asked for that exact file);
+    /// fallback entries are best-effort and only shrink the chain.
+    fn load(spec: &FontChainSpec, font_size: f32) -> Result<Self> {
         // Use an explicitly configured font file if provided, otherwise fall
         // back to the font embedded in the binary.
-        let font_data = match font_path {
+        let font_data = match spec.primary.as_deref() {
             Some(path) => {
                 std::fs::read(path).with_context(|| format!("Failed to read font: {:?}", path))?
             }
@@ -506,7 +671,7 @@ impl Renderer {
             .map_err(|e| anyhow::anyhow!("Failed to parse font: {}", e))?;
 
         // Load bold font if provided
-        let font_bold = if let Some(path) = font_bold_path {
+        let font_bold = if let Some(path) = spec.bold.as_deref() {
             let data = std::fs::read(path)
                 .with_context(|| format!("Failed to read bold font: {:?}", path))?;
             Some(
@@ -517,10 +682,112 @@ impl Renderer {
             None
         };
 
+        // Fallback chain. The embedded JetBrains Mono always comes first so a
+        // theme font without box drawing, arrows, or symbols (MonoLisa, for
+        // example) still renders them instead of tofu; fonts the theme
+        // configured are searched after it. A fallback that cannot be read or
+        // parsed is skipped with a warning - one bad entry must never stop the
+        // renderer from starting.
+        let mut fallback_fonts = Vec::with_capacity(spec.fallbacks.len() + 1);
+        match Font::from_bytes(EMBEDDED_FONT, FontSettings::default()) {
+            Ok(embedded) => fallback_fonts.push(embedded),
+            Err(e) => tracing::warn!("Failed to parse embedded fallback font: {}", e),
+        }
+        for path in &spec.fallbacks {
+            match std::fs::read(path) {
+                Ok(data) => match Font::from_bytes(data, FontSettings::default()) {
+                    Ok(parsed) => fallback_fonts.push(parsed),
+                    Err(e) => tracing::warn!("Ignoring unusable fallback font {:?}: {}", path, e),
+                },
+                Err(e) => tracing::warn!("Ignoring unreadable fallback font {:?}: {}", path, e),
+            }
+        }
+
         let metrics = font.metrics('M', font_size);
         let cell_width = metrics.advance_width.ceil() as u32;
         let cell_height = font_line_height(&font, font_size).ceil() as u32;
 
+        Ok(Self {
+            font,
+            font_bold,
+            fallback_fonts,
+            cell_width,
+            cell_height,
+        })
+    }
+}
+
+/// Font inputs that are not part of a theme: the user's explicit overrides and
+/// the globally configured font.
+///
+/// A theme's own `font`/`font_bold`/`fallback_fonts` are read from its
+/// [`ThemeConfig`], so every theme gets its own chain regardless of how it is
+/// selected (CLI flag or MCP request parameter).
+#[derive(Debug, Clone, Default)]
+pub struct FontSelection {
+    /// Explicit user override (CLI `--font`). Wins over a theme's own font.
+    pub font_override: Option<PathBuf>,
+    /// Explicit user override (CLI `--font-bold`). Wins over a theme's own
+    /// bold font.
+    pub font_bold_override: Option<PathBuf>,
+    /// Globally configured font (`font_path` in the config file), used by
+    /// themes that declare no font of their own.
+    pub global_font: Option<PathBuf>,
+    /// Fallback fonts applied to every theme, searched after the theme's own
+    /// fallback fonts.
+    pub global_fallback_fonts: Vec<PathBuf>,
+}
+
+impl FontSelection {
+    /// Resolve the font chain for one theme: explicit overrides first, then
+    /// the theme's own fonts, then the globally configured font, and finally
+    /// the embedded font (represented by `None`).
+    fn spec_for(&self, theme: Option<&ThemeConfig>) -> FontChainSpec {
+        let (theme_font, theme_bold) = match theme {
+            Some(t) => t.resolved_font_paths(),
+            None => (None, None),
+        };
+        let mut fallbacks = match theme {
+            Some(t) => t.resolved_fallback_font_paths(),
+            None => Vec::new(),
+        };
+        fallbacks.extend(self.global_fallback_fonts.iter().cloned());
+        FontChainSpec {
+            primary: self
+                .font_override
+                .clone()
+                .or(theme_font)
+                .or_else(|| self.global_font.clone()),
+            bold: self.font_bold_override.clone().or(theme_bold),
+            fallbacks,
+        }
+    }
+}
+
+/// Renders a vt100 screen buffer to a PNG image.
+pub struct Renderer {
+    /// Font chain per theme name, so a screenshot rendered with theme `x`
+    /// always uses `x`'s primary, bold, and fallback fonts. Built once at
+    /// construction; themes with identical font files share one entry.
+    theme_fonts: HashMap<String, Arc<ThemeFonts>>,
+    /// Chain used for the default theme and for any theme without its own
+    /// entry.
+    default_fonts: Arc<ThemeFonts>,
+    font_size: f32,
+    themes: HashMap<String, Theme>,
+    default_theme: String,
+    default_chrome: ChromeOptions,
+    padding: u32,
+}
+
+impl Renderer {
+    pub fn new(
+        fonts: &FontSelection,
+        font_size: f32,
+        theme_configs: &HashMap<String, ThemeConfig>,
+        default_theme: &str,
+        chrome_config: &ChromeConfig,
+    ) -> Result<Self> {
         // Parse all themes
         let mut themes = HashMap::new();
         for (name, config) in theme_configs {
@@ -536,12 +803,46 @@ impl Renderer {
         // Always have a fallback
         themes.entry("dark".to_string()).or_insert_with(Theme::dark);
 
+        // The default chain is the one used when no theme is requested (and
+        // when a theme's own fonts cannot be loaded), so a broken font here is
+        // a hard error rather than a silent downgrade.
+        let default_spec = fonts.spec_for(theme_configs.get(default_theme));
+        let default_fonts = Arc::new(ThemeFonts::load(&default_spec, font_size)?);
+
+        // One font chain per theme, deduplicated by the files it resolves to:
+        // the common case (every theme using the same font) parses one chain.
+        let mut by_spec: HashMap<FontChainSpec, Arc<ThemeFonts>> = HashMap::new();
+        by_spec.insert(default_spec, Arc::clone(&default_fonts));
+        let mut theme_fonts: HashMap<String, Arc<ThemeFonts>> = HashMap::new();
+        for name in themes.keys() {
+            let spec = fonts.spec_for(theme_configs.get(name));
+            if let Some(existing) = by_spec.get(&spec) {
+                theme_fonts.insert(name.clone(), Arc::clone(existing));
+                continue;
+            }
+            match ThemeFonts::load(&spec, font_size) {
+                Ok(loaded) => {
+                    let loaded = Arc::new(loaded);
+                    by_spec.insert(spec, Arc::clone(&loaded));
+                    theme_fonts.insert(name.clone(), loaded);
+                }
+                Err(e) => {
+                    // One theme's unusable font must not stop the renderer:
+                    // that theme falls back to the default chain.
+                    tracing::warn!(
+                        "Failed to load fonts for theme '{}': {}; using the default fonts",
+                        name,
+                        e
+                    );
+                    theme_fonts.insert(name.clone(), Arc::clone(&default_fonts));
+                }
+            }
+        }
+
         Ok(Self {
-            font,
-            font_bold,
+            theme_fonts,
+            default_fonts,
             font_size,
-            cell_width,
-            cell_height,
             themes,
             default_theme: default_theme.to_string(),
             default_chrome: ChromeOptions::from_config(chrome_config),
@@ -549,14 +850,37 @@ impl Renderer {
         })
     }
 
+    /// Resolve a requested theme name to one that exists, falling back to the
+    /// default theme and then "dark". Theme colors and theme fonts are looked
+    /// up with the same name, so they can never disagree.
+    fn resolve_theme_name<'a>(&'a self, name: Option<&'a str>) -> &'a str {
+        let name = name.unwrap_or(&self.default_theme);
+        if self.themes.contains_key(name) {
+            name
+        } else if self.themes.contains_key(&self.default_theme) {
+            &self.default_theme
+        } else {
+            "dark"
+        }
+    }
+
     /// Get a theme by name, falling back to default then "dark".
     pub fn get_theme(&self, name: Option<&str>) -> &Theme {
-        let name = name.unwrap_or(&self.default_theme);
+        let name = self.resolve_theme_name(name);
         self.themes
             .get(name)
             .or_else(|| self.themes.get(&self.default_theme))
             .or_else(|| self.themes.get("dark"))
             .expect("no themes available")
+    }
+
+    /// Get the font chain for a theme, falling back to the default chain.
+    fn fonts_for(&self, name: Option<&str>) -> &ThemeFonts {
+        let name = self.resolve_theme_name(name);
+        self.theme_fonts
+            .get(name)
+            .map(Arc::as_ref)
+            .unwrap_or(&self.default_fonts)
     }
 
     /// List available theme names.
@@ -627,9 +951,19 @@ impl Renderer {
         let plain_text = self.output_text(data, screen, cols, redaction_map.as_ref(), text);
 
         let theme = self.get_theme(theme_name);
+        // Fonts are selected by the same theme name as the colors, so a theme
+        // requested per call (CLI flag or MCP parameter) renders with its own
+        // primary, bold, and fallback fonts.
+        let fonts = self.fonts_for(theme_name);
         let chrome = chrome.unwrap_or(&self.default_chrome);
-        let image =
-            self.render_to_image(screen, theme, chrome, redaction_map.as_ref(), auto_crop)?;
+        let image = self.render_to_image(
+            screen,
+            theme,
+            fonts,
+            chrome,
+            redaction_map.as_ref(),
+            auto_crop,
+        )?;
 
         let base = sanitize_base_name(output_name.unwrap_or(""));
         let path = unique_png_path(output_dir, &base);
@@ -670,7 +1004,9 @@ impl Renderer {
             .chrome
             .clone()
             .unwrap_or_else(|| self.default_chrome.clone());
-        let image = self.render_to_image(screen, theme, &chrome, Some(map), meta.auto_crop)?;
+        let fonts = self.fonts_for(meta.theme.as_deref());
+        let image =
+            self.render_to_image(screen, theme, fonts, &chrome, Some(map), meta.auto_crop)?;
         let description = self.description_text(screen, meta.cols, Some(map), text);
         save_png(&image, out_path, description.as_deref())?;
         Ok((plain_text, map.counts.clone()))
@@ -685,6 +1021,11 @@ impl Renderer {
     /// combined into a single tmux-style split, and when `chrome` is supplied
     /// and enabled the *composed* result is wrapped in one outer window frame,
     /// rather than each pane carrying its own title bar.
+    ///
+    /// When `embed_description` is set (the global `embed_description` config),
+    /// the panes' own `Description` metadata is read back and concatenated into
+    /// the composite's `Description` chunk, so a composed image is as readable
+    /// to assistive tooling as the screenshots it was built from.
     #[allow(clippy::too_many_arguments)]
     pub fn compose_screenshots(
         &self,
@@ -695,11 +1036,22 @@ impl Renderer {
         chrome: Option<&ChromeOptions>,
         output_dir: &Path,
         output: Option<&Path>,
+        embed_description: bool,
     ) -> Result<PathBuf> {
         let theme = self.get_theme(theme_name);
+        let fonts = self.fonts_for(theme_name);
+        // Read the panes' descriptions before composing, so the composite can
+        // carry them even though the pixels are merged.
+        let description = if embed_description {
+            composed_description(paths)
+        } else {
+            None
+        };
         let composed = compose_images(paths, layout, divider, theme.background)?;
         let composed = match chrome {
-            Some(chrome) if chrome.enabled => self.compose_with_chrome(composed, theme, chrome),
+            Some(chrome) if chrome.enabled => {
+                self.compose_with_chrome(composed, theme, fonts, chrome)
+            }
             // Frameless composite: round the outer corners (transparent
             // outside the curve) so a bare gallery still gets soft corners
             // instead of a hard rectangle, matching single-screenshot output.
@@ -722,8 +1074,7 @@ impl Renderer {
                 output_dir.join(format!("termshot_composed_{}.png", id))
             }
         };
-        composed
-            .save(&path)
+        save_png(&composed, &path, description.as_deref())
             .with_context(|| format!("Failed to save composed image to {:?}", path))?;
         Ok(path)
     }
@@ -793,19 +1144,21 @@ impl Renderer {
     }
 
     /// Render a screen (with optional redaction) to a composed RGBA image.
+    #[allow(clippy::too_many_arguments)]
     fn render_to_image(
         &self,
         screen: &Screen,
         theme: &Theme,
+        fonts: &ThemeFonts,
         chrome: &ChromeOptions,
         redaction: Option<&RedactionMap>,
         auto_crop: bool,
     ) -> Result<RgbaImage> {
-        let terminal_image = self.render_screen(screen, theme, redaction, auto_crop)?;
+        let terminal_image = self.render_screen(screen, theme, fonts, redaction, auto_crop)?;
         if chrome.enabled {
             // With chrome the frame is rounded (or squared when `rounded` is
             // off); see `compose_with_chrome`.
-            return Ok(self.compose_with_chrome(terminal_image, theme, chrome));
+            return Ok(self.compose_with_chrome(terminal_image, theme, fonts, chrome));
         }
         // No chrome: optionally round the terminal content itself so a bare
         // screenshot still has soft corners on a transparent background,
@@ -823,6 +1176,7 @@ impl Renderer {
         &self,
         screen: &Screen,
         theme: &Theme,
+        fonts: &ThemeFonts,
         redaction: Option<&RedactionMap>,
         auto_crop: bool,
     ) -> Result<RgbaImage> {
@@ -841,8 +1195,8 @@ impl Renderer {
         };
 
         let scale: u32 = RENDER_SCALE;
-        let cell_w = self.cell_width * scale;
-        let cell_h = self.cell_height * scale;
+        let cell_w = fonts.cell_width * scale;
+        let cell_h = fonts.cell_height * scale;
         let padding = self.padding * scale;
         let hi_font_size = self.font_size * scale as f32;
 
@@ -873,13 +1227,15 @@ impl Renderer {
                             ]);
                             self.draw_char_with_font(
                                 &mut img,
+                                fonts,
                                 x,
                                 y,
                                 label_ch,
                                 label,
                                 false,
                                 hi_font_size,
-                                &self.font,
+                                &self.font_for_char(fonts, label_ch, false, hi_font_size),
+                                cell_w,
                             );
                         }
                         continue;
@@ -895,34 +1251,39 @@ impl Renderer {
                     // Draw character(s) at 2x font size
                     let ch = cell.contents();
                     if !ch.is_empty() && ch != " " {
-                        let use_bold_font = cell.bold() && self.font_bold.is_some();
-                        let render_font = if use_bold_font {
-                            self.font_bold.as_ref().unwrap()
-                        } else {
-                            &self.font
-                        };
+                        // A double-width character owns this cell and the
+                        // vt100 continuation cell after it, so a fallback
+                        // glyph is centered across both.
+                        let cell_span = if cell.is_wide() { cell_w * 2 } else { cell_w };
+                        let bold = cell.bold();
+                        let has_bold_font = fonts.font_bold.is_some();
                         for c in ch.chars() {
+                            let chosen = self.font_for_char(fonts, c, bold, hi_font_size);
                             self.draw_char_with_font(
                                 &mut img,
+                                fonts,
                                 x,
                                 y,
                                 c,
                                 fg_color,
                                 cell.italic(),
                                 hi_font_size,
-                                render_font,
+                                &chosen,
+                                cell_span,
                             );
                             // Faux bold only when no bold font is available
-                            if cell.bold() && !use_bold_font {
+                            if bold && !has_bold_font {
                                 self.draw_char_with_font(
                                     &mut img,
+                                    fonts,
                                     x + 1,
                                     y,
                                     c,
                                     fg_color,
                                     cell.italic(),
                                     hi_font_size,
-                                    &self.font,
+                                    &chosen,
+                                    cell_span,
                                 );
                             }
                         }
@@ -945,6 +1306,7 @@ impl Renderer {
         &self,
         terminal: RgbaImage,
         theme: &Theme,
+        fonts: &ThemeFonts,
         chrome: &ChromeOptions,
     ) -> RgbaImage {
         if !chrome.enabled {
@@ -997,14 +1359,20 @@ impl Renderer {
             );
         }
 
-        let frame_bg = match chrome.preset.as_str() {
-            "macos" => Rgba([28, 28, 30, 255]),
-            "report" => Rgba([18, 20, 24, 255]),
-            _ => theme.background,
-        };
-        self.draw_rounded_rect(
-            &mut img, frame_x, frame_y, frame_w, frame_h, radius, frame_bg,
-        );
+        // The window body is always the terminal's own background, for every
+        // preset: a screenshot must not sit inside a mismatched gray (or
+        // otherwise off-theme) border. Presets differ in their title bar, not
+        // in the color surrounding the capture.
+        let frame_bg = theme.background;
+
+        // The window is painted square into its own layer and rounded once, at
+        // the end, with the same anti-aliased corner mask a chrome-less
+        // screenshot gets. Every preset therefore shares one corner
+        // implementation, and because the layer is the only opaque thing
+        // composited onto the canvas, nothing outside the rounded frame can
+        // stay opaque - no gray, black, or theme-colored halo around the
+        // window.
+        let mut frame: RgbaImage = ImageBuffer::from_pixel(frame_w, frame_h, frame_bg);
 
         if title_bar > 0 {
             let title_bg = match chrome.preset.as_str() {
@@ -1019,33 +1387,19 @@ impl Renderer {
                 ]),
             };
 
-            // Title bar painted with rounded top corners that match the
-            // frame, and a squared-off bottom edge. Drawing a rounded rect and
-            // then squaring the lower body avoids leaving frame-colored wedges
-            // in the rounded top corners.
-            self.draw_rounded_rect(
-                &mut img, frame_x, frame_y, frame_w, title_bar, radius, title_bg,
-            );
-            if title_bar > radius {
-                self.draw_rect(
-                    &mut img,
-                    frame_x,
-                    frame_y + radius,
-                    frame_w,
-                    title_bar - radius,
-                    title_bg,
-                );
-            }
+            // A plain rectangle: the corner mask applied to the whole layer
+            // below rounds the title bar's top corners exactly like the frame's,
+            // so there is no seam and no frame-colored wedge to paint over.
+            self.draw_rect(&mut frame, 0, 0, frame_w, title_bar, title_bg);
 
-            self.draw_title_bar_accents(
-                &mut img, chrome, frame_x, frame_y, frame_w, title_bar, theme, scale,
-            );
+            self.draw_title_bar_accents(&mut frame, chrome, 0, 0, frame_w, title_bar, theme, scale);
             if let Some(title) = chrome.title.as_deref() {
                 let title = truncate_title(title);
                 self.draw_text_line(
-                    &mut img,
-                    frame_x + frame_w / 2,
-                    frame_y + title_bar / 2,
+                    &mut frame,
+                    fonts,
+                    frame_w / 2,
+                    title_bar / 2,
                     &title,
                     theme.foreground,
                     self.font_size * 0.85 * scale as f32,
@@ -1053,28 +1407,46 @@ impl Renderer {
             }
         }
 
-        let term_x = frame_x + frame_pad;
-        let term_y = frame_y + frame_pad + title_bar;
+        let term_x = frame_pad;
+        let term_y = frame_pad + title_bar;
         for y in 0..terminal.height() {
             for x in 0..terminal.width() {
                 let px = terminal.get_pixel(x, y);
-                img.put_pixel(term_x + x, term_y + y, *px);
+                frame.put_pixel(term_x + x, term_y + y, *px);
             }
         }
 
         if chrome.timestamp {
             let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
             let color = muted_text_color(theme);
-            let right_x = frame_x + frame_w.saturating_sub(frame_pad.max(6 * scale));
+            let right_x = frame_w.saturating_sub(frame_pad.max(6 * scale));
             let center_y = term_y + terminal.height() + bottom_pad / 2;
             self.draw_text_right_aligned(
-                &mut img,
+                &mut frame,
+                fonts,
                 right_x,
                 center_y,
                 &timestamp,
                 color,
                 self.font_size * 0.65 * scale as f32,
             );
+        }
+
+        // One anti-aliased corner mask for every preset, identical to the one a
+        // chrome-less screenshot gets.
+        self.round_image_corners(&mut frame, radius);
+
+        // Composite the window over the (possibly shadowed) canvas source-over,
+        // so the shadow stays visible through the corner cut-outs and the area
+        // outside the window keeps the frame layer's own alpha.
+        for y in 0..frame.height() {
+            for x in 0..frame.width() {
+                let px = *frame.get_pixel(x, y);
+                if px[3] == 0 {
+                    continue;
+                }
+                self.put_pixel_blend(&mut img, frame_x + x, frame_y + y, px);
+            }
         }
 
         img
@@ -1213,6 +1585,13 @@ impl Renderer {
         }
     }
 
+    /// Fill a rounded rectangle with a one-pixel anti-aliased edge.
+    ///
+    /// Coverage comes from the rounded-rectangle signed distance evaluated at
+    /// each pixel center - the same rule [`draw_circle`](Self::draw_circle) and
+    /// [`round_image_corners`](Self::round_image_corners) use - so every
+    /// rounded shape termshot draws has the same smooth edge instead of a
+    /// staircase.
     #[allow(clippy::too_many_arguments)]
     fn draw_rounded_rect(
         &self,
@@ -1224,33 +1603,29 @@ impl Renderer {
         radius: u32,
         color: Rgba<u8>,
     ) {
-        // Clamp the radius to what the rectangle can actually accommodate and
-        // use that same value in every coordinate calculation, so oversized
-        // radii never underflow the unsigned subtractions below.
-        let radius = radius.min(w / 2).min(h / 2);
-        let r = radius as i32;
-        for py in y..y + h {
-            for px in x..x + w {
-                let dx = if px < x + radius {
-                    (x + radius) as i32 - px as i32
-                } else if px >= x + w - radius {
-                    px as i32 - (x + w - radius - 1) as i32
-                } else {
-                    0
-                };
-                let dy = if py < y + radius {
-                    (y + radius) as i32 - py as i32
-                } else if py >= y + h - radius {
-                    py as i32 - (y + h - radius - 1) as i32
-                } else {
-                    0
-                };
-                if (dx == 0 || dy == 0 || dx * dx + dy * dy <= r * r)
-                    && px < img.width()
-                    && py < img.height()
-                {
-                    self.put_pixel_blend(img, px, py, color);
+        if w == 0 || h == 0 || color[3] == 0 {
+            return;
+        }
+        // Clamp the radius to what the rectangle can actually accommodate.
+        let r = radius.min(w / 2).min(h / 2) as f32;
+        let (half_w, half_h) = (w as f32 / 2.0, h as f32 / 2.0);
+        let (center_x, center_y) = (x as f32 + half_w, y as f32 + half_h);
+        for py in y..(y + h).min(img.height()) {
+            let qy = ((py as f32 + 0.5) - center_y).abs() - (half_h - r);
+            for px in x..(x + w).min(img.width()) {
+                let qx = ((px as f32 + 0.5) - center_x).abs() - (half_w - r);
+                // Signed distance to the rounded rectangle: negative inside.
+                let distance =
+                    (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+                let coverage = (0.5 - distance).clamp(0.0, 1.0);
+                if coverage <= 0.0 {
+                    continue;
                 }
+                let alpha = (color[3] as f32 * coverage).round().clamp(0.0, 255.0) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                self.put_pixel_blend(img, px, py, Rgba([color[0], color[1], color[2], alpha]));
             }
         }
     }
@@ -1274,14 +1649,17 @@ impl Renderer {
                     Rgba([255, 189, 46, 255]),
                     Rgba([39, 201, 63, 255]),
                 ];
+                // Every traffic light is the same true circle: one radius, one
+                // vertical center, and centers spaced by a fixed pitch, so the
+                // three buttons are identical discs rather than rounded squares
+                // of drifting size.
+                let radius = TRAFFIC_LIGHT_RADIUS * scale;
+                let center_y = frame_y as f32 + title_bar_height as f32 / 2.0;
                 for (i, color) in colors.into_iter().enumerate() {
-                    self.draw_circle(
-                        img,
-                        frame_x + (18 + (i as u32 * 16)) * scale,
-                        frame_y + title_bar_height / 2,
-                        5 * scale,
-                        color,
-                    );
+                    let center_x = (frame_x
+                        + (TRAFFIC_LIGHT_FIRST_CENTER + i as u32 * TRAFFIC_LIGHT_PITCH) * scale)
+                        as f32;
+                    self.draw_circle(img, center_x, center_y, radius as f32, color);
                 }
             }
             "gnome" => {
@@ -1302,9 +1680,9 @@ impl Renderer {
                 for offset in [12u32, 22, 32] {
                     self.draw_circle(
                         img,
-                        pill_x + offset * scale,
-                        pill_y + pill_h / 2,
-                        2 * scale,
+                        (pill_x + offset * scale) as f32,
+                        (pill_y + pill_h / 2) as f32,
+                        (2 * scale) as f32,
                         Rgba([255, 255, 255, 90]),
                     );
                 }
@@ -1338,35 +1716,62 @@ impl Renderer {
         }
     }
 
-    fn draw_circle(&self, img: &mut RgbaImage, cx: u32, cy: u32, r: u32, color: Rgba<u8>) {
-        let r = r as i32;
-        for y in (cy as i32 - r)..=(cy as i32 + r) {
-            for x in (cx as i32 - r)..=(cx as i32 + r) {
-                let dx = x - cx as i32;
-                let dy = y - cy as i32;
-                if dx * dx + dy * dy <= r * r && x >= 0 && y >= 0 {
-                    let x = x as u32;
-                    let y = y as u32;
-                    if x < img.width() && y < img.height() {
-                        self.put_pixel_blend(img, x, y, color);
-                    }
+    /// Draw a filled circle of radius `r` centered on `(cx, cy)`, with a
+    /// one-pixel anti-aliased edge.
+    ///
+    /// Coverage is the distance from the *pixel center* to the circle center,
+    /// so the disc is symmetric about `(cx, cy)` in both axes: with `cx`/`cy`
+    /// on a pixel boundary (an integer coordinate) and an even diameter, the
+    /// mask has exactly the same width and height and the same number of lit
+    /// pixels on either side of the center. Testing squared distance against a
+    /// squared radius - rather than approximating a circle with a small rounded
+    /// rectangle - is what keeps the macOS traffic lights round instead of
+    /// leaving single-pixel spikes at the cardinal points.
+    fn draw_circle(&self, img: &mut RgbaImage, cx: f32, cy: f32, r: f32, color: Rgba<u8>) {
+        if r <= 0.0 || color[3] == 0 {
+            return;
+        }
+        let (img_w, img_h) = img.dimensions();
+        // One extra pixel on each side leaves room for the anti-aliased edge.
+        let x0 = (cx - r - 1.0).floor().max(0.0) as u32;
+        let y0 = (cy - r - 1.0).floor().max(0.0) as u32;
+        let x1 = ((cx + r + 1.0).ceil().max(0.0) as u32).min(img_w);
+        let y1 = ((cy + r + 1.0).ceil().max(0.0) as u32).min(img_h);
+        for py in y0..y1 {
+            let dy = py as f32 + 0.5 - cy;
+            for px in x0..x1 {
+                let dx = px as f32 + 0.5 - cx;
+                let distance = (dx * dx + dy * dy).sqrt();
+                // Full coverage inside, zero outside, linear across the last
+                // pixel of the edge.
+                let coverage = (r + 0.5 - distance).clamp(0.0, 1.0);
+                if coverage <= 0.0 {
+                    continue;
                 }
+                let alpha = (color[3] as f32 * coverage).round().clamp(0.0, 255.0) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                self.put_pixel_blend(img, px, py, Rgba([color[0], color[1], color[2], alpha]));
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_text_line(
         &self,
         img: &mut RgbaImage,
+        fonts: &ThemeFonts,
         center_x: u32,
         center_y: u32,
         text: &str,
         color: Rgba<u8>,
         size: f32,
     ) {
-        let total_width = self.text_width(text, size);
+        let total_width = self.text_width(fonts, text, size);
         self.draw_text_at(
             img,
+            fonts,
             center_x as i32 - (total_width as i32 / 2),
             center_y,
             text,
@@ -1375,18 +1780,21 @@ impl Renderer {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_text_right_aligned(
         &self,
         img: &mut RgbaImage,
+        fonts: &ThemeFonts,
         right_x: u32,
         center_y: u32,
         text: &str,
         color: Rgba<u8>,
         size: f32,
     ) {
-        let total_width = self.text_width(text, size);
+        let total_width = self.text_width(fonts, text, size);
         self.draw_text_at(
             img,
+            fonts,
             right_x as i32 - total_width as i32,
             center_y,
             text,
@@ -1395,12 +1803,12 @@ impl Renderer {
         );
     }
 
-    fn text_width(&self, text: &str, size: f32) -> u32 {
+    fn text_width(&self, fonts: &ThemeFonts, text: &str, size: f32) -> u32 {
         // The chrome font is monospace, so every character occupies one fixed
         // cell whose width is derived from 'M'. Using a single cell advance for
         // every glyph keeps `text_width` in sync with `draw_text_at` and avoids
         // per-glyph rounding drift.
-        let cell_advance = self.font.metrics('M', size).advance_width.round() as u32;
+        let cell_advance = fonts.font.metrics('M', size).advance_width.round() as u32;
         text.chars().count() as u32 * cell_advance
     }
 
@@ -1412,21 +1820,43 @@ impl Renderer {
     /// spacing wobble. Glyph placement inside each cell is delegated to
     /// [`draw_glyph`](Self::draw_glyph), the same routine that renders terminal
     /// content, so both paths share baseline and side-bearing handling.
+    #[allow(clippy::too_many_arguments)]
     fn draw_text_at(
         &self,
         img: &mut RgbaImage,
+        fonts: &ThemeFonts,
         start_x: i32,
         center_y: u32,
         text: &str,
         color: Rgba<u8>,
         size: f32,
     ) {
-        let cell_advance = self.font.metrics('M', size).advance_width.round() as i32;
-        let line_height = font_line_height(&self.font, size);
+        let cell_advance = fonts.font.metrics('M', size).advance_width.round() as i32;
+        let line_height = font_line_height(&fonts.font, size);
         let line_top = center_y as i32 - (line_height as i32 / 2);
         let mut cursor_x = start_x;
         for ch in text.chars() {
-            self.draw_glyph(img, cursor_x, line_top, ch, color, false, size, &self.font);
+            let chosen = self.font_for_char(fonts, ch, false, size);
+            let advance = cell_advance.max(0) as u32;
+            let (render_size, placement) = if chosen.is_fallback {
+                (
+                    fallback_font_size(chosen.font, ch, size, advance),
+                    GlyphPlacement::fallback(font_ascent(&fonts.font, size), advance),
+                )
+            } else {
+                (size, GlyphPlacement::natural())
+            };
+            self.draw_glyph(
+                img,
+                cursor_x,
+                line_top,
+                ch,
+                color,
+                false,
+                render_size,
+                chosen.font,
+                placement,
+            );
             cursor_x += cell_advance;
         }
     }
@@ -1608,14 +2038,16 @@ impl Renderer {
     /// through it, so they share identical positioning rules:
     ///
     /// * `cell_x` is the left edge of the character cell; the glyph is placed
-    ///   at `cell_x + xmin` so its side bearing is respected.
+    ///   at `cell_x + xmin` so its side bearing is respected, unless
+    ///   `placement` asks for it to be centered (fallback glyphs).
     /// * `line_top` is the top of the line box; the glyph sits on the shared
     ///   baseline at `line_top + ascent`, offset by its own `ymin`. Using the
     ///   baseline (instead of centering each bitmap) is what keeps descenders
-    ///   hanging and stops the per-glyph vertical wobble.
+    ///   hanging and stops the per-glyph vertical wobble. `placement` may
+    ///   override the ascent so fallback faces share the primary baseline.
     /// * `italic` applies a synthetic shear, used by terminal content.
-    /// * `font` may be the regular or bold face; `color`'s alpha modulates the
-    ///   glyph coverage and the result is composited source-over.
+    /// * `font` may be the regular, bold, or a fallback face; `color`'s alpha
+    ///   modulates the glyph coverage and the result is composited source-over.
     #[allow(clippy::too_many_arguments)]
     fn draw_glyph(
         &self,
@@ -1627,14 +2059,28 @@ impl Renderer {
         italic: bool,
         font_size: f32,
         font: &Font,
+        placement: GlyphPlacement,
     ) {
         let (metrics, bitmap) = font.rasterize(ch, font_size);
         if bitmap.is_empty() || metrics.width == 0 || metrics.height == 0 {
             return;
         }
 
-        let ascent = font_ascent(font, font_size);
-        let glyph_x = cell_x + metrics.xmin;
+        let ascent = placement
+            .ascent
+            .unwrap_or_else(|| font_ascent(font, font_size));
+        let glyph_x = match placement.center_width {
+            // Center by *advance*, not by the ink bitmap: a box drawing corner
+            // like `┌` only inks the right half of its cell, and centering its
+            // bitmap would pull it away from the line it must join. Offsetting
+            // the whole advance keeps every glyph's internal geometry intact.
+            Some(width) => {
+                cell_x
+                    + ((width as f32 - metrics.advance_width) / 2.0).round() as i32
+                    + metrics.xmin
+            }
+            None => cell_x + metrics.xmin,
+        };
         let glyph_y = line_top + ascent.round() as i32 - metrics.height as i32 - metrics.ymin;
 
         let shear = |gy: usize| -> i32 {
@@ -1669,19 +2115,80 @@ impl Renderer {
 
     /// Draw a single terminal cell's character. `x`/`y` are the top-left
     /// corner of the cell in image space.
+    ///
+    /// `cell_span` is the width in pixels of the box the character occupies -
+    /// one cell, or two for a wide (double-width) character - and is used to
+    /// center fallback glyphs.
     #[allow(clippy::too_many_arguments)]
     fn draw_char_with_font(
         &self,
         img: &mut RgbaImage,
+        fonts: &ThemeFonts,
         x: u32,
         y: u32,
         ch: char,
         color: Rgba<u8>,
         italic: bool,
         font_size: f32,
-        font: &Font,
+        font: &ChosenFont<'_>,
+        cell_span: u32,
     ) {
-        self.draw_glyph(img, x as i32, y as i32, ch, color, italic, font_size, font);
+        let (render_size, placement) = if font.is_fallback {
+            (
+                fallback_font_size(font.font, ch, font_size, cell_span),
+                GlyphPlacement::fallback(font_ascent(&fonts.font, font_size), cell_span),
+            )
+        } else {
+            (font_size, GlyphPlacement::natural())
+        };
+        self.draw_glyph(
+            img,
+            x as i32,
+            y as i32,
+            ch,
+            color,
+            italic,
+            render_size,
+            font.font,
+            placement,
+        );
+    }
+
+    /// Pick the font used to draw `ch`, walking the fallback chain in order:
+    /// the primary face (the bold face for a bold cell), then the embedded
+    /// JetBrains Mono, then any fonts the theme configured. When nothing
+    /// covers the character the primary face is returned, so the terminal
+    /// shows its usual missing-glyph behavior rather than silently borrowing
+    /// an unrelated glyph.
+    fn font_for_char<'f>(
+        &self,
+        fonts: &'f ThemeFonts,
+        ch: char,
+        bold: bool,
+        font_size: f32,
+    ) -> ChosenFont<'f> {
+        let primary = match (bold, fonts.font_bold.as_ref()) {
+            (true, Some(bold_font)) => bold_font,
+            _ => &fonts.font,
+        };
+        if font_covers(primary, ch, font_size) {
+            return ChosenFont {
+                font: primary,
+                is_fallback: false,
+            };
+        }
+        for font in &fonts.fallback_fonts {
+            if font_covers(font, ch, font_size) {
+                return ChosenFont {
+                    font,
+                    is_fallback: true,
+                };
+            }
+        }
+        ChosenFont {
+            font: primary,
+            is_fallback: false,
+        }
     }
 }
 
@@ -1804,31 +2311,17 @@ mod tests {
 
     #[test]
     fn compose_with_chrome_increases_canvas_size() {
-        let renderer = Renderer {
-            font: Font::from_bytes(
-                std::fs::read("fonts/JetBrainsMono-Regular.ttf").expect("font present"),
-                FontSettings::default(),
-            )
-            .expect("font parse"),
-            font_bold: None,
-            font_size: 16.0,
-            cell_width: 8,
-            cell_height: 16,
-            themes: HashMap::new(),
-            default_theme: "dark".to_string(),
-            default_chrome: ChromeOptions {
-                enabled: false,
-                preset: "none".to_string(),
-                title: None,
-                timestamp: false,
-                shadow: true,
-                radius: 14,
-                rounded: true,
-                outer_padding: 18,
-                title_bar_height: 34,
-            },
-            padding: 16,
-        };
+        let renderer = renderer_with_chrome(ChromeOptions {
+            enabled: false,
+            preset: "none".to_string(),
+            title: None,
+            timestamp: false,
+            shadow: true,
+            radius: 14,
+            rounded: true,
+            outer_padding: 18,
+            title_bar_height: 34,
+        });
 
         let terminal = ImageBuffer::from_pixel(100, 50, Rgba([10, 10, 10, 255]));
         let theme = Theme::dark();
@@ -1844,38 +2337,25 @@ mod tests {
             title_bar_height: 34,
         };
 
-        let result = renderer.compose_with_chrome(terminal, &theme, &chrome);
+        let result =
+            renderer.compose_with_chrome(terminal, &theme, &renderer.default_fonts, &chrome);
         assert!(result.width() > 100);
         assert!(result.height() > 50);
     }
 
     #[test]
     fn timestamp_reserves_bottom_padding() {
-        let renderer = Renderer {
-            font: Font::from_bytes(
-                std::fs::read("fonts/JetBrainsMono-Regular.ttf").expect("font present"),
-                FontSettings::default(),
-            )
-            .expect("font parse"),
-            font_bold: None,
-            font_size: 16.0,
-            cell_width: 8,
-            cell_height: 16,
-            themes: HashMap::new(),
-            default_theme: "dark".to_string(),
-            default_chrome: ChromeOptions {
-                enabled: false,
-                preset: "none".to_string(),
-                title: None,
-                timestamp: false,
-                shadow: false,
-                radius: 14,
-                rounded: true,
-                outer_padding: 0,
-                title_bar_height: 34,
-            },
-            padding: 16,
-        };
+        let renderer = renderer_with_chrome(ChromeOptions {
+            enabled: false,
+            preset: "none".to_string(),
+            title: None,
+            timestamp: false,
+            shadow: false,
+            radius: 14,
+            rounded: true,
+            outer_padding: 0,
+            title_bar_height: 34,
+        });
         let terminal = ImageBuffer::from_pixel(100, 50, Rgba([10, 10, 10, 255]));
         let chrome = ChromeOptions {
             enabled: true,
@@ -1889,7 +2369,12 @@ mod tests {
             title_bar_height: 34,
         };
 
-        let result = renderer.compose_with_chrome(terminal, &Theme::dark(), &chrome);
+        let result = renderer.compose_with_chrome(
+            terminal,
+            &Theme::dark(),
+            &renderer.default_fonts,
+            &chrome,
+        );
         // Chrome metrics are drawn at RENDER_SCALE (2x): title bar 34*2=68 and
         // the timestamp reserves max(0, 18*2)=36 of bottom padding.
         assert_eq!(result.height(), 50 + 68 + 36);
@@ -1939,13 +2424,27 @@ mod tests {
 
         renderer.default_chrome.rounded = true;
         let rounded = renderer
-            .render_to_image(screen, &theme, &renderer.default_chrome, None, false)
+            .render_to_image(
+                screen,
+                &theme,
+                &renderer.default_fonts,
+                &renderer.default_chrome,
+                None,
+                false,
+            )
             .unwrap();
         assert_eq!(rounded.get_pixel(0, 0)[3], 0, "rounded: corner transparent");
 
         renderer.default_chrome.rounded = false;
         let square = renderer
-            .render_to_image(screen, &theme, &renderer.default_chrome, None, false)
+            .render_to_image(
+                screen,
+                &theme,
+                &renderer.default_fonts,
+                &renderer.default_chrome,
+                None,
+                false,
+            )
             .unwrap();
         assert_eq!(square.get_pixel(0, 0)[3], 255, "square: corner opaque");
     }
@@ -1963,11 +2462,17 @@ mod tests {
         // be identical for narrow vs. wide characters of equal length.
         let r = bare_renderer();
         let size = 20.0;
-        let one_m = r.text_width("M", size);
+        let one_m = r.text_width(&r.default_fonts, "M", size);
         assert!(one_m > 0);
-        assert_eq!(r.text_width("MMMMMMMMMM", size), one_m * 10);
-        assert_eq!(r.text_width("iiiiiiiiii", size), one_m * 10);
-        assert_eq!(r.text_width("Mi.lWx/9-", size), one_m * 9);
+        assert_eq!(
+            r.text_width(&r.default_fonts, "MMMMMMMMMM", size),
+            one_m * 10
+        );
+        assert_eq!(
+            r.text_width(&r.default_fonts, "iiiiiiiiii", size),
+            one_m * 10
+        );
+        assert_eq!(r.text_width(&r.default_fonts, "Mi.lWx/9-", size), one_m * 9);
     }
 
     /// Chrome text (window title *and* timestamp watermark, which share
@@ -1980,10 +2485,18 @@ mod tests {
         let r = bare_renderer();
         let size = 24.0;
         let mut img: RgbaImage = ImageBuffer::from_pixel(400, 80, Rgba([0, 0, 0, 255]));
-        r.draw_text_at(&mut img, 10, 40, "oxy", Rgba([255, 255, 255, 255]), size);
+        r.draw_text_at(
+            &mut img,
+            &r.default_fonts,
+            10,
+            40,
+            "oxy",
+            Rgba([255, 255, 255, 255]),
+            size,
+        );
 
         // Bottom-most inked row per glyph cell (cells are a fixed advance wide).
-        let advance = r.text_width("M", size) as i32;
+        let advance = r.text_width(&r.default_fonts, "M", size) as i32;
         let bottom_of = |cell: i32| -> u32 {
             let (x0, x1) = (10 + cell * advance, 10 + (cell + 1) * advance);
             (0..img.height())
@@ -2018,6 +2531,7 @@ mod tests {
         let mut img: RgbaImage = ImageBuffer::from_pixel(400, 60, Rgba([0, 0, 0, 255]));
         r.draw_text_right_aligned(
             &mut img,
+            &r.default_fonts,
             right_x,
             30,
             text,
@@ -2025,8 +2539,8 @@ mod tests {
             size,
         );
 
-        let advance = r.text_width("M", size);
-        let start_x = right_x - r.text_width(text, size);
+        let advance = r.text_width(&r.default_fonts, "M", size);
+        let start_x = right_x - r.text_width(&r.default_fonts, text, size);
 
         // Per character cell, the top and bottom inked rows.
         let mut extents: Vec<(usize, u32, u32)> = Vec::new();
@@ -2114,32 +2628,47 @@ mod tests {
         assert_eq!(normalize_newlines(b"\nx").as_ref(), b"\r\nx".as_slice());
     }
 
-    fn bare_renderer() -> Renderer {
-        Renderer {
+    /// The bundled JetBrains Mono with fixed 8x16 cell metrics, used as the
+    /// single font chain of the test renderers below.
+    fn test_fonts() -> ThemeFonts {
+        ThemeFonts {
             font: Font::from_bytes(
                 std::fs::read("fonts/JetBrainsMono-Regular.ttf").expect("font present"),
                 FontSettings::default(),
             )
             .expect("font parse"),
             font_bold: None,
-            font_size: 16.0,
+            fallback_fonts: Vec::new(),
             cell_width: 8,
             cell_height: 16,
+        }
+    }
+
+    /// A renderer with one font chain and the given chrome defaults.
+    fn renderer_with_chrome(default_chrome: ChromeOptions) -> Renderer {
+        Renderer {
+            theme_fonts: HashMap::new(),
+            default_fonts: Arc::new(test_fonts()),
+            font_size: 16.0,
             themes: HashMap::new(),
             default_theme: "dark".to_string(),
-            default_chrome: ChromeOptions {
-                enabled: false,
-                preset: "none".to_string(),
-                title: None,
-                timestamp: false,
-                shadow: false,
-                radius: 0,
-                rounded: true,
-                outer_padding: 0,
-                title_bar_height: 0,
-            },
+            default_chrome,
             padding: 16,
         }
+    }
+
+    fn bare_renderer() -> Renderer {
+        renderer_with_chrome(ChromeOptions {
+            enabled: false,
+            preset: "none".to_string(),
+            title: None,
+            timestamp: false,
+            shadow: false,
+            radius: 0,
+            rounded: true,
+            outer_padding: 0,
+            title_bar_height: 0,
+        })
     }
 
     #[test]
@@ -2158,15 +2687,17 @@ mod tests {
         assert!(!map.is_empty(), "expected the IPv4 address to be redacted");
 
         let redacted = renderer
-            .render_screen(screen, &theme, Some(&map), true)
+            .render_screen(screen, &theme, &renderer.default_fonts, Some(&map), true)
             .unwrap();
-        let plain = renderer.render_screen(screen, &theme, None, true).unwrap();
+        let plain = renderer
+            .render_screen(screen, &theme, &renderer.default_fonts, None, true)
+            .unwrap();
 
         // "[IP]" labels columns 3-6; sample a later plain-block column so we
         // land on solid redaction red rather than a label glyph.
         let scale = 2u32;
-        let cell_w = renderer.cell_width * scale;
-        let cell_h = renderer.cell_height * scale;
+        let cell_w = renderer.default_fonts.cell_width * scale;
+        let cell_h = renderer.default_fonts.cell_height * scale;
         let padding = renderer.padding * scale;
         let px = 10 * cell_w + padding + cell_w / 2;
         let py = padding + cell_h / 2;
@@ -2286,17 +2817,20 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// Read the PNG `tEXt` chunk stored under `Description`, if any.
+    /// Read the PNG `iTXt` chunk stored under `Description`, if any.
     fn png_description(path: &std::path::Path) -> Option<String> {
         let file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
         let decoder = png::Decoder::new(file);
-        let reader = decoder.read_info().unwrap();
+        let mut reader = decoder.read_info().unwrap();
+        // `iTXt` chunks may trail the image data, so drain the frame first.
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut buf).unwrap();
         reader
             .info()
-            .uncompressed_latin1_text
+            .utf8_text
             .iter()
             .find(|chunk| chunk.keyword == "Description")
-            .map(|chunk| chunk.text.clone())
+            .map(|chunk| chunk.get_text().expect("iTXt text should decode"))
     }
 
     #[test]
@@ -2390,9 +2924,75 @@ mod tests {
             description
         );
         assert!(description.contains("key "));
-        // Redaction blocks are transliterated to '#' (tEXt is Latin-1 only).
-        assert!(description.contains("####"), "got: {:?}", description);
+        // Redaction blocks survive verbatim: `iTXt` carries UTF-8, so the
+        // masked span reads as the same `█` run the image draws.
+        assert!(
+            description.contains("\u{2588}\u{2588}\u{2588}\u{2588}"),
+            "got: {:?}",
+            description
+        );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The embedded description must survive non-Latin-1 terminal output:
+    /// `bat`/`tree` box drawing, check marks, Greek, and CJK all have to come
+    /// back out of the PNG byte-for-byte, with no `?` transliteration and no
+    /// U+FFFD replacement.
+    #[test]
+    fn embedded_description_preserves_unicode() {
+        let mut renderer = bare_renderer();
+        renderer.themes.insert("dark".to_string(), Theme::dark());
+        let out_dir = std::path::Path::new("target/description-test-out");
+        std::fs::create_dir_all(out_dir).unwrap();
+
+        let unicode = "\u{2500} \u{2502} \u{250c} \u{2713} \u{3bb} \u{6f22}";
+        let source = format!("{}\n", unicode);
+
+        let (path, _text, _audit, _meta) = renderer
+            .render_bytes(
+                source.as_bytes(),
+                40,
+                3,
+                out_dir,
+                Some("description unicode"),
+                Some("dark"),
+                None,
+                None,
+                TextOptions {
+                    embed_description: true,
+                    ..TextOptions::default()
+                },
+                true,
+            )
+            .unwrap();
+
+        let description = png_description(&path).expect("Description chunk missing");
+        assert!(
+            description.contains(unicode),
+            "unicode did not round-trip: {:?}",
+            description
+        );
+        assert!(
+            !description.contains('?') && !description.contains('\u{fffd}'),
+            "unicode was transliterated or replaced: {:?}",
+            description
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Control characters are dropped, newlines are kept, and the cap
+    /// truncates on a character boundary (never mid-codepoint).
+    #[test]
+    fn description_text_chunk_sanitizes_and_truncates_on_char_boundary() {
+        assert_eq!(description_text_chunk("a\u{7}b\u{1b}c\nd\n\n"), "abc\nd");
+
+        // Every character is 3 bytes, so the cap lands mid-character unless
+        // truncation is boundary-aware.
+        let long = "\u{6f22}".repeat(MAX_DESCRIPTION_BYTES);
+        let capped = description_text_chunk(&long);
+        assert!(capped.len() <= MAX_DESCRIPTION_BYTES);
+        assert!(capped.chars().all(|c| c == '\u{6f22}'));
+        assert_eq!(capped.len() % '\u{6f22}'.len_utf8(), 0);
     }
 
     #[test]
@@ -2462,5 +3062,863 @@ mod tests {
         for name in ["cmd.png", "cmd-2.png", "cmd-3.png"] {
             std::fs::remove_file(dir.join(name)).ok();
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Font fallback
+    // ---------------------------------------------------------------------
+
+    /// Stand-in for a real primary font (MonoLisa and friends) that only
+    /// covers printable ASCII: no box drawing, no symbols, no CJK.
+    const LIMITED_PRIMARY: &str = "tests/fixtures/limited-ascii.ttf";
+    /// Stand-in for a user-configured fallback font (WenQuanYi Zen Hei and
+    /// friends): a single CJK character and nothing else.
+    const CJK_FALLBACK: &str = "tests/fixtures/cjk-fallback.ttf";
+
+    /// Box drawing, symbol, and Greek characters `bat`/`batcat` frames use and
+    /// MonoLisa does not ship.
+    const FALLBACK_CHARS: [char; 5] = ['\u{2500}', '\u{2502}', '\u{250c}', '\u{2713}', '\u{3bb}'];
+
+    fn renderer_with(primary: Option<&str>, fallbacks: &[&str]) -> Renderer {
+        let fallbacks: Vec<PathBuf> = fallbacks.iter().map(PathBuf::from).collect();
+        Renderer::new(
+            &FontSelection {
+                font_override: primary.map(PathBuf::from),
+                font_bold_override: None,
+                global_font: None,
+                global_fallback_fonts: fallbacks,
+            },
+            16.0,
+            &HashMap::new(),
+            "dark",
+            &ChromeConfig::default(),
+        )
+        .expect("renderer builds")
+    }
+
+    /// Render `text` through the normal terminal path and return the image.
+    fn render_line(renderer: &Renderer, text: &str, cols: u16) -> RgbaImage {
+        let mut parser = vt100::Parser::new(2, cols, 0);
+        parser.process(text.as_bytes());
+        renderer
+            .render_screen(
+                parser.screen(),
+                &Theme::dark(),
+                &renderer.default_fonts,
+                None,
+                false,
+            )
+            .expect("render")
+    }
+
+    /// Count pixels that differ from the theme background, i.e. how much ink a
+    /// glyph actually put on the canvas.
+    fn ink(img: &RgbaImage) -> usize {
+        let bg = Theme::dark().background;
+        img.pixels().filter(|p| **p != bg).count()
+    }
+
+    /// Ink inside the horizontal span `[x0, x1)` of the image.
+    fn ink_in_columns(img: &RgbaImage, x0: u32, x1: u32) -> usize {
+        let bg = Theme::dark().background;
+        let mut count = 0;
+        for y in 0..img.height() {
+            for x in x0..x1.min(img.width()) {
+                if *img.get_pixel(x, y) != bg {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// A primary font without box drawing glyphs must hand those characters to
+    /// the embedded JetBrains Mono instead of drawing a tofu box.
+    #[test]
+    fn missing_box_drawing_glyphs_fall_back_to_the_embedded_font() {
+        let renderer = renderer_with(Some(LIMITED_PRIMARY), &[]);
+        for ch in FALLBACK_CHARS {
+            assert!(
+                !font_covers(&renderer.default_fonts.font, ch, 32.0),
+                "fixture primary font unexpectedly covers {:?}",
+                ch
+            );
+            let chosen = renderer.font_for_char(&renderer.default_fonts, ch, false, 32.0);
+            assert!(chosen.is_fallback, "{:?} did not use a fallback font", ch);
+            assert!(
+                font_covers(chosen.font, ch, 32.0),
+                "fallback font chosen for {:?} does not cover it",
+                ch
+            );
+        }
+        // ASCII still comes from the primary font.
+        let chosen = renderer.font_for_char(&renderer.default_fonts, 'M', false, 32.0);
+        assert!(!chosen.is_fallback, "ASCII must stay on the primary font");
+    }
+
+    /// The embedded JetBrains Mono is always the first fallback, even when the
+    /// theme configures extra fonts.
+    #[test]
+    fn embedded_font_is_always_the_first_fallback() {
+        let renderer = renderer_with(Some(LIMITED_PRIMARY), &[CJK_FALLBACK]);
+        assert_eq!(
+            renderer.default_fonts.fallback_fonts.len(),
+            2,
+            "expected the embedded font plus one configured fallback"
+        );
+        let embedded = &renderer.default_fonts.fallback_fonts[0];
+        for ch in FALLBACK_CHARS {
+            assert!(
+                font_covers(embedded, ch, 32.0),
+                "embedded JetBrains Mono should cover {:?}",
+                ch
+            );
+            let chosen = renderer.font_for_char(&renderer.default_fonts, ch, false, 32.0);
+            assert!(
+                std::ptr::eq(chosen.font, embedded),
+                "{:?} skipped the embedded font",
+                ch
+            );
+        }
+    }
+
+    /// The embedded font really rasterizes the box drawing and symbol
+    /// characters, and they reach the canvas through the full render path.
+    #[test]
+    fn embedded_font_renders_box_drawing_and_symbols() {
+        let renderer = renderer_with(Some(LIMITED_PRIMARY), &[]);
+        let embedded = &renderer.default_fonts.fallback_fonts[0];
+        for ch in FALLBACK_CHARS {
+            let (metrics, bitmap) = embedded.rasterize(ch, 32.0);
+            assert!(
+                !bitmap.is_empty() && metrics.width > 0 && metrics.height > 0,
+                "embedded font produced no bitmap for {:?}",
+                ch
+            );
+        }
+
+        let drawn: String = FALLBACK_CHARS.iter().collect();
+        let img = render_line(&renderer, &drawn, 10);
+        assert!(ink(&img) > 0, "fallback glyphs left no ink on the canvas");
+    }
+
+    /// A character no font in the chain covers keeps the terminal's normal
+    /// missing-glyph behavior: nothing is borrowed from an unrelated font, and
+    /// no tofu box is invented.
+    #[test]
+    fn uncovered_cjk_stays_missing_without_a_configured_fallback() {
+        let renderer = renderer_with(Some(LIMITED_PRIMARY), &[]);
+        let chosen = renderer.font_for_char(&renderer.default_fonts, '\u{4e2d}', false, 32.0);
+        assert!(
+            !chosen.is_fallback,
+            "no fallback should cover this CJK char"
+        );
+        assert!(!font_covers(chosen.font, '\u{4e2d}', 32.0));
+        assert_eq!(
+            ink(&render_line(&renderer, "\u{4e2d}", 10)),
+            0,
+            "a character no font covers must not draw a substitute glyph"
+        );
+    }
+
+    /// A fallback font configured by the theme is loaded and used for the
+    /// characters only it covers.
+    #[test]
+    fn configured_fallback_font_is_loaded_and_selected() {
+        let renderer = renderer_with(Some(LIMITED_PRIMARY), &[CJK_FALLBACK]);
+        let chosen = renderer.font_for_char(&renderer.default_fonts, '\u{4e2d}', false, 32.0);
+        assert!(chosen.is_fallback, "configured fallback was not selected");
+        assert!(std::ptr::eq(
+            chosen.font,
+            &renderer.default_fonts.fallback_fonts[1]
+        ));
+        assert!(
+            ink(&render_line(&renderer, "\u{4e2d}", 10)) > 0,
+            "configured fallback glyph was not drawn"
+        );
+    }
+
+    /// A fallback that does not exist, or is not a font at all, is skipped
+    /// with a warning: the renderer still builds and the rest of the chain
+    /// keeps working.
+    #[test]
+    fn broken_fallback_fonts_warn_and_are_skipped() {
+        let dir = Path::new("target/font-fallback-test");
+        std::fs::create_dir_all(dir).unwrap();
+        let junk = dir.join("not-a-font.ttf");
+        std::fs::write(&junk, b"this is definitely not a font").unwrap();
+
+        let renderer = renderer_with(
+            Some(LIMITED_PRIMARY),
+            &[
+                "target/font-fallback-test/missing-font.ttf",
+                junk.to_str().unwrap(),
+                CJK_FALLBACK,
+            ],
+        );
+
+        // Embedded font + the one usable configured fallback.
+        assert_eq!(renderer.default_fonts.fallback_fonts.len(), 2);
+        assert!(
+            renderer
+                .font_for_char(&renderer.default_fonts, '\u{2500}', false, 32.0)
+                .is_fallback
+        );
+        assert!(
+            renderer
+                .font_for_char(&renderer.default_fonts, '\u{4e2d}', false, 32.0)
+                .is_fallback
+        );
+    }
+
+    /// Fallback fonts must not disturb the monospace grid: cell metrics come
+    /// from the primary font alone, and a fallback glyph stays inside its own
+    /// cell.
+    #[test]
+    fn fallback_glyphs_keep_the_primary_cell_metrics() {
+        let plain = renderer_with(Some(LIMITED_PRIMARY), &[]);
+        let with_fallbacks = renderer_with(Some(LIMITED_PRIMARY), &[CJK_FALLBACK]);
+        assert_eq!(
+            plain.default_fonts.cell_width,
+            with_fallbacks.default_fonts.cell_width
+        );
+        assert_eq!(
+            plain.default_fonts.cell_height,
+            with_fallbacks.default_fonts.cell_height
+        );
+
+        let cols = 4;
+        let img = render_line(&with_fallbacks, "\u{2500}", cols);
+        let expected_width = cols as u32 * plain.default_fonts.cell_width * RENDER_SCALE
+            + plain.padding * RENDER_SCALE * 2;
+        assert_eq!(
+            img.width(),
+            expected_width,
+            "fallback changed the grid width"
+        );
+
+        // The glyph is drawn in its own (first) cell. Box drawing glyphs
+        // deliberately overhang the advance width a little so horizontal rules
+        // join across cells, so the check is that the ink never reaches the
+        // middle of the neighbouring cell.
+        let cell_w = plain.default_fonts.cell_width * RENDER_SCALE;
+        let padding = plain.padding * RENDER_SCALE;
+        assert!(ink_in_columns(&img, padding, padding + cell_w) > 0);
+        assert_eq!(
+            ink_in_columns(&img, padding + cell_w + cell_w / 2, img.width()),
+            0,
+            "fallback glyph spilled into the next cell"
+        );
+    }
+
+    /// A fallback glyph is positioned as cleanly in its cell as a primary
+    /// glyph is in its own: it fills the cell horizontally (so rules join) and
+    /// sits at the same height on the line.
+    #[test]
+    fn fallback_glyphs_sit_cleanly_in_the_cell() {
+        // Primary = embedded JetBrains Mono: the glyph is drawn directly.
+        let direct = renderer_with(None, &[]);
+        // Primary = the ASCII-only fixture, whose cell is wider (0.64 em, like
+        // MonoLisa): the glyph now comes from the embedded fallback.
+        let via_fallback = renderer_with(Some(LIMITED_PRIMARY), &[]);
+
+        let bbox = |img: &RgbaImage| -> (u32, u32, u32, u32) {
+            let bg = Theme::dark().background;
+            let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+            for (x, y, p) in img.enumerate_pixels() {
+                if *p != bg {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+            (x0, y0, x1, y1)
+        };
+
+        let measure = |r: &Renderer| {
+            let img = render_line(r, "\u{2500}", 4);
+            let padding = r.padding * RENDER_SCALE;
+            let cell_w = r.default_fonts.cell_width * RENDER_SCALE;
+            let (x0, y0, x1, y1) = bbox(&img);
+            // Insets from the cell edges, and the ink's vertical midpoint
+            // measured from the top of the line.
+            (
+                x0 as i64 - padding as i64,
+                (padding + cell_w) as i64 - (x1 + 1) as i64,
+                ((y0 + y1) / 2) as i64 - padding as i64,
+            )
+        };
+
+        let (direct_left, direct_right, direct_mid) = measure(&direct);
+        let (fb_left, fb_right, fb_mid) = measure(&via_fallback);
+
+        assert!(
+            fb_left <= direct_left + 1 && fb_right <= direct_right + 1,
+            "fallback rule does not reach its cell edges (insets {}/{} vs {}/{})",
+            fb_left,
+            fb_right,
+            direct_left,
+            direct_right
+        );
+        assert!(
+            fb_mid.abs_diff(direct_mid) <= 2,
+            "fallback glyph sits at a different height: {} vs {}",
+            fb_mid,
+            direct_mid
+        );
+    }
+
+    /// A double-width fallback glyph is centered across the cell *and* its
+    /// vt100 continuation cell, and does not bleed into the next character.
+    #[test]
+    fn wide_fallback_glyphs_respect_continuation_cells() {
+        let renderer = renderer_with(Some(LIMITED_PRIMARY), &[CJK_FALLBACK]);
+        let cols = 6;
+        let img = render_line(&renderer, "\u{4e2d}", cols);
+        let cell_w = renderer.default_fonts.cell_width * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+
+        assert!(
+            ink_in_columns(&img, padding, padding + cell_w * 2) > 0,
+            "wide glyph drew nothing in its two cells"
+        );
+        assert_eq!(
+            ink_in_columns(&img, padding + cell_w * 2, img.width()),
+            0,
+            "wide glyph spilled past its continuation cell"
+        );
+    }
+
+    /// A horizontal rule drawn from a fallback font must tile: the glyph is
+    /// scaled to the primary font's advance, so a run of `─` comes out as one
+    /// unbroken line instead of a dashed one.
+    #[test]
+    fn fallback_box_drawing_tiles_without_gaps() {
+        // A primary font whose cell is wider than the fallback's natural
+        // advance is exactly the MonoLisa + JetBrains Mono case.
+        let renderer = renderer_with(Some(LIMITED_PRIMARY), &[]);
+        let cols = 6;
+        let img = render_line(&renderer, &"\u{2500}".repeat(4), cols);
+        let bg = Theme::dark().background;
+        let padding = renderer.padding * RENDER_SCALE;
+        let run_end = padding + renderer.default_fonts.cell_width * RENDER_SCALE * 4;
+
+        // The row carrying the rule must have ink in every column of the run.
+        let row = (0..img.height())
+            .max_by_key(|y| {
+                (0..img.width())
+                    .filter(|x| *img.get_pixel(*x, *y) != bg)
+                    .count()
+            })
+            .expect("image has rows");
+        let gaps: Vec<u32> = (padding..run_end)
+            .filter(|x| *img.get_pixel(*x, row) == bg)
+            .collect();
+        assert!(
+            gaps.is_empty(),
+            "horizontal rule from the fallback font has gaps at columns {:?}",
+            gaps
+        );
+    }
+
+    /// Box drawing corners only ink part of their cell, so they must be placed
+    /// by advance (side bearings preserved) rather than by centering their ink:
+    /// `┌` keeps its stub on the right, where the rule it joins begins.
+    #[test]
+    fn fallback_box_corners_keep_their_side_bearings() {
+        let renderer = renderer_with(Some(LIMITED_PRIMARY), &[]);
+        let img = render_line(&renderer, "\u{250c}", 4);
+        let cell_w = renderer.default_fonts.cell_width * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        let mid = padding + cell_w / 2;
+
+        let left = ink_in_columns(&img, padding, mid);
+        let right = ink_in_columns(&img, mid, padding + cell_w);
+        assert!(
+            right > left,
+            "'┌' should ink mostly the right half of its cell (left {} vs right {})",
+            left,
+            right
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-theme font chains
+    // ---------------------------------------------------------------------
+
+    fn theme_config_with_fonts(font: Option<&str>, fallbacks: &[&str]) -> ThemeConfig {
+        ThemeConfig {
+            foreground: "#ffffff".to_string(),
+            background: "#000000".to_string(),
+            font: font.map(str::to_string),
+            font_bold: None,
+            fallback_fonts: fallbacks.iter().map(|f| f.to_string()).collect(),
+            palette: std::array::from_fn(|_| "#808080".to_string()),
+            base_dir: None,
+        }
+    }
+
+    /// Every theme gets the font chain it declares, and themes that resolve to
+    /// the same files share one parsed chain instead of reparsing the fonts.
+    #[test]
+    fn each_theme_gets_its_own_font_chain() {
+        let mut themes = HashMap::new();
+        themes.insert(
+            "ascii-only".to_string(),
+            theme_config_with_fonts(Some(LIMITED_PRIMARY), &[]),
+        );
+        themes.insert(
+            "cjk".to_string(),
+            theme_config_with_fonts(Some(LIMITED_PRIMARY), &[CJK_FALLBACK]),
+        );
+        themes.insert("embedded".to_string(), theme_config_with_fonts(None, &[]));
+        themes.insert(
+            "embedded-too".to_string(),
+            theme_config_with_fonts(None, &[]),
+        );
+
+        let renderer = Renderer::new(
+            &FontSelection::default(),
+            16.0,
+            &themes,
+            "embedded",
+            &ChromeConfig::default(),
+        )
+        .expect("renderer builds");
+
+        // Only the theme that configured the CJK fallback can draw the CJK
+        // character; the others keep the terminal's missing-glyph behavior.
+        let cjk_fonts = renderer.fonts_for(Some("cjk"));
+        assert!(
+            renderer
+                .font_for_char(cjk_fonts, '\u{4e2d}', false, 32.0)
+                .is_fallback
+        );
+        let ascii_fonts = renderer.fonts_for(Some("ascii-only"));
+        assert!(
+            !renderer
+                .font_for_char(ascii_fonts, '\u{4e2d}', false, 32.0)
+                .is_fallback
+        );
+
+        // The fixture primary font has a wider cell than the embedded font.
+        let embedded_fonts = renderer.fonts_for(Some("embedded"));
+        assert!(ascii_fonts.cell_width > embedded_fonts.cell_width);
+
+        // Themes resolving to identical files share one chain, so adding
+        // themes does not multiply font parsing.
+        assert!(std::ptr::eq(
+            renderer.fonts_for(Some("embedded-too")),
+            embedded_fonts
+        ));
+        // An unknown theme falls back to the default theme's chain.
+        assert!(std::ptr::eq(
+            renderer.fonts_for(Some("nope")),
+            embedded_fonts
+        ));
+        assert!(std::ptr::eq(renderer.fonts_for(None), embedded_fonts));
+    }
+
+    /// An explicit `--font` override wins over every theme's own font.
+    #[test]
+    fn font_override_applies_to_every_theme() {
+        let mut themes = HashMap::new();
+        themes.insert("embedded".to_string(), theme_config_with_fonts(None, &[]));
+        themes.insert(
+            "ascii-only".to_string(),
+            theme_config_with_fonts(Some(LIMITED_PRIMARY), &[]),
+        );
+
+        let renderer = Renderer::new(
+            &FontSelection {
+                font_override: Some(PathBuf::from(LIMITED_PRIMARY)),
+                ..FontSelection::default()
+            },
+            16.0,
+            &themes,
+            "embedded",
+            &ChromeConfig::default(),
+        )
+        .expect("renderer builds");
+
+        let overridden = renderer.fonts_for(Some("embedded"));
+        let declared = renderer.fonts_for(Some("ascii-only"));
+        assert_eq!(overridden.cell_width, declared.cell_width);
+        assert!(std::ptr::eq(overridden, declared));
+    }
+
+    // ---------------------------------------------------------------------
+    // Composed image descriptions
+    // ---------------------------------------------------------------------
+
+    /// A composed image's description is the panes' descriptions, in order,
+    /// with a clear separator and Unicode preserved.
+    #[test]
+    fn composed_description_joins_panes_and_keeps_unicode() {
+        let dir = std::path::Path::new("target/composed-description-test");
+        std::fs::create_dir_all(dir).unwrap();
+        let img: RgbaImage = ImageBuffer::from_pixel(4, 4, Rgba([0, 0, 0, 255]));
+
+        let first = dir.join("first.png");
+        let second = dir.join("second.png");
+        let bare = dir.join("bare.png");
+        save_png(&img, &first, Some("héllo ✓ \u{4e2d}\u{6587}")).unwrap();
+        save_png(&img, &second, Some("λ ─┐ second")).unwrap();
+        save_png(&img, &bare, None).unwrap();
+
+        assert_eq!(
+            read_png_description(&first).as_deref(),
+            Some("héllo ✓ \u{4e2d}\u{6587}")
+        );
+        assert_eq!(read_png_description(&bare), None);
+
+        let joined = composed_description(&[first.clone(), second.clone()])
+            .expect("panes have descriptions");
+        assert_eq!(
+            joined,
+            "héllo ✓ \u{4e2d}\u{6587}\n\n--- Pane 2 ---\n\nλ ─┐ second"
+        );
+
+        // A pane without a description is marked, so pane numbers still line
+        // up with the image.
+        let mixed =
+            composed_description(&[bare.clone(), second]).expect("one pane has a description");
+        assert!(mixed.starts_with("(no description)"));
+        assert!(mixed.contains("--- Pane 2 ---"));
+
+        // No descriptions at all: nothing is invented.
+        assert_eq!(composed_description(&[bare.clone(), bare]), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Chrome geometry: rounded frames and macOS traffic lights
+    // ---------------------------------------------------------------------
+
+    /// Every preset that draws a window frame.
+    const CHROME_PRESETS: [&str; 4] = ["minimal", "gnome", "macos", "report"];
+
+    fn preset_chrome(preset: &str, rounded: bool, shadow: bool) -> ChromeOptions {
+        ChromeOptions {
+            enabled: true,
+            preset: preset.to_string(),
+            title: Some("demo".to_string()),
+            timestamp: false,
+            shadow,
+            radius: 14,
+            rounded,
+            outer_padding: 18,
+            title_bar_height: 34,
+        }
+    }
+
+    /// Render a terminal image inside `preset`'s window frame.
+    fn framed(preset: &str, rounded: bool, shadow: bool) -> RgbaImage {
+        let renderer = bare_renderer();
+        let theme = Theme::dark();
+        // Wide enough that the centered title cannot overlap the traffic
+        // lights on the left, so masks stay comparable.
+        let terminal = ImageBuffer::from_pixel(400, 80, theme.background);
+        renderer.compose_with_chrome(
+            terminal,
+            &theme,
+            &renderer.default_fonts,
+            &preset_chrome(preset, rounded, shadow),
+        )
+    }
+
+    /// Signed distance from a pixel center to a rounded rectangle: negative
+    /// inside, positive outside.
+    fn rounded_rect_distance(x: u32, y: u32, w: u32, h: u32, r: f32) -> f32 {
+        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+        let (hw, hh) = (w as f32 / 2.0, h as f32 / 2.0);
+        let qx = (px - hw).abs() - (hw - r);
+        let qy = (py - hh).abs() - (hh - r);
+        (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r
+    }
+
+    /// Rounded corners are a property of the frame, not of one preset: every
+    /// chrome preset must leave its four outer corner pixels fully transparent.
+    #[test]
+    fn every_chrome_preset_has_transparent_outer_corners() {
+        for preset in CHROME_PRESETS {
+            let img = framed(preset, true, false);
+            let (w, h) = img.dimensions();
+            for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+                assert_eq!(
+                    img.get_pixel(x, y)[3],
+                    0,
+                    "{preset}: corner ({x}, {y}) is not transparent"
+                );
+            }
+            // The corner is anti-aliased, not a hard staircase: the frame edge
+            // produces partially transparent pixels.
+            let partial = img.pixels().filter(|p| p[3] > 0 && p[3] < 255).count();
+            assert!(
+                partial > 0,
+                "{preset}: rounded corners have no anti-aliased pixels"
+            );
+        }
+    }
+
+    /// Nothing opaque may exist outside the rounded frame - no gray, black, or
+    /// theme-colored halo around the window - for any preset.
+    #[test]
+    fn no_opaque_pixels_outside_the_rounded_frame() {
+        let radius = (14 * RENDER_SCALE) as f32;
+        for preset in CHROME_PRESETS {
+            let img = framed(preset, true, false);
+            let (w, h) = img.dimensions();
+            for y in 0..h {
+                for x in 0..w {
+                    let alpha = img.get_pixel(x, y)[3];
+                    // Half a pixel of slack for the anti-aliased edge itself.
+                    if rounded_rect_distance(x, y, w, h, radius) > 0.75 {
+                        assert_eq!(
+                            alpha, 0,
+                            "{preset}: pixel ({x}, {y}) outside the frame is not transparent"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// With a shadow the area outside the frame may hold shadow pixels, but
+    /// they must stay semi-transparent - never an opaque backdrop.
+    #[test]
+    fn shadow_outside_the_frame_is_never_opaque() {
+        let radius = (14 * RENDER_SCALE) as f32;
+        for preset in CHROME_PRESETS {
+            let img = framed(preset, true, true);
+            let (w, h) = img.dimensions();
+            // `compose_with_chrome` reserves `16 * RENDER_SCALE` pixels for the
+            // shadow and centers the frame in them.
+            let offset = 16 * RENDER_SCALE / 2;
+            let (frame_w, frame_h) = (w - offset * 2, h - offset * 2);
+            let mut shadow_pixels = 0usize;
+            for y in 0..h {
+                for x in 0..w {
+                    let alpha = img.get_pixel(x, y)[3];
+                    if alpha == 0 {
+                        continue;
+                    }
+                    let (fx, fy) = (x as i64 - offset as i64, y as i64 - offset as i64);
+                    let outside = fx < 0
+                        || fy < 0
+                        || fx >= frame_w as i64
+                        || fy >= frame_h as i64
+                        || rounded_rect_distance(fx as u32, fy as u32, frame_w, frame_h, radius)
+                            > 0.75;
+                    if outside {
+                        shadow_pixels += 1;
+                        assert!(
+                            alpha < 255,
+                            "{preset}: opaque pixel ({x}, {y}) outside the frame"
+                        );
+                    }
+                }
+            }
+            assert!(shadow_pixels > 0, "{preset}: shadow was not drawn");
+        }
+    }
+
+    /// The window body is the terminal's own background for every preset, so a
+    /// screenshot is never surrounded by a mismatched gray border.
+    #[test]
+    fn frame_padding_matches_the_terminal_background() {
+        let background = Theme::dark().background;
+        for preset in CHROME_PRESETS {
+            let img = framed(preset, true, false);
+            let (w, h) = img.dimensions();
+            // Left padding (below any title bar) and bottom padding, both well
+            // inside the rounded corners.
+            for (x, y) in [(4, h / 2), (w / 2, h - 4)] {
+                assert_eq!(
+                    *img.get_pixel(x, y),
+                    background,
+                    "{preset}: padding at ({x}, {y}) is not the terminal background"
+                );
+            }
+        }
+    }
+
+    /// `--no-rounded` must still produce a square, fully opaque frame: the
+    /// corner mask is applied only when rounding is on.
+    #[test]
+    fn square_chrome_keeps_opaque_corners() {
+        for preset in CHROME_PRESETS {
+            let img = framed(preset, false, false);
+            let (w, h) = img.dimensions();
+            for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+                assert_eq!(
+                    img.get_pixel(x, y)[3],
+                    255,
+                    "{preset}: square corner ({x}, {y}) lost its opacity"
+                );
+            }
+        }
+    }
+
+    /// Shape statistics of the pixels exactly matching one color.
+    #[derive(Debug, PartialEq, Eq)]
+    struct MaskStats {
+        width: u32,
+        height: u32,
+        count: usize,
+        left: usize,
+        right: usize,
+        top: usize,
+        bottom: usize,
+        origin: (u32, u32),
+    }
+
+    /// Bounding box, pixel count, and left/right + top/bottom symmetry of the
+    /// pixels exactly matching `color`.
+    fn mask_stats(img: &RgbaImage, color: Rgba<u8>) -> MaskStats {
+        let points: Vec<(u32, u32)> = img
+            .enumerate_pixels()
+            .filter(|(_, _, p)| **p == color)
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        assert!(!points.is_empty(), "no pixels of {:?} were drawn", color);
+        let (x0, x1) = (
+            points.iter().map(|p| p.0).min().unwrap(),
+            points.iter().map(|p| p.0).max().unwrap(),
+        );
+        let (y0, y1) = (
+            points.iter().map(|p| p.1).min().unwrap(),
+            points.iter().map(|p| p.1).max().unwrap(),
+        );
+        let cx = (x0 + x1) as f32 / 2.0;
+        let cy = (y0 + y1) as f32 / 2.0;
+        MaskStats {
+            width: x1 - x0 + 1,
+            height: y1 - y0 + 1,
+            count: points.len(),
+            left: points.iter().filter(|p| (p.0 as f32) < cx).count(),
+            right: points.iter().filter(|p| (p.0 as f32) > cx).count(),
+            top: points.iter().filter(|p| (p.1 as f32) < cy).count(),
+            bottom: points.iter().filter(|p| (p.1 as f32) > cy).count(),
+            origin: (x0, y0),
+        }
+    }
+
+    /// The macOS traffic lights must be three identical circles: equal
+    /// diameters, square (and therefore circular) masks, mirror symmetry about
+    /// both axes, and evenly spaced centers.
+    #[test]
+    fn macos_traffic_lights_are_equal_symmetric_circles() {
+        let img = framed("macos", true, false);
+        let colors = [
+            Rgba([255, 95, 86, 255]),
+            Rgba([255, 189, 46, 255]),
+            Rgba([39, 201, 63, 255]),
+        ];
+
+        let stats: Vec<MaskStats> = colors.iter().map(|c| mask_stats(&img, *c)).collect();
+        for (stat, color) in stats.iter().zip(colors) {
+            assert_eq!(
+                stat.width, stat.height,
+                "{color:?} button is not square (so not round)"
+            );
+            assert_eq!(
+                stat.left, stat.right,
+                "{color:?} button is not left/right symmetric"
+            );
+            assert_eq!(
+                stat.top, stat.bottom,
+                "{color:?} button is not top/bottom symmetric"
+            );
+        }
+
+        // All three buttons are the same disc.
+        for other in &stats[1..] {
+            assert_eq!(
+                (other.width, other.height, other.count),
+                (stats[0].width, stats[0].height, stats[0].count),
+                "traffic lights differ in size"
+            );
+        }
+
+        // Evenly spaced, on one horizontal line.
+        let pitch = (TRAFFIC_LIGHT_PITCH * RENDER_SCALE) as i64;
+        for (index, stat) in stats.iter().enumerate() {
+            assert_eq!(
+                stat.origin.1, stats[0].origin.1,
+                "traffic lights are not on the same line"
+            );
+            assert_eq!(
+                stat.origin.0 as i64 - stats[0].origin.0 as i64,
+                pitch * index as i64,
+                "traffic light {index} is misplaced"
+            );
+        }
+
+        // A rounded square would fill its bounding box; a disc leaves the
+        // corners of the box empty.
+        let (x0, y0) = stats[0].origin;
+        let side = stats[0].width - 1;
+        for (dx, dy) in [(0, 0), (side, 0), (0, side), (side, side)] {
+            assert_ne!(
+                *img.get_pixel(x0 + dx, y0 + dy),
+                colors[0],
+                "the button fills its bounding box corner, so it is not a circle"
+            );
+        }
+    }
+
+    /// The circle helper itself: a true disc, symmetric about its center, with
+    /// a one-pixel anti-aliased edge.
+    #[test]
+    fn draw_circle_is_a_symmetric_antialiased_disc() {
+        let renderer = bare_renderer();
+        let mut img: RgbaImage = ImageBuffer::from_pixel(41, 41, Rgba([0, 0, 0, 0]));
+        // An even diameter centered on a pixel boundary is exactly symmetric.
+        let (cx, cy, r) = (20.0f32, 20.0f32, 10.0f32);
+        renderer.draw_circle(&mut img, cx, cy, r, Rgba([255, 0, 0, 255]));
+
+        let opaque: Vec<(u32, u32)> = img
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p[3] == 255)
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        let xs: Vec<u32> = opaque.iter().map(|p| p.0).collect();
+        let ys: Vec<u32> = opaque.iter().map(|p| p.1).collect();
+        let (x0, x1) = (*xs.iter().min().unwrap(), *xs.iter().max().unwrap());
+        let (y0, y1) = (*ys.iter().min().unwrap(), *ys.iter().max().unwrap());
+        assert_eq!(x1 - x0, y1 - y0, "the disc is not as wide as it is tall");
+
+        // Mirror symmetry about both axes, pixel for pixel.
+        for (x, y) in &opaque {
+            let mirrored_x = (2.0 * cx - 1.0) as u32 - x;
+            let mirrored_y = (2.0 * cy - 1.0) as u32 - y;
+            assert_eq!(
+                img.get_pixel(mirrored_x, *y)[3],
+                255,
+                "no horizontal mirror for ({x}, {y})"
+            );
+            assert_eq!(
+                img.get_pixel(*x, mirrored_y)[3],
+                255,
+                "no vertical mirror for ({x}, {y})"
+            );
+        }
+
+        // Round, not square: the bounding-box corners stay empty, and a point
+        // just outside the radius is never lit.
+        assert_eq!(img.get_pixel(x0, y0)[3], 0);
+        assert_eq!(img.get_pixel(x1, y1)[3], 0);
+        for (x, y) in [(cx + r + 1.0, cy), (cx, cy + r + 1.0)] {
+            assert_eq!(
+                img.get_pixel(x as u32, y as u32)[3],
+                0,
+                "ink outside the circle radius"
+            );
+        }
+
+        // The edge is anti-aliased rather than a hard staircase.
+        let partial = img.pixels().filter(|p| p[3] > 0 && p[3] < 255).count();
+        assert!(partial > 0, "circle edge is not anti-aliased");
     }
 }

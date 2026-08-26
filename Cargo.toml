@@ -27,7 +27,7 @@ pty-process = { version = "0.5", features = ["async"] }
 # Image rendering
 fontdue = "0.9"
 image = "0.25"
-# Direct PNG encoding so screenshots can carry a `Description` tEXt chunk
+# Direct PNG encoding so screenshots can carry a UTF-8 `Description` iTXt chunk
 # (the `image` crate's PNG encoder exposes no metadata API).
 png = "0.18"
 
@@ -49,6 +49,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 
+[dev-dependencies]
+# Used by the MCP integration tests to decode tool parameters exactly the way
+# the server does, so unknown-field rejection is tested against real JSON.
+serde_json = "1"
+
 [package.metadata.deb]
 maintainer = "Adam Hassan <adam@hackback.zip>"
 copyright = "2025-2026 Adam Hassan"
@@ -60,6 +65,11 @@ assets = [
     ["target/release/termshot", "usr/bin/", "755"],
     ["doc/termshot.1", "usr/share/man/man1/termshot.1", "644"],
     ["termshot.example.toml", "usr/share/doc/termshot/config.toml.example", "644"],
+    ["LICENSE", "usr/share/doc/termshot/LICENSE", "644"],
+    ["README.md", "usr/share/doc/termshot/README.md", "644"],
+    ["docs/*.md", "usr/share/doc/termshot/docs/", "644"],
+    # The README and docs reference these screenshots, so they must ship too.
+    ["docs/assets/*.png", "usr/share/doc/termshot/docs/assets/", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -67,4 +77,8 @@ assets = [
     { source = "target/release/termshot", dest = "/usr/bin/termshot", mode = "755" },
     { source = "doc/termshot.1", dest = "/usr/share/man/man1/termshot.1", mode = "644", doc = true },
     { source = "termshot.example.toml", dest = "/usr/share/doc/termshot/config.toml.example", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/termshot/LICENSE", mode = "644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/termshot/README.md", mode = "644", doc = true },
+    { source = "docs/*.md", dest = "/usr/share/doc/termshot/docs/", mode = "644", doc = true },
+    { source = "docs/assets/*.png", dest = "/usr/share/doc/termshot/docs/assets/", mode = "644", doc = true },
 ]

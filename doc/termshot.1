@@ -147,7 +147,6 @@ instead.
 .BI \-\-theme " NAME"
 Theme name (e.g.
 .BR dark ,
-.BR adamkadaban ,
 .BR catppuccin\-mocha ,
 .BR dracula ,
 .BR nord ,
@@ -178,8 +177,10 @@ Force redaction off even when auto\-redaction is enabled in the config.
 .B \-\-no\-description
 Do not embed the terminal text in the PNG
 .B Description
-metadata. By default the text (redacted, when redaction ran) is embedded so
-screen readers can read the screenshot.
+metadata. By default the text (redacted, when redaction ran) is embedded as a
+UTF\-8
+.B iTXt
+chunk so screen readers can read the screenshot.
 .TP
 .B \-\-redact\-text
 Also redact the returned plain text. By default only the PNG is redacted and
@@ -270,6 +271,15 @@ Compose two or more screenshots side by side or stacked into one image.
 .I image1 image2 ...
 .PP
 At least two input PNGs are required; they are placed in the order given.
+When
+.B embed_description
+is enabled, the panes'
+.B Description
+metadata is read back and joined (separated by
+.RB ` "--- Pane N ---" `
+markers) into the composed image's own
+.B Description
+chunk.
 .TP
 .BI \-\-layout " LAYOUT"
 .B horizontal
@@ -498,10 +508,24 @@ User themes are loaded from
 \(em each
 .I .toml
 file there defines one theme (foreground, background, and a 16\-color palette),
-and may reference its own regular/bold fonts. User themes with the same name as
-a built\-in override it. Run
+and may reference its own regular/bold fonts plus a
+.B fallback_fonts
+list of extra faces used for characters those fonts lack. Paths in all three
+keys accept
+.RB \(dq ~ \(dq
+and resolve relative entries against the theme file's directory; the bundled
+JetBrains Mono is always tried before
+.B fallback_fonts
+and never needs listing. User themes with the same name as a built\-in override
+it. Run
 .B termshot themes
 to list them all.
+.PP
+No theme files are installed for you: the
+.I themes/
+directory is created empty, and the shipped default theme is the built\-in
+.BR dark ,
+which uses the bundled JetBrains Mono.
 .SH CONFIGURATION
 On first run termshot bootstraps
 .I ~/.config/termshot/
@@ -575,22 +599,32 @@ so the image shows
 while the rest is masked. The PNG is re\-rendered in place from the server's
 in\-memory record; no sidecar files are involved.
 .SH LIMITATIONS
-Glyphs are rasterized from a single font (the bundled JetBrains Mono unless
+Glyphs are rasterized from the configured font (the bundled JetBrains Mono
+unless
 .BR \-\-font ,
 a theme, or
 .B font_path
-says otherwise); there is no fallback chain. Codepoints that font does not
-cover - CJK, emoji, and some box\-drawing or Powerline glyphs emitted by tools
+says otherwise), then from the bundled JetBrains Mono, then from the faces
+listed in the theme's
+.B fallback_fonts
+\(em in that order. Box drawing, arrows, and common symbols emitted by tools
 such as
 .BR bat (1)
 or
 .BR btop (1)
-- are drawn as
+therefore render even under a font that lacks them. Scripts no font in the
+chain covers - CJK and most Powerline or Nerd Font glyphs - are still drawn
+as
 .I .notdef
-boxes. Point
-.B \-\-font
-at a face with wider coverage (a Nerd Font, for example) when capturing such
-output.
+boxes; add a covering face to
+.B fallback_fonts
+(see
+.BR THEMES )
+when capturing such output.
+.PP
+Fallback faces must contain outline glyphs. Color-bitmap emoji fonts such as
+Noto Color Emoji and Apple Color Emoji are not supported; monochrome outline
+emoji fonts may work.
 .PP
 termshot uses PTYs and POSIX signals: Linux and macOS are supported, Windows is
 not.

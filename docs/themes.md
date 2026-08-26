@@ -13,10 +13,9 @@ catppuccin-macchiato, solarized-dark, solarized-light, dracula, nord,
 gruvbox-dark, tokyo-night
 ```
 
-The bootstrapped `config.toml` selects `dark`, which uses the bundled JetBrains
-Mono. termshot also writes an `adamkadaban` *example* user theme; it points at
-MonoLisa (a commercial font), so edit or remove its `font` keys before selecting
-it.
+They all use the bundled JetBrains Mono, so they work with no fonts installed.
+The shipped default is `dark`. No theme files are installed for you: the
+`themes/` directory is created empty on first run and is yours to fill.
 
 Select a theme per run with `--theme <name>` (CLI) or the `theme` parameter
 (MCP), or set `default_theme` in the config file. List everything available,
@@ -28,9 +27,12 @@ termshot themes
 
 ## User themes
 
-User themes live in `~/.config/termshot/themes/`, one `.toml` per theme. A theme
-with the same name as a built-in overrides it. You can also define themes inline
-in `config.toml` under `[themes.<name>]` (same fields as a theme file).
+Create any number of your own themes in `~/.config/termshot/themes/`, one
+`.toml` per theme - the file name (without the extension) is the theme name, and
+each may point at its own fonts. They are picked up automatically and listed by
+`termshot themes` as `user`. A theme with the same name as a built-in overrides
+it. You can also define themes inline in `config.toml` under `[themes.<name>]`
+(same fields as a theme file).
 
 ## Theme format
 
@@ -55,6 +57,8 @@ palette = [
 # Optional per-theme fonts:
 # font = "/path/to/Regular.ttf"
 # font_bold = "/path/to/Bold.ttf"
+# Extra faces searched for glyphs the fonts above lack:
+# fallback_fonts = ["/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"]
 ```
 
 ## Fonts
@@ -68,18 +72,53 @@ are needed. To use a different font, in order of precedence:
 - Globally: `font_path` in `config.toml`, or the `TERMSHOT_FONT_PATH`
   environment variable.
 
+A theme's fonts follow the theme wherever it is selected: the CLI's `--theme`
+and the MCP tools' `theme` parameter both render with that theme's `font`,
+`font_bold`, and `fallback_fonts`. The renderer builds one font chain per theme
+up front, so switching themes between screenshots costs nothing.
+
 When no bold font is supplied, bold text is rendered as faux bold (the regular
 glyph drawn twice with a one-pixel offset) and standard palette colors use their
 bright variants, matching how most terminal emulators show bold.
 
-### Glyph coverage
+### Glyph coverage and font fallback
 
-There is no font fallback chain: every glyph comes from the one configured font.
-Codepoints it does not cover - CJK, emoji, and some box-drawing or Powerline
-glyphs used by tools like `bat`, `btop`, and `eza` - render as `.notdef` boxes.
-If you capture such output, point `font` / `font_bold` (per theme) or
-`font_path` (globally) at a face with wider coverage, such as a Nerd Font
-build of your favorite monospace family.
+Every character is drawn by the first font that actually has a glyph for it:
+
+1. the theme's `font` (or `font_bold` for a bold cell),
+2. the **bundled JetBrains Mono**, always tried next and never configured by
+   hand,
+3. each file listed in the theme's `fallback_fonts`, in order.
+
+A character mapped to `.notdef` does not count as coverage, so a font that would
+draw a tofu box never wins the lookup. If no font in the chain has the glyph,
+the character keeps the primary font's normal missing-glyph rendering.
+
+Step 2 is what makes a font that ships no box drawing glyphs usable for
+capturing `bat`, `btop`, or `eza`: the frames come from JetBrains Mono while the
+text stays in your font. Fallback glyphs are scaled to the primary
+font's advance and drawn on the primary baseline, so the monospace grid is
+untouched and box drawing runs still tile without gaps. Double-width characters
+keep their continuation cell.
+
+For scripts neither font covers - CJK and Powerline/Nerd Font glyphs - list
+a covering face in the theme:
+
+```toml
+font = "~/.local/share/fonts/MyMono-Regular.otf"
+font_bold = "~/.local/share/fonts/MyMono-Bold.otf"
+fallback_fonts = [
+  "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+]
+```
+
+`fallback_fonts` entries are resolved exactly like `font` and `font_bold`: `~`
+expands to your home directory and relative paths resolve against the theme
+file's directory. An entry that is missing, or is not a font at all, is skipped
+with a warning. Fallback fonts must contain outline glyphs that `fontdue` can
+rasterize. Color-bitmap emoji fonts such as Noto Color Emoji and Apple Color
+Emoji are not supported; monochrome outline emoji fonts may work. Rendering
+continues with the rest of the chain when a configured fallback is skipped.
 
 Adjust the text size with the top-level `font_size` config key (default `16.0`)
 or `TERMSHOT_FONT_SIZE`.

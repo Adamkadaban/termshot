@@ -22,8 +22,8 @@ pub struct ConfigFile {
     pub timeout_secs: u64,
     /// Shell to use for command execution.
     pub shell: Option<String>,
-    /// Embed the terminal text in each PNG's `Description` metadata so
-    /// screenshots are readable by screen readers.
+    /// Embed the terminal text in each PNG's UTF-8 `Description` metadata
+    /// (PNG `iTXt`) so screenshots are readable by screen readers.
     pub embed_description: bool,
     /// Name of the default theme to use.
     pub default_theme: String,
@@ -100,12 +100,50 @@ pub struct ThemeConfig {
     /// Path to bold font file (if not set, faux bold is used).
     #[serde(default)]
     pub font_bold: Option<String>,
+    /// Extra font files searched, in order, for characters the primary font
+    /// does not have. The embedded JetBrains Mono is always tried before these,
+    /// so it never needs to be listed here.
+    #[serde(default)]
+    pub fallback_fonts: Vec<String>,
     /// 16-color ANSI palette as ["#RRGGBB", ...].
     pub palette: [String; 16],
     /// Directory the theme was loaded from, used to resolve relative font
     /// paths. Not part of the serialized TOML.
     #[serde(skip)]
     pub base_dir: Option<PathBuf>,
+}
+
+impl ThemeConfig {
+    /// Resolve this theme's regular and bold font paths, expanding `~` and
+    /// resolving relative paths against the theme's own directory. Missing
+    /// files are dropped (with a warning) so rendering falls back to the
+    /// globally configured or embedded font.
+    ///
+    /// The renderer builds one font chain per theme from these paths, so a
+    /// theme's fonts apply wherever that theme is rendered - CLI or MCP.
+    pub fn resolved_font_paths(&self) -> (Option<PathBuf>, Option<PathBuf>) {
+        let base = self.base_dir.as_deref();
+        let regular = self.font.as_ref().and_then(|p| resolve_font_path(p, base));
+        let bold = self
+            .font_bold
+            .as_ref()
+            .and_then(|p| resolve_font_path(p, base));
+        (regular, bold)
+    }
+
+    /// Resolve this theme's extra fallback font paths, in the order they were
+    /// listed. Paths are expanded exactly like the primary fonts; entries that
+    /// do not exist are dropped with a warning.
+    ///
+    /// The embedded JetBrains Mono is *not* part of this list: the renderer
+    /// always tries it before these fonts, so users never have to declare it.
+    pub fn resolved_fallback_font_paths(&self) -> Vec<PathBuf> {
+        let base = self.base_dir.as_deref();
+        self.fallback_fonts
+            .iter()
+            .filter_map(|p| resolve_fallback_font_path(p, base))
+            .collect()
+    }
 }
 
 /// Resolved runtime configuration.
@@ -277,17 +315,23 @@ impl Config {
     /// files are dropped (with a warning) so rendering falls back to the
     /// embedded font.
     pub fn theme_font_paths(&self, theme_name: &str) -> (Option<PathBuf>, Option<PathBuf>) {
-        let theme = match self.themes.get(theme_name) {
-            Some(t) => t,
-            None => return (None, None),
-        };
-        let base = theme.base_dir.as_deref();
-        let regular = theme.font.as_ref().and_then(|p| resolve_font_path(p, base));
-        let bold = theme
-            .font_bold
-            .as_ref()
-            .and_then(|p| resolve_font_path(p, base));
-        (regular, bold)
+        match self.themes.get(theme_name) {
+            Some(theme) => theme.resolved_font_paths(),
+            None => (None, None),
+        }
+    }
+
+    /// Resolve the extra fallback font paths declared by a theme, in the order
+    /// they were listed. Paths are expanded exactly like the primary fonts;
+    /// entries that do not exist are dropped with a warning.
+    ///
+    /// The embedded JetBrains Mono is *not* part of this list: the renderer
+    /// always tries it before these fonts, so users never have to declare it.
+    pub fn theme_fallback_font_paths(&self, theme_name: &str) -> Vec<PathBuf> {
+        match self.themes.get(theme_name) {
+            Some(theme) => theme.resolved_fallback_font_paths(),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -367,6 +411,7 @@ fn builtin_themes() -> HashMap<String, ThemeConfig> {
             ThemeConfig {
                 font: None,
                 font_bold: None,
+                fallback_fonts: Vec::new(),
                 base_dir: None,
                 foreground: "#cccccc".into(),
                 background: "#1e1e1e".into(),
@@ -383,6 +428,7 @@ fn builtin_themes() -> HashMap<String, ThemeConfig> {
             ThemeConfig {
                 font: None,
                 font_bold: None,
+                fallback_fonts: Vec::new(),
                 base_dir: None,
                 foreground: "#cdd6f4".into(),
                 background: "#1e1e2e".into(),
@@ -399,6 +445,7 @@ fn builtin_themes() -> HashMap<String, ThemeConfig> {
             ThemeConfig {
                 font: None,
                 font_bold: None,
+                fallback_fonts: Vec::new(),
                 base_dir: None,
                 foreground: "#4c4f69".into(),
                 background: "#eff1f5".into(),
@@ -415,6 +462,7 @@ fn builtin_themes() -> HashMap<String, ThemeConfig> {
             ThemeConfig {
                 font: None,
                 font_bold: None,
+                fallback_fonts: Vec::new(),
                 base_dir: None,
                 foreground: "#c6d0f5".into(),
                 background: "#303446".into(),
@@ -431,6 +479,7 @@ fn builtin_themes() -> HashMap<String, ThemeConfig> {
             ThemeConfig {
                 font: None,
                 font_bold: None,
+                fallback_fonts: Vec::new(),
                 base_dir: None,
                 foreground: "#cad3f5".into(),
                 background: "#24273a".into(),
@@ -447,6 +496,7 @@ fn builtin_themes() -> HashMap<String, ThemeConfig> {
             ThemeConfig {
                 font: None,
                 font_bold: None,
+                fallback_fonts: Vec::new(),
                 base_dir: None,
                 foreground: "#839496".into(),
                 background: "#002b36".into(),
@@ -463,6 +513,7 @@ fn builtin_themes() -> HashMap<String, ThemeConfig> {
             ThemeConfig {
                 font: None,
                 font_bold: None,
+                fallback_fonts: Vec::new(),
                 base_dir: None,
                 foreground: "#657b83".into(),
                 background: "#fdf6e3".into(),
@@ -479,6 +530,7 @@ fn builtin_themes() -> HashMap<String, ThemeConfig> {
             ThemeConfig {
                 font: None,
                 font_bold: None,
+                fallback_fonts: Vec::new(),
                 base_dir: None,
                 foreground: "#f8f8f2".into(),
                 background: "#282a36".into(),
@@ -495,6 +547,7 @@ fn builtin_themes() -> HashMap<String, ThemeConfig> {
             ThemeConfig {
                 font: None,
                 font_bold: None,
+                fallback_fonts: Vec::new(),
                 base_dir: None,
                 foreground: "#d8dee9".into(),
                 background: "#2e3440".into(),
@@ -511,6 +564,7 @@ fn builtin_themes() -> HashMap<String, ThemeConfig> {
             ThemeConfig {
                 font: None,
                 font_bold: None,
+                fallback_fonts: Vec::new(),
                 base_dir: None,
                 foreground: "#ebdbb2".into(),
                 background: "#282828".into(),
@@ -527,6 +581,7 @@ fn builtin_themes() -> HashMap<String, ThemeConfig> {
             ThemeConfig {
                 font: None,
                 font_bold: None,
+                fallback_fonts: Vec::new(),
                 base_dir: None,
                 foreground: "#a9b1d6".into(),
                 background: "#1a1b26".into(),
@@ -558,25 +613,48 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Resolve a font path from a theme: expand `~`, resolve relative paths against
-/// the theme's directory, and verify the file exists. Returns None (with a
-/// warning) when the font is missing so the caller falls back to the embedded
-/// font.
-fn resolve_font_path(path: &str, base_dir: Option<&Path>) -> Option<PathBuf> {
+/// Expand `~` and resolve a relative font path against the directory the theme
+/// was loaded from. Shared by the primary, bold, and fallback font paths so
+/// every font a theme declares is resolved identically.
+fn resolve_font_path_raw(path: &str, base_dir: Option<&Path>) -> PathBuf {
     let expanded = expand_tilde(path);
-    let resolved = if expanded.is_absolute() {
+    if expanded.is_absolute() {
         expanded
     } else if let Some(base) = base_dir {
         base.join(expanded)
     } else {
         expanded
-    };
+    }
+}
 
+/// Resolve a font path from a theme: expand `~`, resolve relative paths against
+/// the theme's directory, and verify the file exists. Returns None (with a
+/// warning) when the font is missing so the caller falls back to the embedded
+/// font.
+fn resolve_font_path(path: &str, base_dir: Option<&Path>) -> Option<PathBuf> {
+    let resolved = resolve_font_path_raw(path, base_dir);
     if resolved.exists() {
         Some(resolved)
     } else {
         tracing::warn!(
             "Font '{}' not found (resolved to {:?}), falling back to embedded font",
+            path,
+            resolved
+        );
+        None
+    }
+}
+
+/// Resolve a configured fallback font path. Missing files are skipped with a
+/// warning: a broken entry in `fallback_fonts` must never stop the renderer
+/// from starting, it only shrinks the fallback chain.
+fn resolve_fallback_font_path(path: &str, base_dir: Option<&Path>) -> Option<PathBuf> {
+    let resolved = resolve_font_path_raw(path, base_dir);
+    if resolved.exists() {
+        Some(resolved)
+    } else {
+        tracing::warn!(
+            "Fallback font '{}' not found (resolved to {:?}), ignoring it",
             path,
             resolved
         );
@@ -622,14 +700,13 @@ fn load_user_themes(themes_dir: &Path) -> Result<Vec<(String, ThemeConfig)>> {
 }
 
 /// Write default config files on first run: the config directory, the themes
-/// and rules directories, a starter `config.toml`, and the `adamkadaban`
-/// example user theme (not selected by default - it needs a commercial font).
-/// Existing files are never overwritten.
+/// and rules directories, and a starter `config.toml`. No themes are written -
+/// the built-in themes cover the defaults, and `themes/` is left empty for the
+/// user's own theme files. Existing files are never overwritten.
 fn bootstrap_defaults(config_dir: &Path) -> Result<()> {
-    let themes_dir = config_dir.join("themes");
-    std::fs::create_dir_all(&themes_dir)?;
-    // Created empty: any .toml / .yaml rule file dropped in here is picked up
-    // automatically, the same way themes/ works.
+    // Created empty: any .toml theme file dropped in here is picked up
+    // automatically, the same way rules/ works.
+    std::fs::create_dir_all(config_dir.join("themes"))?;
     std::fs::create_dir_all(user_rules_dir(config_dir))?;
 
     let config_path = config_dir.join("config.toml");
@@ -638,27 +715,22 @@ fn bootstrap_defaults(config_dir: &Path) -> Result<()> {
         tracing::info!("Wrote default config to {:?}", config_path);
     }
 
-    let adamkadaban_path = themes_dir.join("adamkadaban.toml");
-    if !adamkadaban_path.exists() {
-        std::fs::write(&adamkadaban_path, DEFAULT_ADAMKADABAN_THEME)?;
-        tracing::info!("Wrote default theme to {:?}", adamkadaban_path);
-    }
-
     Ok(())
 }
 
 const DEFAULT_CONFIG_TOML: &str = r##"# termshot configuration
-# Built-in themes use the bundled JetBrains Mono font, so this works with no
-# extra downloads. An example user theme is written to themes/adamkadaban.toml;
-# it needs MonoLisa installed, so switch to it only if you have that font.
+# The built-in themes use the bundled JetBrains Mono font, so this works with no
+# extra downloads. Drop your own theme files in themes/ to add more - see
+# docs/themes.md for the format and per-theme font options.
 default_theme = "dark"
 font_size = 16.0
 cols = 120
 rows = 40
 timeout_secs = 30
 
-# Embed the terminal text (redacted, when redaction ran) in each PNG's
-# `Description` metadata, so screenshots are readable by screen readers.
+# Embed the terminal text (redacted, when redaction ran) in each PNG's UTF-8
+# `Description` metadata (a PNG `iTXt` chunk, so box drawing and non-Latin
+# scripts survive), so screenshots are readable by screen readers.
 embed_description = true
 
 [chrome]
@@ -724,28 +796,6 @@ auto = false
 # output_dir = "/tmp/termshot"
 # font_path = "/path/to/your/monospace.ttf"
 # shell = "/bin/bash"
-"##;
-
-const DEFAULT_ADAMKADABAN_THEME: &str = r##"# adamkadaban theme (example user theme)
-# Colors from a GNOME Terminal profile. The font paths below point at MonoLisa,
-# a commercial font: change them to a font you have (or delete both lines to use
-# the bundled JetBrains Mono) before selecting this theme.
-foreground = "#ffffff"
-background = "#171421"
-font = "~/.local/share/fonts/MonoLisa-Regular.otf"
-font_bold = "~/.local/share/fonts/MonoLisa-Bold.otf"
-
-# ANSI 16-color palette
-# [0]  black    [1]  red      [2]  green    [3]  yellow
-# [4]  blue     [5]  magenta  [6]  cyan     [7]  white
-# [8]  bright black  [9]  bright red    [10] bright green  [11] bright yellow
-# [12] bright blue   [13] bright magenta [14] bright cyan   [15] bright white
-palette = [
-  "#171421", "#d41919", "#5ebdab", "#fea44c",
-  "#367bf0", "#9755b3", "#49aee6", "#d0cfcc",
-  "#aa27ac", "#d41919", "#47d4b9", "#ff8a18",
-  "#277fff", "#962ac3", "#05a1f7", "#ffffff"
-]
 "##;
 
 #[cfg(test)]
@@ -820,5 +870,117 @@ mod tests {
         assert!(user_rules_dir(dir).is_dir(), "rules/ was not created");
         assert!(dir.join("themes").is_dir(), "themes/ was not created");
         assert!(dir.join("config.toml").is_file());
+    }
+
+    /// A theme may list extra fallback fonts; the field is optional, so themes
+    /// written before it existed still parse.
+    #[test]
+    fn theme_fallback_fonts_are_optional_and_parsed() {
+        let palette = r##"palette = ["#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000","#000000"]"##;
+
+        let without: ThemeConfig = toml::from_str(&format!(
+            "foreground = \"#ffffff\"\nbackground = \"#000000\"\n{}\n",
+            palette
+        ))
+        .expect("theme without fallback_fonts parses");
+        assert!(without.fallback_fonts.is_empty());
+
+        let with: ThemeConfig = toml::from_str(&format!(
+            "foreground = \"#ffffff\"\nbackground = \"#000000\"\nfont = \"~/.local/share/fonts/MyMono-Regular.otf\"\nfallback_fonts = [\"/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc\", \"extra.ttf\"]\n{}\n",
+            palette
+        ))
+        .expect("theme with fallback_fonts parses");
+        assert_eq!(
+            with.fallback_fonts,
+            vec![
+                "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc".to_string(),
+                "extra.ttf".to_string()
+            ]
+        );
+    }
+
+    /// Fallback font paths go through the same resolution as the primary
+    /// fonts: `~` is expanded, relative paths resolve against the theme
+    /// directory, and entries that do not exist are dropped instead of
+    /// breaking the theme.
+    #[test]
+    fn theme_fallback_font_paths_resolve_like_primary_fonts() {
+        let dir = Path::new("target/config-test/fallback-fonts");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let present = dir.join("present.ttf");
+        std::fs::write(&present, b"not really a font, only its presence matters").unwrap();
+
+        let home = std::env::var("HOME").unwrap_or_default();
+        let home_font = Path::new(&home).join(".config/termshot/does-not-exist.ttf");
+
+        let theme = ThemeConfig {
+            foreground: "#ffffff".into(),
+            background: "#000000".into(),
+            font: None,
+            font_bold: None,
+            fallback_fonts: vec![
+                "present.ttf".into(),
+                "~/.config/termshot/does-not-exist.ttf".into(),
+                "/definitely/missing/font.ttf".into(),
+            ],
+            palette: ["#000000"; 16].map(String::from),
+            base_dir: Some(dir.to_path_buf()),
+        };
+
+        let mut config = Config {
+            output_dir: dir.to_path_buf(),
+            font_path: None,
+            font_size: 16.0,
+            default_cols: 80,
+            default_rows: 24,
+            default_timeout_secs: 30,
+            shell: "/bin/bash".to_string(),
+            embed_description: true,
+            default_theme: "custom".to_string(),
+            chrome: ChromeConfig::default(),
+            themes: HashMap::new(),
+            user_theme_names: BTreeSet::new(),
+            redaction: RedactionConfig::default(),
+        };
+        config.themes.insert("custom".to_string(), theme);
+
+        // The relative path resolved against the theme directory is kept; the
+        // two missing files (one via `~`) are dropped with a warning.
+        assert_eq!(
+            config.theme_fallback_font_paths("custom"),
+            vec![present.clone()]
+        );
+        assert!(!home_font.exists(), "test assumed this path is absent");
+
+        // Unknown theme: no fallbacks, no panic.
+        assert!(config.theme_fallback_font_paths("nope").is_empty());
+    }
+
+    /// First run must not install any theme files: `themes/` is created empty
+    /// for the user's own themes, and the shipped default stays the built-in
+    /// `dark`, which needs no external font.
+    #[test]
+    fn bootstrap_writes_no_theme_files() {
+        let dir = Path::new("target/config-test/no-starter-theme");
+        let _ = std::fs::remove_dir_all(dir);
+        bootstrap_defaults(dir).unwrap();
+
+        let themes_dir = dir.join("themes");
+        assert!(themes_dir.is_dir(), "themes/ was not created");
+        let entries: Vec<PathBuf> = std::fs::read_dir(&themes_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "bootstrap must not ship theme files, found {:?}",
+            entries
+        );
+
+        let default_config: ConfigFile =
+            toml::from_str(&std::fs::read_to_string(dir.join("config.toml")).unwrap()).unwrap();
+        assert_eq!(default_config.default_theme, "dark");
+        assert!(builtin_themes().contains_key("dark"));
     }
 }

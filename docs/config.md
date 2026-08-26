@@ -1,8 +1,8 @@
 # Configuration
 
 On first run termshot bootstraps `~/.config/termshot/` with a starter
-`config.toml`, `themes/` and `rules/` directories, and an `adamkadaban` example user theme
-(not selected by default: it points at a commercial font). Point at a different
+`config.toml` and empty `themes/` and `rules/` directories - no theme or rule
+files are installed, they are yours to fill. Point at a different
 file with `--config <path>`. A commented example ships as
 `termshot.example.toml`.
 
@@ -22,7 +22,7 @@ that touches config (for example `termshot themes`) bootstraps
 | `default_theme` | `dark` | Theme used when `--theme` is not given. |
 | `font_path` | unset | Path to a monospace font, overriding the embedded JetBrains Mono. |
 | `shell` | `$SHELL` | Shell used to execute commands. `exec` runs it as a login + interactive shell (`-l -i`), so your profile, prompt, aliases, and `PATH` apply; `--no-prompt` runs it non-interactively (`-c`). |
-| `embed_description` | `true` | Embed the terminal text (redacted, when redaction ran) in each PNG's `Description` metadata for screen readers. Disable per run with `--no-description`. |
+| `embed_description` | `true` | Embed the terminal text (redacted, when redaction ran) in each PNG's UTF-8 `Description` metadata (PNG `iTXt`) for screen readers. Disable per run with `--no-description`. Not exposed over MCP: the server always follows this setting. |
 
 ## `[chrome]`
 
@@ -64,8 +64,8 @@ See [redaction.md](./redaction.md) for the rule format and partial redaction.
 ## `[themes.<name>]`
 
 Inline theme definitions, using the same fields as a user theme file
-(`foreground`, `background`, `palette`, optional `font` / `font_bold`). See
-[themes.md](./themes.md).
+(`foreground`, `background`, `palette`, optional `font` / `font_bold` /
+`fallback_fonts`). See [themes.md](./themes.md).
 
 ## Example
 

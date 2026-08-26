@@ -21,7 +21,7 @@ reports, blog posts, and PR descriptions.
 </p>
 
 ```sh
-termshot exec --chrome gnome --title 'termshot — ls src/' 'ls --color=always -la src/'
+termshot exec --chrome gnome --title 'termshot - ls src/' 'ls --color=always -la src/'
 ```
 
 ## Highlights
@@ -59,19 +59,20 @@ Set `[redaction] enabled = false` in the config to turn redaction off entirely;
 with it off, an explicit `--redact` fails loudly instead of quietly writing an
 unredacted image.
 
-**Themes** - 11 built-in (using the bundled JetBrains Mono), plus user themes
-with custom fonts at `~/.config/termshot/themes/`.
+**Themes** - 11 built-in (using the bundled JetBrains Mono), plus any themes you
+drop in `~/.config/termshot/themes/`, each with its own fonts.
 
 <p align="center">
-  <img src="docs/assets/themes.png" alt="The same colorized 'git log' command rendered in three themes - adamkadaban, dracula, and nord - stacked with thin dividers to show their different backgrounds and palettes" width="700">
+  <img src="docs/assets/themes.png" alt="The same colorized 'git log' command rendered in three built-in themes - catppuccin-mocha, dracula, and nord - stacked with thin dividers to show their different backgrounds and palettes" width="700">
 </p>
 
 ```sh
-for theme in adamkadaban dracula nord; do
+for theme in catppuccin-mocha dracula nord; do
   termshot exec --theme "$theme" --no-rounded -o "$theme.png" \
     'git log --oneline --color=always -n 4'
 done
-termshot compose --divider 4 -o themes.png adamkadaban.png dracula.png nord.png
+termshot compose --divider 4 -o themes.png \
+  catppuccin-mocha.png dracula.png nord.png
 ```
 
 **Chrome frames** - title bar presets with optional timestamp. Good for
@@ -97,7 +98,7 @@ termshot exec -o before.png 'git status -su'
 git add -A
 termshot exec -o after.png 'git status -su'
 termshot compose --layout horizontal --chrome gnome \
-  --title 'git status — before / after staging' -o compose.png before.png after.png
+  --title 'git status - before / after staging' -o compose.png before.png after.png
 ```
 
 **MCP server** - four tools for agent workflows:
@@ -107,18 +108,43 @@ termshot compose --layout horizontal --chrome gnome \
 ## Install
 
 ```sh
-git clone https://github.com/Adamkadaban/termshot
+git clone https://github.com/Adamkadaban/screenshot-mcp termshot
 cd termshot
 cargo build --release
 # binary at ./target/release/termshot
 ```
 
+### Prebuilt releases
+
+Each tagged release publishes:
+
+| Artifact | Contents |
+| --- | --- |
+| `termshot-<tag>-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 (glibc) |
+| `termshot-<tag>-aarch64-unknown-linux-gnu.tar.gz` | Linux aarch64 (glibc) |
+| `termshot-<tag>-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64, fully static (no glibc needed) |
+| `termshot-<tag>-x86_64-apple-darwin.tar.gz` | macOS Intel |
+| `termshot-<tag>-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+| `termshot_<version>-1_amd64.deb` | Debian/Ubuntu x86_64 |
+| `termshot_<version>-1_arm64.deb` | Debian/Ubuntu aarch64 |
+| `termshot-<version>-1.x86_64.rpm` | Fedora/RHEL/openSUSE x86_64 |
+
+Every archive carries the binary, `LICENSE`, `README.md`, `docs/`, the man page
+(`termshot.1`), and `termshot.example.toml`.
+
+RPM is x86_64 only: the RPM tooling derives package dependencies by inspecting
+the built binary with the host's `ldd`, which cannot read a foreign-architecture
+ELF, so an aarch64 RPM would ship without a glibc requirement. On aarch64 RPM
+distros, install from the `aarch64-unknown-linux-gnu` archive (the static musl
+build is published for x86_64 only).
+
 ### Debian/Ubuntu package
 
 Release builds publish a `.deb` for `x86_64` and `aarch64`. It installs the
 binary to `/usr/bin/termshot`, the man page to
-`/usr/share/man/man1/termshot.1.gz`, and a sample config to
-`/usr/share/doc/termshot/config.toml.example`.
+`/usr/share/man/man1/termshot.1.gz`, and the docs, `LICENSE`, and a sample
+config under `/usr/share/doc/termshot/` (the sample config is
+`config.toml.example`). The RPM lays out the same files.
 
 The package does not write a user config. On first run any command that touches
 config - for example `termshot themes` - bootstraps
@@ -186,18 +212,23 @@ sourced. Set `shell` in the config (or `TERMSHOT_SHELL`) to capture with a
 different shell.
 
 **Accessibility** - every PNG embeds its terminal text (the redacted version
-when redaction ran) in a `Description` metadata chunk, so screen readers can
-read the screenshot. Disable per run with `--no-description`, or globally with
-`embed_description = false`.
+when redaction ran) in a UTF-8 `Description` metadata chunk (PNG `iTXt`), so
+screen readers can read the screenshot and box drawing, Greek, and CJK survive
+intact. Disable per run with `--no-description`, or globally with
+`embed_description = false`. Composed images carry the same metadata: the
+panes' descriptions are read back and joined, separated by `--- Pane N ---`
+markers. The MCP tools have no toggle for this: the document or app that embeds
+a screenshot owns its alt text, so the server always follows the global config.
 
 ### Known limitations
 
-- **One font, no fallback chain.** Every glyph is rasterized from the single
-  configured font (bundled JetBrains Mono by default). Codepoints that font does
-  not cover - CJK, emoji, and some box-drawing or Powerline glyphs used by tools
-  like `bat`, `btop`, or `eza` - render as `.notdef` boxes. Point `font` /
-  `font_bold` at a face with wider coverage (a Nerd Font, for example) when
-  capturing such output.
+- **Fallback covers common gaps, not everything.** Glyphs the configured font
+  lacks are taken from the bundled JetBrains Mono, which covers box drawing,
+  arrows, and common symbols (so `bat`, `btop`, and `eza` frames render even
+  under a font that lacks them). Scripts neither font has - CJK and most
+  Powerline/Nerd Font glyphs - still render as `.notdef` boxes until you add a
+  covering face to the theme's `fallback_fonts`. See
+  [docs/themes.md](./docs/themes.md#glyph-coverage-and-font-fallback).
 - **Unix only.** termshot uses PTYs and POSIX signals; Linux and macOS are
   supported, Windows is not.
 
@@ -239,7 +270,7 @@ Add to your MCP client config:
 - [docs/mcp.md](./docs/mcp.md) - MCP server setup, tool reference, and
   agent workflow examples
 - [docs/themes.md](./docs/themes.md) - theme format, built-in list, user
-  themes, and font config
+  themes, font config, and font fallback
 - [docs/redaction.md](./docs/redaction.md) - redaction rules, custom YAML
   format, partial redaction, and labels
 - [docs/config.md](./docs/config.md) - full `config.toml` reference

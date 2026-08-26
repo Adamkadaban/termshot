@@ -19,7 +19,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Every parameter struct below denies unknown fields, so a caller that sends
+/// a parameter this server does not expose - a stale `embed_description`, a
+/// typo, or a field from an older schema - gets a clear error instead of a
+/// screenshot silently rendered with different settings than it asked for.
+/// (`embed_description` in particular is deliberately global config only.)
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExecuteAndScreenshotParams {
     /// Shell command to execute. The command is run in an interactive shell,
     /// so the PS1 prompt (username, directory, etc.) will be visible in the
@@ -118,15 +124,10 @@ pub struct ExecuteAndScreenshotParams {
     /// the full `cols` width.
     #[serde(default)]
     pub auto_crop: Option<bool>,
-
-    /// Embed the terminal text (redacted, when redaction ran) in the PNG's
-    /// `Description` metadata so screen readers can read the screenshot.
-    /// Defaults to the server config (`embed_description`, on by default).
-    #[serde(default)]
-    pub embed_description: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RenderAnsiParams {
     /// Path to a file containing raw terminal output with ANSI escape sequences.
     pub input_path: String,
@@ -198,12 +199,6 @@ pub struct RenderAnsiParams {
     /// Defaults to true.
     #[serde(default)]
     pub show_labels: Option<bool>,
-
-    /// Embed the terminal text (redacted, when redaction ran) in the PNG's
-    /// `Description` metadata so screen readers can read the screenshot.
-    /// Defaults to the server config (`embed_description`, on by default).
-    #[serde(default)]
-    pub embed_description: Option<bool>,
 }
 
 /// A single selective redaction for `redact_screenshot`: either a regex
@@ -244,6 +239,7 @@ pub enum RedactionSpec {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RedactScreenshotParams {
     /// Path to a screenshot PNG produced by THIS server instance in the current
     /// session (via execute_and_screenshot or render_ansi). The raw output and
@@ -274,6 +270,7 @@ pub struct RedactScreenshotParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ComposeScreenshotsParams {
     /// Paths to two or more PNG screenshots to combine, in order.
     pub paths: Vec<String>,
@@ -542,9 +539,7 @@ impl ScreenshotServer {
         let text_options = TextOptions {
             strip_ansi: params.strip_ansi.unwrap_or(false),
             redact_text: params.redact_text.unwrap_or(false),
-            embed_description: params
-                .embed_description
-                .unwrap_or(self.config.embed_description),
+            embed_description: self.config.embed_description,
         };
 
         // Derive the output PNG base name. An explicit `output_name` is the
@@ -667,9 +662,7 @@ impl ScreenshotServer {
                 TextOptions {
                     strip_ansi: params.strip_ansi.unwrap_or(false),
                     redact_text: params.redact_text.unwrap_or(false),
-                    embed_description: params
-                        .embed_description
-                        .unwrap_or(self.config.embed_description),
+                    embed_description: self.config.embed_description,
                 },
                 params.auto_crop.unwrap_or(true),
             )
@@ -878,6 +871,9 @@ impl ScreenshotServer {
                 chrome_options.as_ref(),
                 &self.config.output_dir,
                 output.as_deref(),
+                // Composition follows the server's global embed_description
+                // policy; there is deliberately no per-call toggle.
+                self.config.embed_description,
             )
             .map_err(|e| McpError::internal_error(format!("Compose failed: {}", e), None))?;
 
@@ -885,6 +881,14 @@ impl ScreenshotServer {
             "Composed screenshot saved to: {}",
             path.display()
         ))]))
+    }
+}
+
+impl ScreenshotServer {
+    /// The tool definitions this server publishes, exactly as an MCP client
+    /// sees them (including each tool's JSON input schema).
+    pub fn tool_definitions() -> Vec<Tool> {
+        Self::tool_router().list_all()
     }
 }
 

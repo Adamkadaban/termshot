@@ -51,9 +51,18 @@ prompt in the image.
   into a single image, like tmux split panes, and can wrap the composed result
   in one outer window frame.
 
-Both tools also accept `embed_description` (boolean, default from config): when
-on, the terminal text - redacted, if redaction ran - is stored in the PNG's
-`Description` metadata so screen readers can read the screenshot.
+Screenshot metadata is not an MCP parameter. Every PNG carries its terminal
+text - redacted, if redaction ran - in a UTF-8 `Description` chunk (PNG
+`iTXt`) whenever `embed_description` is on in the server config, which it is by
+default. The document or app embedding a screenshot owns its alt text, so tool
+callers cannot change or omit it per call; flip `embed_description = false` in
+the config (or use the CLI's `--no-description`) to turn it off. A composed
+image is described too: `compose_screenshots` reads each source PNG's
+`Description` and joins them, separated by `--- Pane N ---` markers.
+
+Unknown parameters are rejected. Every tool's schema forbids extra properties,
+so a call that passes a field the tool does not define (for example a legacy
+`embed_description`) fails with an error instead of being silently ignored.
 
 `execute_and_screenshot` and `render_ansi` accept an optional `rounded`
 (boolean, default `true`): with `chrome` the window frame is rounded, and
