@@ -1,0 +1,630 @@
+.\" Manpage for termshot.
+.\" Contact the project maintainers to correct errors or typos.
+.TH TERMSHOT 1 "2026-08-25" "termshot 0.1.0" "User Commands"
+.SH NAME
+termshot \- capture terminal screenshots with full ANSI rendering
+.SH SYNOPSIS
+.B termshot
+.RI [ GLOBAL\ OPTIONS ]
+.I COMMAND
+.RI [ ARGS ]
+.br
+.B termshot exec
+.RI [ OPTIONS ]
+.I command ...
+.br
+.B termshot render
+.RI [ OPTIONS ]
+.I input
+.br
+.B termshot compose
+.RI [ OPTIONS ]
+.I image1 image2 ...
+.br
+.B termshot mcp
+.br
+.B termshot themes
+.SH DESCRIPTION
+.B termshot
+runs a command in a pseudo\-terminal (PTY), captures its output including all
+ANSI escape sequences (colors, bold, cursor movement), and renders a crisp PNG
+image that looks like a real terminal window. It can decorate the output with
+window chrome (GNOME, macOS, or report styles), apply color themes, and
+redact known secret formats from the rendered image on request.
+.PP
+Commands run through your shell as a login and interactive shell
+.RI ( $SHELL " \-l \-i" ),
+so a capture inherits the environment you normally work in: the profile files
+.RI ( ~/.bashrc ,
+.IR ~/.zshrc ,
+and friends) are sourced, and your prompt (PS1), aliases, shell functions,
+.BR PATH ,
+exports, and shell options all apply. That is what makes the screenshot look
+like your terminal.
+.PP
+It also means aliases apply: if
+.B cat
+is aliased to
+.BR bat / batcat ,
+then
+.B termshot exec \(aqcat file\(aq
+captures bat\(aqs framed, line\-numbered output. Bypass an alias the way you
+would interactively -
+.BR "command cat" ,
+.BR \(rscat ,
+or
+.B \-\-no\-prompt
+(which runs non\-interactively, where aliases are not defined at all).
+.PP
+The screen is reset before the command runs, so shell startup banners stay out
+of the image and every capture shows exactly one prompt: the one in front of
+the command. The trailing prompt the shell draws afterwards is removed as well,
+including the upper lines of a multi\-line PS1.
+.PP
+.B \-\-no\-prompt
+runs the command non\-interactively instead
+.RI ( $SHELL " \-c" ),
+so no prompt is drawn and interactive\-only startup files are not sourced. The
+shell itself can be changed with the
+.B shell
+config key or
+.BR TERMSHOT_SHELL .
+.PP
+The same binary doubles as a Model Context Protocol (MCP) server
+.RB ( termshot\ mcp ),
+exposing the
+.BR execute_and_screenshot ,
+.BR render_ansi ,
+.BR redact_screenshot ,
+and
+.B compose_screenshots
+tools so an AI agent can capture, inspect, redact, and combine screenshots
+programmatically.
+.SH GLOBAL OPTIONS
+These options are accepted before or after any subcommand.
+.TP
+.BI \-\-config " PATH"
+Path to the configuration file. Defaults to
+.IR ~/.config/termshot/config.toml .
+.TP
+.BI \-\-rules\-path " DIR"
+Additional directory of redaction rule files
+.RI ( .toml
+plus Kingfisher
+.IR .yaml )
+loaded on top of the built\-in rules, the config rules, and the default user
+rules directory
+.IR ~/.config/termshot/rules/ .
+.TP
+.B \-h, \-\-help
+Print help and exit.
+.TP
+.B \-V, \-\-version
+Print version and exit.
+.SH SUBCOMMANDS
+.SS exec
+Execute a command and save a terminal screenshot.
+.PP
+.B termshot exec
+.RI [ OPTIONS ]
+.I command ...
+.PP
+Everything after the options is treated as the command to run. Multiple
+arguments are each executed on their own line, each with its own PS1 prompt.
+.TP
+.BI \-c, \-\-cols " N"
+Terminal width in columns (default: 120).
+.TP
+.BI \-r, \-\-rows " N"
+Terminal height in rows (default: 40).
+.TP
+.BI \-t, \-\-timeout " SECS"
+Maximum time to wait for the command to finish (default: 30).
+.TP
+.BI \-\-chrome " PRESET"
+Window chrome preset: one of
+.BR none ,
+.BR minimal ,
+.BR gnome ,
+.BR macos ,
+.BR report .
+.TP
+.BI \-\-font " PATH"
+Path to a regular font file, overriding the embedded JetBrains Mono.
+.TP
+.BI \-\-font\-bold " PATH"
+Path to a bold font file (uses a real bold face instead of faux bold).
+.TP
+.B \-\-no\-prompt
+Hide the interactive shell prompt (PS1). By default the command runs in an
+interactive login shell, so the prompt is visible and the shell's startup files
+(aliases, functions,
+.BR PATH ,
+exports) are in effect; with this flag the command runs non\-interactively via
+.RI $SHELL " \-c"
+instead.
+.TP
+.BI \-\-theme " NAME"
+Theme name (e.g.
+.BR dark ,
+.BR adamkadaban ,
+.BR catppuccin\-mocha ,
+.BR dracula ,
+.BR nord ,
+.BR tokyo\-night ).
+.TP
+.BI \-\-title " TITLE"
+Optional chrome title bar text.
+.TP
+.B \-\-timestamp
+Add a UTC timestamp watermark below the terminal content.
+.TP
+.BI \-o, \-\-output " PATH"
+Output file path. When omitted, a descriptively named file is auto\-generated
+in the output directory (see
+.BR "OUTPUT AND NAMING" ).
+.TP
+.B \-\-redact
+Redact sensitive data (IPs, keys, tokens, ...) from this screenshot.
+.TP
+.BI \-\-redact\-rules " RULES"
+Comma\-separated list of redaction rule names to apply (default: all enabled
+rules). Implies
+.BR \-\-redact .
+.TP
+.B \-\-no\-redact
+Force redaction off even when auto\-redaction is enabled in the config.
+.TP
+.B \-\-no\-description
+Do not embed the terminal text in the PNG
+.B Description
+metadata. By default the text (redacted, when redaction ran) is embedded so
+screen readers can read the screenshot.
+.TP
+.B \-\-redact\-text
+Also redact the returned plain text. By default only the PNG is redacted and
+the text keeps the original (unredacted) content.
+.TP
+.B \-\-plain\-text
+Return plain text with ANSI color codes stripped. By default the original
+output is returned with colors preserved.
+.TP
+.BI \-\-auto\-crop " BOOL"
+Crop the image width to fit the actual content instead of using the full
+terminal width (default: true).
+.TP
+.B \-\-rounded, \-\-no\-rounded
+Draw soft rounded corners (default) or square corners. With chrome the window
+frame is rounded; without chrome the terminal image itself gets rounded corners
+on a transparent background.
+.SS render
+Render a file of raw ANSI terminal output to a PNG screenshot.
+.PP
+.B termshot render
+.RI [ OPTIONS ]
+.I input
+.TP
+.BI \-c, \-\-cols " N"
+Terminal width in columns (default: 120).
+.TP
+.BI \-r, \-\-rows " N"
+Terminal height in rows (default: 40).
+.TP
+.BI \-\-theme " NAME"
+Theme name.
+.TP
+.BI \-\-chrome " PRESET"
+Window chrome preset:
+.BR none ,
+.BR minimal ,
+.BR gnome ,
+.BR macos ,
+.BR report .
+.TP
+.BI \-\-title " TITLE"
+Optional chrome title.
+.TP
+.B \-\-timestamp
+Add a UTC timestamp watermark below the terminal content.
+.TP
+.BI \-o, \-\-output " PATH"
+Output file path.
+.TP
+.B \-\-plain\-text
+Return plain text with ANSI color codes stripped.
+.TP
+.B \-\-redact
+Redact sensitive data (IPs, keys, tokens, ...) from this render. Rendering a
+captured log honors the same
+.B [redaction]
+policy as
+.BR exec .
+.TP
+.BI \-\-redact\-rules " RULES"
+Comma\-separated list of redaction rule names to apply (default: all enabled
+rules). Implies
+.BR \-\-redact .
+.TP
+.B \-\-no\-redact
+Force redaction off even when auto\-redaction is enabled in the config.
+.TP
+.B \-\-redact\-text
+Also redact the returned plain text.
+.TP
+.BI \-\-auto\-crop " BOOL"
+Crop the image width to fit the actual content instead of using the full
+terminal width (default: true).
+.TP
+.B \-\-rounded, \-\-no\-rounded
+Draw soft rounded corners (default) or square corners.
+.TP
+.B \-\-no\-description
+Do not embed the terminal text in the PNG
+.B Description
+metadata.
+.SS compose
+Compose two or more screenshots side by side or stacked into one image.
+.PP
+.B termshot compose
+.RI [ OPTIONS ]
+.I image1 image2 ...
+.PP
+At least two input PNGs are required; they are placed in the order given.
+.TP
+.BI \-\-layout " LAYOUT"
+.B horizontal
+(side by side) or
+.B vertical
+(stacked). Default:
+.BR vertical .
+.TP
+.BI \-\-divider " PIXELS"
+Divider thickness in pixels between adjacent panes, drawn as a thin solid line
+like a tmux split (default: 2; use 0 for none). Panes sit directly adjacent and
+are stretched to a common height (horizontal) or width (vertical).
+.TP
+.BI \-\-theme " NAME"
+Theme name whose background color fills the canvas.
+.TP
+.BI \-o, \-\-output " PATH"
+Output file path. When omitted, a file is auto\-generated in the output
+directory.
+.SS mcp
+Start the MCP server on stdio. Exposes the
+.BR execute_and_screenshot ,
+.BR render_ansi ,
+.BR redact_screenshot ,
+and
+.B compose_screenshots
+tools. The server keeps each screenshot's raw output and render metadata in
+memory for the lifetime of the process so
+.B redact_screenshot
+can re\-render it; no sidecar files are written to disk. Records are lost on
+restart and are not created by the CLI.
+.SS themes
+List available themes. Each theme is marked
+.B built\-in
+or
+.BR user ,
+and the active default is flagged.
+.SH OUTPUT AND NAMING
+Over MCP, the
+.B output_name
+parameter is the preferred way to name a screenshot: agents and users should
+pick a short, descriptive slug such as
+.I finding-01-sqli
+or
+.IR before-fix .
+On the CLI, use
+.B \-o
+to choose the path explicitly.
+.PP
+When no name is given, a fallback base name is generated as
+.IR {working-dir}-{first-command-word} .
+For example, running
+.B cargo test
+in
+.I ~/Desktop/webapp
+yields
+.IR webapp-cargo.png ,
+and
+.B git log --oneline
+yields
+.IR git.png
+(prefixed by the working directory basename). Generated names are lowercased,
+runs of non\-alphanumeric characters collapse to single hyphens, they are
+trimmed and capped at 60 characters, and a numeric suffix
+.RB ( \-2 ,
+.BR \-3 ,
+\&...) is appended to avoid overwriting an existing file.
+.SH REDACTION
+termshot can mask sensitive data in the rendered image so screenshots are safe
+to share.
+.SS Built-in rules
+A set of rules is compiled in and enabled by default, matching common secret
+formats:
+.BR ipv4 ,
+.BR ipv6 ,
+.BR mac ,
+.BR aws_key ,
+.BR aws_secret ,
+.BR private_key ,
+.BR jwt ,
+.BR email ,
+.BR hostname ,
+.BR api_key ,
+.BR github_token ,
+.BR slack_token ,
+.BR private_key_pem ,
+.BR gcp_service_account ,
+.BR azure_client_secret ,
+.BR generic_api_key ,
+.BR bearer_token ,
+.BR connection_string ,
+.BR discord_token ,
+and
+.BR hashicorp_vault_token .
+Several provider\-token patterns are sourced from and inspired by Betterleaks
+(MIT, https://github.com/betterleaks/betterleaks).
+Matches are covered with a colored block and a short
+.RB [ LABEL ]
+tag. Obviously non\-sensitive values (such as
+.IR 127.0.0.1 ,
+.IR ::1 ,
+or IPv6 look\-alikes inside ordinary code such as
+.IR std::fs::read )
+are left visible. Rows joined by a soft line wrap are matched as one logical
+line, so a secret that crosses the right margin is still masked.
+.PP
+Redaction is opt\-in: enable it per run with
+.B \-\-redact
+or
+.BR "\-\-redact\-rules a,b" ,
+or always\-on by setting
+.B auto = true
+in the
+.B [redaction]
+section of the config file. The built\-in rules favor precision over recall, so
+ordinary output (source code, hashes, version strings) is not masked.
+.SS Agent workflow
+The recommended flow for selective redaction (especially over MCP):
+.IP 1. 4
+Capture with
+.B execute_and_screenshot
+(or
+.BR render_ansi ).
+With redaction enabled the PNG is masked for known secrets, while the RETURNED
+TEXT keeps the original content.
+.IP 2. 4
+Inspect the returned text and decide what else is sensitive.
+.IP 3. 4
+Call
+.B redact_screenshot
+with the returned screenshot path and a list of redactions, each either a
+regex
+.B pattern
+(with optional
+.BR replacement )
+or an explicit cell range
+.RB ( row ,
+.BR col_start ,
+.BR col_end ).
+The screenshot is re\-rendered in place from the in\-memory record.
+.SS Partial redaction
+To reveal only part of a secret, either write a regex that matches just the
+sensitive portion, or set
+.B keep_prefix
+and/or
+.B keep_suffix
+(character counts) on a
+.B redact_screenshot
+pattern. Those leave the first/last characters visible and mask only the
+middle. For a hash like
+.IR 8846f7eaee8fb117ad06bdd830b7586c ,
+.B keep_prefix: 4
+renders
+.IR 8846\[u2588]\[u2588]\[u2588]... ;
+for an AWS key
+.IR AKIA... ,
+.B keep_prefix: 4
+shows
+.IR AKIA\[u2588]\[u2588]\[u2588]... .
+.SS Turning redaction off
+.B [redaction] enabled
+is the master switch. With
+.B enabled = false
+no rule ever runs, and an explicit
+.B \-\-redact
+(or
+.BR "redact: true" )
+fails with an error instead of writing an unredacted image. To keep the rules
+available but off unless asked for, leave
+.B enabled = true
+with
+.B auto = false
+- the shipped default.
+.SS Custom rules
+Every
+.IR .toml ,
+.IR .yaml ,
+and
+.I .yml
+file in
+.I ~/.config/termshot/rules/
+is loaded automatically; that directory is created on first run, like
+.IR themes/ .
+Supply an additional directory with
+.BI \-\-rules\-path " DIR"
+(or the
+.B [redaction] rules_path
+config key), whose rules are layered on top and win on name conflicts. TOML files use the native
+.B [[rules]]
+format; YAML files use the Kingfisher rule format
+.RB ( rules:
+list with
+.B name
+/
+.B id
+and
+.B pattern
+/
+.BR regex ).
+Individual built\-ins can be overridden or disabled by name in the config.
+.SS Colors
+The redaction block and label colors are configurable, both engine\-wide via
+.B [redaction] color
+and
+.BR "[redaction] label_color" ,
+and per\-rule via a rule's
+.B color
+field (all as
+.IR #RRGGBB ).
+.SH THEMES
+Built\-in themes include
+.BR dark ,
+.BR catppuccin\-mocha ,
+.BR catppuccin\-latte ,
+.BR catppuccin\-frappe ,
+.BR catppuccin\-macchiato ,
+.BR solarized\-dark ,
+.BR solarized\-light ,
+.BR dracula ,
+.BR nord ,
+.BR gruvbox\-dark ,
+and
+.BR tokyo\-night .
+User themes are loaded from
+.I ~/.config/termshot/themes/
+\(em each
+.I .toml
+file there defines one theme (foreground, background, and a 16\-color palette),
+and may reference its own regular/bold fonts. User themes with the same name as
+a built\-in override it. Run
+.B termshot themes
+to list them all.
+.SH CONFIGURATION
+On first run termshot bootstraps
+.I ~/.config/termshot/
+with a starter
+.IR config.toml ,
+a
+.I themes/
+directory, and a
+.I rules/
+directory. The config file
+.RI ( ~/.config/termshot/config.toml
+by default, or the path given to
+.BR \-\-config )
+controls the output directory, default font and font size, default terminal
+size, shell, default theme, window chrome, and redaction behavior. A commented
+example ships as
+.I termshot.example.toml
+in the source tree.
+.PP
+Several settings can also be overridden by environment variables:
+.BR TERMSHOT_OUTPUT_DIR ,
+.BR TERMSHOT_FONT_PATH ,
+.BR TERMSHOT_FONT_SIZE ,
+.BR TERMSHOT_COLS ,
+.BR TERMSHOT_ROWS ,
+.BR TERMSHOT_TIMEOUT ,
+.BR TERMSHOT_SHELL ,
+.BR TERMSHOT_THEME ,
+and
+.BR TERMSHOT_CHROME .
+The pre\-rename
+.B SCREENSHOT_MCP_*
+spellings are still read, with a deprecation warning.
+The default output directory is
+.IR /tmp/termshot .
+.SH EXAMPLES
+.PP
+Capture a themed test run with GNOME chrome for a blog post:
+.PP
+.RS 4
+.EX
+termshot exec \-\-chrome gnome \-\-theme catppuccin\-mocha \-o post\-demo.png 'cargo test'
+.EE
+.RE
+.PP
+Produce a redacted, timestamped finding image for a pentest report:
+.PP
+.RS 4
+.EX
+termshot exec \-\-redact \-\-timestamp \-\-chrome report \-o finding\-01.png 'nmap \-sV target'
+.EE
+.RE
+.PP
+Combine before/after screenshots side by side for a pull\-request comparison:
+.PP
+.RS 4
+.EX
+termshot compose \-\-layout horizontal \-o before\-after.png before.png after.png
+.EE
+.RE
+.PP
+Selective agent redaction (MCP): the agent runs
+.B execute_and_screenshot
+without forcing redaction and reads the returned text (original content). It
+spots a value it wants partly hidden \(em say an API key \(em and calls
+.B redact_screenshot
+with the returned screenshot path and a redaction such as
+.IR "{ \(dqpattern\(dq: \(dqAKIA[0-9A-Z]{16}\(dq, \(dqkeep_prefix\(dq: 4 }" ,
+so the image shows
+.IR AKIA\[u2588]\[u2588]\[u2588]...
+while the rest is masked. The PNG is re\-rendered in place from the server's
+in\-memory record; no sidecar files are involved.
+.SH LIMITATIONS
+Glyphs are rasterized from a single font (the bundled JetBrains Mono unless
+.BR \-\-font ,
+a theme, or
+.B font_path
+says otherwise); there is no fallback chain. Codepoints that font does not
+cover - CJK, emoji, and some box\-drawing or Powerline glyphs emitted by tools
+such as
+.BR bat (1)
+or
+.BR btop (1)
+- are drawn as
+.I .notdef
+boxes. Point
+.B \-\-font
+at a face with wider coverage (a Nerd Font, for example) when capturing such
+output.
+.PP
+termshot uses PTYs and POSIX signals: Linux and macOS are supported, Windows is
+not.
+.SH FILES
+.TP
+.I ~/.config/termshot/config.toml
+Main configuration file.
+.TP
+.I ~/.config/termshot/themes/
+User theme directory (one
+.I .toml
+per theme).
+.TP
+.I ~/.config/termshot/rules/
+User redaction rule directory. Every
+.IR .toml ,
+.IR .yaml ,
+and
+.I .yml
+file in it is loaded automatically.
+.TP
+.I /tmp/termshot/
+Default output directory for generated PNGs.
+.SH SEE ALSO
+.BR bash (1),
+.BR nmap (1).
+.PP
+Project documentation:
+.IR README.md ,
+.IR docs/mcp.md ,
+.IR docs/themes.md ,
+.IR docs/redaction.md ,
+and
+.I docs/config.md
+in the source tree.
+.SH AUTHOR
+Written by the termshot project contributors.

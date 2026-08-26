@@ -1,16 +1,27 @@
-output_dir = "/tmp/screenshot-mcp"
+output_dir = "/tmp/termshot"
 font_size = 16.0
 cols = 120
 rows = 40
 timeout_secs = 30
-default_theme = "adamkadaban"
+# Built-in themes use the bundled JetBrains Mono, so they work with no extra
+# fonts installed. User themes live in ~/.config/termshot/themes/.
+default_theme = "dark"
+
+# Embed the terminal text (redacted, when redaction ran) in each PNG's
+# `Description` metadata so screenshots are readable by screen readers.
+embed_description = true
 
 [chrome]
 enabled = false
 preset = "none"
 title = "termshot"
-shadow = true
+timestamp = false
+shadow = false
 radius = 14
+# Draw soft rounded corners. Independent of chrome: with chrome the window
+# frame is rounded; without chrome the terminal image itself gets rounded
+# corners on a transparent background. Set false for square corners.
+rounded = true
 outer_padding = 18
 title_bar_height = 34
 
@@ -18,9 +29,64 @@ title_bar_height = 34
 # font_path = "/path/to/your/monospace.ttf"
 # shell = "/bin/bash"
 
+[redaction]
+# --- Master switch -----------------------------------------------------------
+# Set to false to disable ALL redaction globally: no rule ever runs, and even
+# --redact (CLI) / redact: true (MCP) become no-ops. This is the single knob
+# for "turn everything off".
+enabled = true
+
+# --- Automatic redaction -----------------------------------------------------
+# Redact every screenshot without an explicit flag. Off by default: a false
+# positive silently mangles a screenshot of ordinary output, which is worse
+# than an unmasked capture you chose not to redact. With auto = true the PNG is
+# masked while the returned text stays original unless you pass --redact-text.
+auto = false
+
+# --- Custom rules ------------------------------------------------------------
+# Every .toml / .yaml file in ~/.config/termshot/rules is loaded automatically;
+# that directory is created on first run, just like themes/. Point at an extra
+# directory with rules_path here or --rules-path on the CLI (it wins over the
+# default directory).
+# rules_path = "~/work/termshot-rules"
+
+# Built-in rules (ipv4, ipv6, mac, aws_key, aws_secret, private_key, jwt,
+# email, hostname, api_key, github_token, slack_token, private_key_pem,
+# gcp_service_account, azure_client_secret, generic_api_key, bearer_token,
+# connection_string, discord_token, hashicorp_vault_token) are compiled in
+# and enabled by default. Several provider-token patterns are sourced from
+# and inspired by Betterleaks (MIT, https://github.com/betterleaks/betterleaks).
+# Redacted regions are drawn as bright red blocks with a short [LABEL] tag.
+#
+# Disable a built-in rule:
+#   [[redaction.rules]]
+#   name = "email"
+#   enabled = false
+#
+# Override a built-in rule's pattern:
+#   [[redaction.rules]]
+#   name = "ipv4"
+#   pattern = '\b(?:(?:25[0-5]|2[0-4]\d|1?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|1?\d\d?)\b'
+#   # A rule may wrap the part to mask in a (?P<redact>...) group and match
+#   # surrounding context around it; only the group is blocked out.
+#   replacement = "[REDACTED-IP]"
+#   enabled = true
+#
+# Add a custom rule:
+#   [[redaction.rules]]
+#   name = "ticket"
+#   pattern = 'TICKET-\d+'
+#   replacement = "[REDACTED-TICKET]"
+#   enabled = true
+
 [themes.report]
 foreground = "#e6edf3"
 background = "#0d1117"
+# ANSI 16-color palette
+# [0]  black    [1]  red      [2]  green    [3]  yellow
+# [4]  blue     [5]  magenta  [6]  cyan     [7]  white
+# [8]  bright black  [9]  bright red    [10] bright green  [11] bright yellow
+# [12] bright blue   [13] bright magenta [14] bright cyan   [15] bright white
 palette = [
   "#0d1117", "#ff7b72", "#3fb950", "#d29922",
   "#58a6ff", "#bc8cff", "#39c5cf", "#b1bac4",

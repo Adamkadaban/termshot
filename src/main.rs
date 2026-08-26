@@ -1,12 +1,15 @@
-mod config;
-mod executor;
-mod renderer;
-mod server;
-
+use anyhow::Context;
 use clap::{Parser, Subcommand};
-use config::Config;
-use renderer::{ChromeOptions, Renderer};
+use std::path::PathBuf;
 use std::time::Duration;
+use termshot::config::Config;
+use termshot::redaction::{
+    explicit_request_is_blocked, resolve_should_redact, RedactionEngine, REDACTION_DISABLED_MSG,
+};
+use termshot::renderer::{
+    fallback_output_name, ChromeOptions, ComposeLayout, RedactionRequest, Renderer, TextOptions,
+};
+use termshot::{executor, server};
 
 #[derive(Parser)]
 #[command(
@@ -21,6 +24,11 @@ struct Cli {
     /// Path to config file (default: ~/.config/termshot/config.toml)
     #[arg(long, global = true)]
     config: Option<String>,
+
+    /// Directory of extra redaction rule files (.toml + generic .yaml) to
+    /// load in addition to the built-in and config rules.
+    #[arg(long, global = true)]
+    rules_path: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -34,17 +42,29 @@ enum Commands {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
 
-        /// Terminal width in columns
-        #[arg(short = 'c', long, default_value_t = 120)]
+        /// Terminal width in columns (1-500)
+        #[arg(short = 'c', long, default_value_t = 120, value_parser = clap::value_parser!(u16).range(1..=500))]
         cols: u16,
 
-        /// Terminal height in rows
-        #[arg(short = 'r', long, default_value_t = 40)]
+        /// Terminal height in rows (1-500)
+        #[arg(short = 'r', long, default_value_t = 40, value_parser = clap::value_parser!(u16).range(1..=500))]
         rows: u16,
 
         /// Timeout in seconds
         #[arg(short, long, default_value_t = 30)]
         timeout: u64,
+
+        /// Chrome preset: none, minimal, gnome, macos, report
+        #[arg(long)]
+        chrome: Option<String>,
+
+        /// Path to regular font file (overrides embedded JetBrains Mono)
+        #[arg(long)]
+        font: Option<PathBuf>,
+
+        /// Path to bold font file (uses real bold instead of faux bold)
+        #[arg(long)]
+        font_bold: Option<PathBuf>,
 
         /// Hide interactive shell prompt (PS1) from screenshot.
         /// By default the command runs in an interactive login shell so
@@ -56,30 +76,76 @@ enum Commands {
         #[arg(long)]
         theme: Option<String>,
 
-        /// Chrome preset: none, minimal, gnome, macos, report
-        #[arg(long)]
-        chrome: Option<String>,
-
         /// Optional chrome title
         #[arg(long)]
         title: Option<String>,
 
+        /// Add a UTC timestamp watermark below the terminal content
+        #[arg(long, default_value_t = false)]
+        timestamp: bool,
+
         /// Output file path (default: auto-generated in output dir)
         #[arg(short, long)]
         output: Option<String>,
+
+        /// Redact sensitive data (IPs, keys, tokens, ...) from this screenshot.
+        #[arg(long, default_value_t = false)]
+        redact: bool,
+
+        /// Comma-separated list of redaction rule names to apply
+        /// (default: all enabled rules). Implies --redact.
+        #[arg(long, value_name = "RULES")]
+        redact_rules: Option<String>,
+
+        /// Force redaction off even when auto-redaction is enabled in config.
+        #[arg(long = "no-redact", default_value_t = false)]
+        no_redact: bool,
+
+        /// Also redact the returned plain text. By default only the PNG image
+        /// is redacted and the text keeps the original (unredacted) content.
+        #[arg(long = "redact-text", default_value_t = false)]
+        redact_text: bool,
+
+        /// Return plain text with ANSI color codes stripped. By default the
+        /// original output is returned with colors preserved.
+        #[arg(long = "plain-text", default_value_t = false)]
+        plain_text: bool,
+
+        /// Crop the image width to fit the actual content instead of using the
+        /// full terminal width. Pass `--auto-crop false` to keep full width.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        auto_crop: bool,
+
+        /// Do not embed the terminal text in the PNG's `Description` metadata.
+        /// By default the (redacted, when redaction ran) text is embedded so
+        /// screen readers can read the screenshot.
+        #[arg(long = "no-description", default_value_t = false)]
+        no_description: bool,
+
+        /// Draw soft rounded corners (default: on). With chrome the window
+        /// frame is rounded; without chrome the terminal content itself gets
+        /// rounded corners on a transparent background.
+        #[arg(long, overrides_with = "no_rounded")]
+        rounded: bool,
+
+        /// Square (un-rounded) corners. Overrides --rounded and the config
+        /// default.
+        #[arg(long = "no-rounded", overrides_with = "rounded")]
+        no_rounded: bool,
     },
 
-    /// Render an ANSI file to a PNG screenshot
+    /// Render an ANSI file (or piped stdin) to a PNG screenshot
     Render {
-        /// Path to file containing raw ANSI terminal output
+        /// Path to a file containing raw ANSI terminal output, or `-` to read
+        /// from stdin (e.g. `cmd --color=always | termshot render -`).
         input: String,
 
-        /// Terminal width in columns
-        #[arg(short = 'c', long, default_value_t = 120)]
+        /// Terminal width in columns (1-500)
+        #[arg(short = 'c', long, default_value_t = 120, value_parser = clap::value_parser!(u16).range(1..=500))]
         cols: u16,
 
-        /// Terminal height in rows
-        #[arg(short = 'r', long, default_value_t = 40)]
+        /// Terminal height in rows (1-500)
+        #[arg(short = 'r', long, default_value_t = 40, value_parser = clap::value_parser!(u16).range(1..=500))]
         rows: u16,
 
         /// Theme name
@@ -94,13 +160,95 @@ enum Commands {
         #[arg(long)]
         title: Option<String>,
 
+        /// Add a UTC timestamp watermark below the terminal content
+        #[arg(long, default_value_t = false)]
+        timestamp: bool,
+
         /// Output file path
         #[arg(short, long)]
         output: Option<String>,
+
+        /// Return plain text with ANSI color codes stripped. By default the
+        /// original output is returned with colors preserved.
+        #[arg(long = "plain-text", default_value_t = false)]
+        plain_text: bool,
+
+        /// Redact sensitive data (IPs, keys, tokens, ...) from this render.
+        #[arg(long, default_value_t = false)]
+        redact: bool,
+
+        /// Comma-separated list of redaction rule names to apply
+        /// (default: all enabled rules). Implies --redact.
+        #[arg(long, value_name = "RULES")]
+        redact_rules: Option<String>,
+
+        /// Force redaction off even when auto-redaction is enabled in config.
+        #[arg(long = "no-redact", default_value_t = false)]
+        no_redact: bool,
+
+        /// Also redact the returned plain text. By default only the PNG image
+        /// is redacted and the text keeps the original (unredacted) content.
+        #[arg(long = "redact-text", default_value_t = false)]
+        redact_text: bool,
+
+        /// Crop the image width to fit the actual content instead of using the
+        /// full terminal width. Pass `--auto-crop false` to keep full width.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        auto_crop: bool,
+
+        /// Do not embed the terminal text in the PNG's `Description` metadata.
+        #[arg(long = "no-description", default_value_t = false)]
+        no_description: bool,
+
+        /// Draw soft rounded corners (default: on). With chrome the window
+        /// frame is rounded; without chrome the terminal content itself gets
+        /// rounded corners on a transparent background.
+        #[arg(long, overrides_with = "no_rounded")]
+        rounded: bool,
+
+        /// Square (un-rounded) corners. Overrides --rounded and the config
+        /// default.
+        #[arg(long = "no-rounded", overrides_with = "rounded")]
+        no_rounded: bool,
     },
 
     /// List available themes
     Themes,
+
+    /// Compose two or more screenshots side by side or stacked into one image
+    Compose {
+        /// Input PNG paths to combine, in order (at least two).
+        #[arg(required = true, num_args = 2..)]
+        images: Vec<PathBuf>,
+
+        /// Layout: vertical (stacked top-to-bottom, tmux-style) or horizontal
+        /// (side by side). Defaults to vertical.
+        #[arg(long, default_value = "vertical")]
+        layout: String,
+
+        /// Divider thickness in pixels between adjacent panes (tmux-style
+        /// split). Use 0 for no divider line.
+        #[arg(long, default_value_t = 2)]
+        divider: u32,
+
+        /// Theme name whose background color fills the canvas
+        #[arg(long)]
+        theme: Option<String>,
+
+        /// Wrap the composed result in a single outer window frame. Chrome
+        /// preset: none, minimal, gnome, macos, report. Inputs should be raw
+        /// (chrome-less) screenshots so only this outer frame is drawn.
+        #[arg(long)]
+        chrome: Option<String>,
+
+        /// Optional chrome title (only used with --chrome)
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Output file path (default: auto-generated in output dir)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -111,17 +259,20 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("screenshot_mcp=info".parse()?),
+                .add_directive("termshot=info".parse()?),
         )
         .with_writer(std::io::stderr)
         .init();
 
-    let config = Config::load(cli.config.as_deref())?;
+    let config = Config::load(cli.config.as_deref(), cli.rules_path.as_deref())?;
 
     match cli.command {
         Commands::Mcp => {
+            let (theme_font, theme_font_bold) = config.theme_font_paths(&config.default_theme);
+            let font_path = theme_font.or_else(|| config.font_path.clone());
             let renderer = Renderer::new(
-                &config.font_path,
+                font_path.as_deref(),
+                theme_font_bold.as_deref(),
                 config.font_size,
                 &config.themes,
                 &config.default_theme,
@@ -137,11 +288,34 @@ async fn main() -> anyhow::Result<()> {
             no_prompt,
             theme,
             chrome,
+            font,
+            font_bold,
             title,
+            timestamp,
             output,
+            redact,
+            redact_rules,
+            no_redact,
+            redact_text,
+            plain_text,
+            auto_crop,
+            no_description,
+            rounded,
+            no_rounded,
         } => {
+            // Resolve fonts: an explicit --font/--font-bold always wins;
+            // otherwise use the fonts declared by the theme being rendered,
+            // then any globally configured font, then the embedded font.
+            let active_theme = theme.as_deref().unwrap_or(&config.default_theme);
+            let (theme_font, theme_font_bold) = config.theme_font_paths(active_theme);
+            let font_path = font
+                .clone()
+                .or(theme_font)
+                .or_else(|| config.font_path.clone());
+            let font_bold_path = font_bold.clone().or(theme_font_bold);
             let renderer = Renderer::new(
-                &config.font_path,
+                font_path.as_deref(),
+                font_bold_path.as_deref(),
                 config.font_size,
                 &config.themes,
                 &config.default_theme,
@@ -163,39 +337,73 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let theme_name = theme.as_deref();
-            let chrome_options = chrome_options_from_args(&config, chrome, title);
-            let (image_path, plain_text) = renderer.render_bytes(
+            let chrome_options = chrome_options_from_args(
+                &config,
+                chrome,
+                title,
+                timestamp,
+                rounded_override(rounded, no_rounded),
+                command.first().map(String::as_str),
+            );
+
+            // Resolve whether redaction runs, then build the engine on demand.
+            let redaction_engine =
+                resolve_redaction(&config, redact, redact_rules.as_deref(), no_redact)?;
+            let redaction_request = redaction_engine.as_ref().map(|engine| RedactionRequest {
+                engine,
+                rules: redact_rules.as_ref().map(|s| parse_rule_list(s)),
+            });
+
+            let output_name = {
+                let cwd = std::env::current_dir().ok();
+                fallback_output_name(cwd.as_deref(), &command.join(" "))
+            };
+            let (image_path, terminal_text, redactions, _meta) = renderer.render_bytes(
                 &exec_result.raw_output,
                 cols,
                 rows,
                 &config.output_dir,
+                Some(output_name.as_str()),
                 theme_name,
                 chrome_options.as_ref(),
+                redaction_request.as_ref(),
+                TextOptions {
+                    strip_ansi: plain_text,
+                    redact_text,
+                    embed_description: config.embed_description && !no_description,
+                },
+                auto_crop,
             )?;
+
+            if !redactions.is_empty() {
+                let summary = redactions
+                    .iter()
+                    .map(|(name, count)| format!("{}x {}", count, name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!("Redacted: {}", summary);
+            }
 
             // If user specified an output path, move the file there
             let final_path = if let Some(out) = output {
-                let out = std::path::PathBuf::from(&out);
-                std::fs::rename(&image_path, &out)?;
-                out
+                move_screenshot(&image_path, &out)?
             } else {
                 image_path
             };
 
-            // Print screenshot path to stdout (easy to capture), everything else to stderr
+            // Print screenshot path to stdout (easy to capture); the terminal
+            // output and all diagnostics go to stderr.
             println!("{}", final_path.display());
-
-            let exit_info = if exec_result.timed_out {
-                "TIMED OUT".to_string()
-            } else {
-                match exec_result.exit_code {
-                    Some(code) => format!("exit code: {}", code),
-                    None => "unknown".to_string(),
-                }
-            };
-            eprintln!("Status: {}", exit_info);
             eprintln!("--- Terminal Output ---");
-            eprint!("{}", plain_text);
+            eprintln!("{}", terminal_text);
+
+            if exec_result.timed_out {
+                eprintln!("(timed out)");
+            } else if let Some(code) = exec_result.exit_code {
+                if code != 0 {
+                    eprintln!("(exit {})", code);
+                }
+            }
         }
         Commands::Render {
             input,
@@ -204,32 +412,96 @@ async fn main() -> anyhow::Result<()> {
             theme,
             chrome,
             title,
+            timestamp,
             output,
+            plain_text,
+            redact,
+            redact_rules,
+            no_redact,
+            redact_text,
+            auto_crop,
+            no_description,
+            rounded,
+            no_rounded,
         } => {
+            let active_theme = theme.as_deref().unwrap_or(&config.default_theme);
+            let (theme_font, theme_font_bold) = config.theme_font_paths(active_theme);
+            let font_path = theme_font.or_else(|| config.font_path.clone());
             let renderer = Renderer::new(
-                &config.font_path,
+                font_path.as_deref(),
+                theme_font_bold.as_deref(),
                 config.font_size,
                 &config.themes,
                 &config.default_theme,
                 &config.chrome,
             )?;
 
-            let data = std::fs::read(&input)?;
+            let data = if input == "-" {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .context("failed to read ANSI data from stdin")?;
+                buf
+            } else {
+                std::fs::read(&input)
+                    .with_context(|| format!("failed to read ANSI file {:?}", input))?
+            };
             let theme_name = theme.as_deref();
-            let chrome_options = chrome_options_from_args(&config, chrome, title);
-            let (image_path, plain_text) = renderer.render_bytes(
+            let chrome_options = chrome_options_from_args(
+                &config,
+                chrome,
+                title,
+                timestamp,
+                rounded_override(rounded, no_rounded),
+                None,
+            );
+            let output_name = if input == "-" {
+                Some("render".to_string())
+            } else {
+                std::path::Path::new(&input)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+            };
+
+            // `render` honors the same redaction policy as `exec`: rendering a
+            // captured log is exactly the case where the content has not been
+            // eyeballed first.
+            let redaction_engine =
+                resolve_redaction(&config, redact, redact_rules.as_deref(), no_redact)?;
+            let redaction_request = redaction_engine.as_ref().map(|engine| RedactionRequest {
+                engine,
+                rules: redact_rules.as_ref().map(|s| parse_rule_list(s)),
+            });
+
+            let (image_path, plain_text, redactions, _meta) = renderer.render_bytes(
                 &data,
                 cols,
                 rows,
                 &config.output_dir,
+                output_name.as_deref(),
                 theme_name,
                 chrome_options.as_ref(),
+                redaction_request.as_ref(),
+                TextOptions {
+                    strip_ansi: plain_text,
+                    redact_text,
+                    embed_description: config.embed_description && !no_description,
+                },
+                auto_crop,
             )?;
 
+            if !redactions.is_empty() {
+                let summary = redactions
+                    .iter()
+                    .map(|(name, count)| format!("{}x {}", count, name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!("Redacted: {}", summary);
+            }
+
             let final_path = if let Some(out) = output {
-                let out = std::path::PathBuf::from(&out);
-                std::fs::rename(&image_path, &out)?;
-                out
+                move_screenshot(&image_path, &out)?
             } else {
                 image_path
             };
@@ -238,9 +510,42 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("--- Terminal Output ---");
             eprint!("{}", plain_text);
         }
+        Commands::Compose {
+            images,
+            layout,
+            divider,
+            theme,
+            chrome,
+            title,
+            output,
+        } => {
+            let renderer = Renderer::new(
+                config.font_path.as_deref(),
+                None,
+                config.font_size,
+                &config.themes,
+                &config.default_theme,
+                &config.chrome,
+            )?;
+            let layout = ComposeLayout::parse(&layout)?;
+            let chrome_options =
+                chrome_options_from_args(&config, chrome, title, false, None, None);
+            let output_path = output.map(PathBuf::from);
+            let path = renderer.compose_screenshots(
+                &images,
+                layout,
+                divider,
+                theme.as_deref(),
+                chrome_options.as_ref(),
+                &config.output_dir,
+                output_path.as_deref(),
+            )?;
+            println!("{}", path.display());
+        }
         Commands::Themes => {
             let renderer = Renderer::new(
-                &config.font_path,
+                config.font_path.as_deref(),
+                None,
                 config.font_size,
                 &config.themes,
                 &config.default_theme,
@@ -249,10 +554,15 @@ async fn main() -> anyhow::Result<()> {
             let names = renderer.theme_names();
             let default = &config.default_theme;
             for name in &names {
-                if name == default {
-                    println!("{} (default)", name);
+                let kind = if config.user_theme_names.contains(name) {
+                    "user"
                 } else {
-                    println!("{}", name);
+                    "built-in"
+                };
+                if name == default {
+                    println!("{} ({}, default)", name, kind);
+                } else {
+                    println!("{} ({})", name, kind);
                 }
             }
         }
@@ -261,22 +571,115 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve whether redaction should run for this invocation and, if so, build
+/// the engine. Shared by `exec` and `render` so both entry points honor the
+/// same `[redaction] enabled/auto` policy: an explicit request fails closed if
+/// the engine cannot be built, while automatic redaction degrades to a warning.
+fn resolve_redaction(
+    config: &Config,
+    redact: bool,
+    redact_rules: Option<&str>,
+    no_redact: bool,
+) -> anyhow::Result<Option<RedactionEngine>> {
+    let want_redact = redact || redact_rules.is_some();
+    // The master switch wins over an explicit request, but silently returning
+    // an unredacted screenshot to someone who typed --redact would be worse
+    // than failing.
+    if explicit_request_is_blocked(&config.redaction, want_redact, no_redact) {
+        anyhow::bail!(REDACTION_DISABLED_MSG);
+    }
+    if !resolve_should_redact(&config.redaction, want_redact, no_redact) {
+        return Ok(None);
+    }
+    match RedactionEngine::from_config(&config.redaction) {
+        Ok(engine) => {
+            // An explicit --redact-rules list with an unknown name must fail
+            // loudly instead of silently redacting nothing.
+            if let Some(rules) = redact_rules {
+                engine.validate_rule_names(&parse_rule_list(rules))?;
+            }
+            Ok(Some(engine))
+        }
+        Err(e) if want_redact => Err(anyhow::anyhow!(
+            "redaction was requested but could not be enabled: {}",
+            e
+        )),
+        Err(e) => {
+            // Auto-redaction is best-effort: warn and continue.
+            eprintln!("(auto-redaction disabled: {})", e);
+            Ok(None)
+        }
+    }
+}
+
 fn chrome_options_from_args(
     config: &Config,
     chrome: Option<String>,
     title: Option<String>,
+    timestamp: bool,
+    rounded: Option<bool>,
+    inferred_title: Option<&str>,
 ) -> Option<ChromeOptions> {
-    if chrome.is_none() && title.is_none() {
-        return None;
-    }
-
+    let has_overrides = chrome.is_some() || title.is_some() || timestamp || rounded.is_some();
     let mut options = ChromeOptions::from_config(&config.chrome);
     if let Some(preset) = chrome {
         options.enabled = preset != "none";
         options.preset = preset;
     }
-    if title.is_some() {
-        options.title = title;
+    if let Some(title) = title {
+        options.title = Some(title);
+    } else if options.enabled {
+        options.title = inferred_title.map(str::to_owned);
+    }
+    if timestamp {
+        options.timestamp = true;
+    }
+    if let Some(rounded) = rounded {
+        options.rounded = rounded;
+    }
+
+    if !(has_overrides || options.enabled && inferred_title.is_some()) {
+        return None;
     }
     Some(options)
+}
+
+/// Collapse the `--rounded` / `--no-rounded` flag pair into an explicit
+/// override: `Some(false)` when `--no-rounded` was given, `Some(true)` when
+/// `--rounded` was given, and `None` when neither was passed (so the config
+/// default applies). The two flags `overrides_with` each other, so the last one
+/// on the command line wins.
+fn rounded_override(rounded: bool, no_rounded: bool) -> Option<bool> {
+    if no_rounded {
+        Some(false)
+    } else if rounded {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Parse a comma-separated `--redact-rules` list into rule names, dropping
+/// empty entries and surrounding whitespace.
+fn parse_rule_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|r| r.trim())
+        .filter(|r| !r.is_empty())
+        .map(|r| r.to_string())
+        .collect()
+}
+
+/// Move a rendered screenshot to a user-specified output path. Falls back to a
+/// copy + delete when the source and destination are on different filesystems
+/// (where a plain rename fails).
+fn move_screenshot(src: &std::path::Path, dst: &str) -> anyhow::Result<PathBuf> {
+    let dst = PathBuf::from(dst);
+    match std::fs::rename(src, &dst) {
+        Ok(()) => Ok(dst),
+        Err(_) => {
+            std::fs::copy(src, &dst)?;
+            std::fs::remove_file(src).ok();
+            Ok(dst)
+        }
+    }
 }

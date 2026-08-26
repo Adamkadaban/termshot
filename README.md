@@ -1,294 +1,249 @@
-# termshot
+<h1 align="center">termshot</h1>
 
-`termshot` is a Rust CLI and MCP server for capturing terminal screenshots with ANSI escape sequences fully rendered into PNGs.
+<p align="center">
+  Terminal screenshots as PNGs, with ANSI colors fully rendered.
+</p>
 
-It is built for workflows like pentesting, operator runbooks, and agent tooling where plain text is not enough and you want the terminal output to look like a terminal.
+<p align="center">
+  <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue"></a>
+  <img alt="Made with vibes" src="https://img.shields.io/badge/made_with-vibes-ff69b4">
+  <img alt="Rust" src="https://img.shields.io/badge/rust-stable-orange">
+</p>
 
-## What It Does
+---
 
-- Executes commands in a PTY so shell prompts, colors, cursor movement, and formatting are preserved
-- Renders terminal state to PNG using a bundled monospace font
-- Works as both:
-  - a standalone CLI
-  - an MCP server over stdio
-- Supports multiple themes, including a built-in `adamkadaban` theme captured from the local GNOME Terminal profile
-- Preserves intermediate prompts for multi-command sessions while stripping the trailing prompt
-- Supports optional terminal chrome presets such as `gnome`, `macos`, and `report`
+Run a command, get a PNG that looks like your terminal. Works as a
+standalone CLI and as an MCP server for AI agents. Built for pentest
+reports, blog posts, and PR descriptions.
 
-## Status
+<p align="center">
+  <img src="docs/assets/hero.png" alt="termshot capturing a colorized 'ls -la' of the source tree with the shell prompt visible, framed in a GNOME window with the command as its title" width="700">
+</p>
 
-Core functionality is working:
+```sh
+termshot exec --chrome gnome --title 'termshot — ls src/' 'ls --color=always -la src/'
+```
 
-- CLI command execution
-- MCP server mode
-- ANSI rendering to PNG
-- PS1 prompt capture
-- multiple command support
-- title-sequence stripping (`ESC k ... ESC \\`, OSC title updates)
+## Highlights
 
-Stretch goals like redaction and terminal chrome are planned and documented locally in `REDACTION.md` and `TERMINAL_CHROME.md`.
+**Real ANSI rendering** - colors, bold, italic, underline, Unicode.
+Rendered at 2x resolution with your own font.
+
+<p align="center">
+  <img src="docs/assets/ansi.png" alt="Screenshot of a colorized 'git log --graph --oneline' with orange commit hashes rendered next to the shell prompt" width="700">
+</p>
+
+```sh
+termshot exec 'git log --graph --oneline --color=always -n 6'
+```
+
+**Redaction** - opt-in masking of secrets in the image (`--redact`, or
+`auto = true` in config). Text returned to the caller preserves originals so
+agents can inspect and selectively redact.
+
+<p align="center">
+  <img src="docs/assets/redaction.png" alt="Screenshot of an accidentally cat'd .env.staging file where the AWS key, secret, database URL, GitHub token, and Stripe key are each partially masked by red blocks labeled AWSKEY, SECRET, DBURL, GITHUB, and STRIPE - the identifying prefix stays visible so you can see the secret type but not its value" width="700">
+</p>
+
+```sh
+# `command cat` bypasses the shell alias: termshot runs your interactive shell,
+# where `cat` is often `bat`/`batcat` and would add its own frame and line numbers
+termshot exec --redact --chrome gnome 'command cat .env.staging'
+
+# the labelled, prefix-preserving blocks above come from custom rules using
+# `keep_prefix`: drop a .toml in ~/.config/termshot/rules/ and it is picked up
+# automatically - see docs/redaction.md
+```
+
+Set `[redaction] enabled = false` in the config to turn redaction off entirely;
+with it off, an explicit `--redact` fails loudly instead of quietly writing an
+unredacted image.
+
+**Themes** - 11 built-in (using the bundled JetBrains Mono), plus user themes
+with custom fonts at `~/.config/termshot/themes/`.
+
+<p align="center">
+  <img src="docs/assets/themes.png" alt="The same colorized 'git log' command rendered in three themes - adamkadaban, dracula, and nord - stacked with thin dividers to show their different backgrounds and palettes" width="700">
+</p>
+
+```sh
+for theme in adamkadaban dracula nord; do
+  termshot exec --theme "$theme" --no-rounded -o "$theme.png" \
+    'git log --oneline --color=always -n 4'
+done
+termshot compose --divider 4 -o themes.png adamkadaban.png dracula.png nord.png
+```
+
+**Chrome frames** - title bar presets with optional timestamp. Good for
+reports and blog posts.
+
+<p align="center">
+  <img src="docs/assets/chrome.png" alt="An 'nmap -F localhost' service scan showing port 3000 open, rendered with a GNOME-style title bar, rounded corners, and a UTC timestamp watermark in the corner like a pentest report screenshot" width="700">
+</p>
+
+```sh
+termshot exec --chrome gnome --timestamp 'nmap -F localhost'
+```
+
+**Composition** - combine screenshots side by side or stacked (tmux-style)
+for before/after comparisons.
+
+<p align="center">
+  <img src="docs/assets/compose.png" alt="A side-by-side before/after of 'git status -su' while staging a feature in a rate-limiter crate: the left pane lists five modified files and three untracked ones in red, the right pane shows the same eight files staged in green after git add, both with the shell prompt and command visible, joined by a thin vertical tmux-style divider in one window" width="820">
+</p>
+
+```sh
+termshot exec -o before.png 'git status -su'
+git add -A
+termshot exec -o after.png 'git status -su'
+termshot compose --layout horizontal --chrome gnome \
+  --title 'git status — before / after staging' -o compose.png before.png after.png
+```
+
+**MCP server** - four tools for agent workflows:
+`execute_and_screenshot`, `render_ansi`, `redact_screenshot`,
+`compose_screenshots`.
 
 ## Install
 
-### Local development
-
-```bash
-cargo build
+```sh
+git clone https://github.com/Adamkadaban/termshot
+cd termshot
+cargo build --release
+# binary at ./target/release/termshot
 ```
 
-Run directly:
+### Debian/Ubuntu package
 
-```bash
-cargo run -- themes
-cargo run -- exec "ls -la"
-cargo run -- mcp
-```
+Release builds publish a `.deb` for `x86_64` and `aarch64`. It installs the
+binary to `/usr/bin/termshot`, the man page to
+`/usr/share/man/man1/termshot.1.gz`, and a sample config to
+`/usr/share/doc/termshot/config.toml.example`.
 
-### Install as a CLI
+The package does not write a user config. On first run any command that touches
+config - for example `termshot themes` - bootstraps
+`~/.config/termshot/` (including `config.toml`), so your settings are never
+overwritten by upgrades.
 
-```bash
-cargo install --path .
-```
+## Usage
 
-This installs the binary as `termshot`.
+```sh
+# basic screenshot
+termshot exec 'ls --color=always -la'
 
-## CLI Usage
+# with chrome and theme
+termshot exec --chrome gnome --theme dracula 'git log --oneline'
 
-### Execute a command and capture a screenshot
+# auto-redact secrets in the image
+termshot exec --redact 'cat credentials.txt'
 
-```bash
-termshot exec "ls -la"
-```
+# square (un-rounded) corners; corners are rounded by default
+termshot exec --no-rounded 'ls --color=always'
 
-Prints the screenshot path to `stdout` and the textual output to `stderr`.
+# render pre-captured ANSI without executing anything: from a pipe or a file
+cmd --color=always | termshot render -
+termshot render output.log --redact
 
-### Multiple commands, each with its own prompt
+# side-by-side comparison
+termshot compose -o diff.png before.png after.png
 
-```bash
-termshot exec "pwd" "whoami" "echo hello"
-```
-
-This renders:
-
-```text
-PS1$ pwd
-/path/to/repo
-PS1$ whoami
-adam
-PS1$ echo hello
-hello
-```
-
-The trailing prompt is stripped.
-
-### Run without the prompt
-
-```bash
-termshot exec --no-prompt -- ls --color=always /tmp
-```
-
-### Pick a theme
-
-```bash
-termshot exec --theme adamkadaban "ls -la"
-termshot exec --theme catppuccin-mocha "git status"
-```
-
-### Add terminal chrome
-
-```bash
-termshot exec --chrome gnome --title "nmap scan" "nmap -sV 10.0.0.1"
-termshot exec --chrome macos --title "operator shell" "whoami"
-```
-
-### Write to a specific file
-
-```bash
-termshot exec -o screenshot.png "nmap -sV 10.0.0.1"
-```
-
-### Render an ANSI file directly
-
-```bash
-termshot render session.ansi
-termshot render --theme dracula -o render.png session.ansi
-```
-
-### List built-in themes
-
-```bash
+# list themes
 termshot themes
 ```
 
-## MCP Usage
+`termshot render` reads raw ANSI data (from a file, or from stdin with `-`) and
+renders it to a PNG **without executing anything** - handy for piping the output
+of a command you have already run, or for previously saved logs. Bare `\n` line
+endings from non-TTY output are handled automatically. It takes the same
+`--redact` / `--no-redact` flags as `exec`.
 
-Start the MCP server on stdio:
+### Your shell, your environment
 
-```bash
-termshot mcp
+`termshot exec` runs the command in a real PTY through your shell as a **login
++ interactive** shell (`$SHELL -l -i`), so it sources your profile
+(`~/.bashrc`, `~/.zshrc`, ...) and inherits the environment you normally work
+in: prompt (PS1), aliases and shell functions, `PATH`, exports, and shell
+options. That is what makes a screenshot look like *your* terminal.
+
+It also means aliases apply. If `cat` is aliased to `bat`/`batcat`, then
+`termshot exec 'cat file'` screenshots *bat's* framed, line-numbered output.
+Bypass an alias the same way you would interactively:
+
+```sh
+termshot exec 'command cat .env.staging'   # ignore the alias, run the real cat
+termshot exec '\cat .env.staging'           # same, via backslash
+termshot exec --no-prompt 'cat .env.staging'  # non-interactive: no aliases at all
 ```
 
-### MCP tools
+The screen is reset before the command runs, so shell startup banners (MOTD,
+version notices) stay out of the image and every capture shows exactly one
+prompt: the one in front of your command. The trailing prompt the shell draws
+afterwards is removed too, including the upper lines of a multi-line PS1.
 
-#### `execute_and_screenshot`
+`--no-prompt` runs the command non-interactively instead (`$SHELL -c`), so
+there is no PS1 in the image and interactive-only startup files are not
+sourced. Set `shell` in the config (or `TERMSHOT_SHELL`) to capture with a
+different shell.
 
-Runs a command in a PTY and returns:
+**Accessibility** - every PNG embeds its terminal text (the redacted version
+when redaction ran) in a `Description` metadata chunk, so screen readers can
+read the screenshot. Disable per run with `--no-description`, or globally with
+`embed_description = false`.
 
-- screenshot path
-- status / exit code
-- plain text terminal output
+### Known limitations
 
-If `commands` is provided, each command is executed on its own line and gets its own PS1 prompt.
+- **One font, no fallback chain.** Every glyph is rasterized from the single
+  configured font (bundled JetBrains Mono by default). Codepoints that font does
+  not cover - CJK, emoji, and some box-drawing or Powerline glyphs used by tools
+  like `bat`, `btop`, or `eza` - render as `.notdef` boxes. Point `font` /
+  `font_bold` at a face with wider coverage (a Nerd Font, for example) when
+  capturing such output.
+- **Unix only.** termshot uses PTYs and POSIX signals; Linux and macOS are
+  supported, Windows is not.
 
-Parameters:
+## Tips
+
+```sh
+# screenshot the last command you ran (bash/zsh history expansion)
+termshot exec '!!'
+
+# alias for quick screenshots
+alias tshot='termshot exec'
+tshot 'git status'
+
+# render pre-captured ANSI output from a file or pipe
+cmd --color=always | termshot render -
+termshot render output.log
+```
+
+`!!` is expanded by your shell before termshot ever sees it, so you get a
+screenshot of your previous command line and its output.
+
+## MCP server
+
+Add to your MCP client config:
 
 ```json
 {
-  "command": "ls -la",
-  "commands": ["pwd", "whoami"],
-  "cols": 120,
-  "rows": 40,
-  "timeout_secs": 30,
-  "show_prompt": true,
-  "theme": "adamkadaban",
-  "chrome": "gnome",
-  "title": "operator shell"
+  "mcpServers": {
+    "termshot": {
+      "command": "/path/to/termshot",
+      "args": ["mcp"]
+    }
+  }
 }
 ```
 
-#### `render_ansi`
+## Docs
 
-Renders a file containing raw ANSI terminal output:
+- [docs/mcp.md](./docs/mcp.md) - MCP server setup, tool reference, and
+  agent workflow examples
+- [docs/themes.md](./docs/themes.md) - theme format, built-in list, user
+  themes, and font config
+- [docs/redaction.md](./docs/redaction.md) - redaction rules, custom YAML
+  format, partial redaction, and labels
+- [docs/config.md](./docs/config.md) - full `config.toml` reference
 
-```json
-{
-  "input_path": "/tmp/captured.ansi",
-  "cols": 120,
-  "rows": 40,
-  "theme": "dracula",
-  "chrome": "report",
-  "title": "captured session"
-}
-```
+## License
 
-## Config File
-
-Default lookup order:
-
-1. `--config <path>`
-2. `~/.config/termshot/config.toml`
-3. `./termshot.toml`
-
-Example config:
-
-```toml
-output_dir = "/tmp/screenshot-mcp"
-font_size = 16.0
-cols = 120
-rows = 40
-timeout_secs = 30
-default_theme = "adamkadaban"
-
-[chrome]
-enabled = false
-preset = "none"
-title = "termshot"
-shadow = true
-radius = 14
-outer_padding = 18
-title_bar_height = 34
-
-[themes.my-theme]
-foreground = "#e0e0e0"
-background = "#10141a"
-palette = [
-  "#10141a", "#ff6b6b", "#51cf66", "#fcc419",
-  "#4dabf7", "#b197fc", "#22b8cf", "#ced4da",
-  "#495057", "#ff8787", "#69db7c", "#ffd43b",
-  "#74c0fc", "#d0bfff", "#66d9e8", "#f8f9fa",
-]
-```
-
-See `termshot.example.toml` for a starting point.
-
-### Environment variables
-
-- `SCREENSHOT_MCP_OUTPUT_DIR`
-- `SCREENSHOT_MCP_FONT_PATH`
-- `SCREENSHOT_MCP_FONT_SIZE`
-- `SCREENSHOT_MCP_COLS`
-- `SCREENSHOT_MCP_ROWS`
-- `SCREENSHOT_MCP_TIMEOUT`
-- `SCREENSHOT_MCP_SHELL`
-- `SCREENSHOT_MCP_THEME`
-- `SCREENSHOT_MCP_CHROME`
-
-## Built-in Themes
-
-- `adamkadaban`
-- `dark`
-- `catppuccin-mocha`
-- `catppuccin-latte`
-- `catppuccin-frappe`
-- `catppuccin-macchiato`
-- `dracula`
-- `nord`
-- `gruvbox-dark`
-- `solarized-dark`
-- `solarized-light`
-- `tokyo-night`
-
-## Current Limitations
-
-- Redaction is documented but not implemented yet
-- Chrome is intentionally lightweight today and not yet a pixel-perfect GNOME Terminal clone
-- `--no-prompt` mode shells out via `-c`, so shell-specific quoting/escaping behavior still applies
-- MCP still prefers `command` for backward compatibility, even though `commands` is now supported
-
-## Testing
-
-Run unit tests:
-
-```bash
-cargo test
-```
-
-Current tests cover:
-
-- stripping GNU Screen and OSC title sequences
-- preserving row boundaries when rebuilding ANSI from the vt100 screen
-- preserving intermediate prompts while removing trailing sentinel/prompt rows
-- chrome-related code paths compile and are exercised by CLI smoke checks
-
-## Release Workflow
-
-GitHub Actions builds release binaries for:
-
-- Linux x86_64
-- Linux aarch64
-- macOS x86_64
-- macOS aarch64
-
-Create a tag like `v0.1.0` to trigger a release.
-
-## Roadmap
-
-### Terminal chrome
-
-Planned in `TERMINAL_CHROME.md`.
-
-High-level direction:
-
-- add a decorative terminal frame around the rendered content
-- support multiple chrome presets (plain, GNOME-like, macOS-like, minimal)
-- allow title text, tab label, shadow, padding, corner radius, and DPI scaling
-
-### Redaction
-
-Planned in `REDACTION.md`.
-
-High-level direction:
-
-- regex-based rules first
-- optional local-LLM-assisted redaction
-- redact at the terminal-cell layer before PNG rendering
+[MIT](./LICENSE)
