@@ -5,10 +5,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Adamkadaban/termshot/releases">
-    <img alt="Latest release" src="https://img.shields.io/github/v/tag/Adamkadaban/termshot?label=release&sort=semver">
-  </a>
-  <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue"></a>
+  <a href="https://github.com/Adamkadaban/termshot/releases"><img alt="Latest release" src="https://img.shields.io/github/v/tag/Adamkadaban/termshot?label=release&sort=semver&color=brightgreen"></a>&nbsp;
+  <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue"></a>&nbsp;
   <img alt="Made with vibes" src="https://img.shields.io/badge/made_with-vibes-ff69b4">
 </p>
 
