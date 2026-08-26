@@ -365,7 +365,7 @@ fn out_of_bounds_coordinates_are_rejected() {
         "unhelpful error: {message}"
     );
     assert!(
-        message.contains("renders 2 row(s) x 3 column(s)"),
+        message.contains("renders 1 row(s) x 3 column(s)"),
         "the error must name the rendered bounds: {message}"
     );
 

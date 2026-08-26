@@ -34,6 +34,23 @@ const RENDER_SCALE: u32 = 2;
 /// PNG. Any real content is trimmed to its exact bound.
 const MIN_CONTENT_COLS: u32 = 1;
 
+/// Shortest image, in terminal cells, that height trimming will produce, so an
+/// empty capture still renders as a small padded tile instead of a zero-height
+/// PNG. Any real content is trimmed to its exact bound.
+const MIN_CONTENT_ROWS: u32 = 1;
+
+/// Fraction of the terminal font size the chrome timestamp watermark is drawn
+/// at. Shared by the layout reserve and the draw call so the strip below the
+/// terminal is measured with the size the text is actually rendered at.
+const TIMESTAMP_FONT_SCALE: f32 = 0.65;
+
+/// Breathing room, in unscaled pixels, above and below the timestamp watermark.
+/// The reserve below the terminal is one line of timestamp text plus this gap
+/// on each side - enough that the text is never clipped and never crowds the
+/// last row of output, and nothing like the full blank terminal row that used
+/// to sit there.
+const TIMESTAMP_GAP: u32 = 4;
+
 /// Largest image, in pixels, that will be rendered.
 ///
 /// A capture of a command that printed tens of thousands of lines would
@@ -1522,13 +1539,13 @@ impl Renderer {
     /// The `(rows, cols)` of `screen` a render with these settings actually
     /// paints.
     ///
-    /// Not the same as [`CapturedScreen::size`]: the renderer stops at one row
-    /// past the last row holding content, and with `auto_crop` it stops at the
-    /// rightmost column holding content too, so a retained grid is routinely
-    /// taller and wider than the image made from it. Callers that address cells
-    /// in a finished screenshot - a coordinate redaction, say - have to be
-    /// checked against *these* bounds, because a cell outside them is counted
-    /// by the capture but never drawn.
+    /// Not the same as [`CapturedScreen::size`]: the renderer stops at the last
+    /// row holding content, and with `auto_crop` it stops at the rightmost
+    /// column holding content too, so a retained grid is routinely taller and
+    /// wider than the image made from it. Callers that address cells in a
+    /// finished screenshot - a coordinate redaction, say - have to be checked
+    /// against *these* bounds, because a cell outside them is counted by the
+    /// capture but never drawn.
     pub fn rendered_bounds(
         &self,
         screen: &CapturedScreen,
@@ -1766,7 +1783,12 @@ impl Renderer {
             // into a buffer of its own that is then copied in: one full-size
             // layer instead of two, for an image that is already the largest
             // allocation in the process.
-            let metrics = ChromeMetrics::new(chrome, layout.width, layout.height);
+            let metrics = ChromeMetrics::new(
+                chrome,
+                layout.width,
+                layout.height,
+                self.timestamp_reserve(fonts),
+            );
             metrics.check_budget(screen)?;
             return Ok(self.compose_with_chrome_layer(
                 theme,
@@ -1988,7 +2010,12 @@ impl Renderer {
         if !chrome.enabled {
             return terminal;
         }
-        let metrics = ChromeMetrics::new(chrome, terminal.width(), terminal.height());
+        let metrics = ChromeMetrics::new(
+            chrome,
+            terminal.width(),
+            terminal.height(),
+            self.timestamp_reserve(fonts),
+        );
         self.compose_with_chrome_layer(theme, fonts, chrome, &metrics, |_, frame, ox, oy| {
             for y in 0..terminal.height() {
                 for x in 0..terminal.width() {
@@ -2093,7 +2120,7 @@ impl Renderer {
                 center_y,
                 &timestamp,
                 color,
-                self.font_size * 0.65 * scale as f32,
+                self.timestamp_font_size(),
             );
         }
 
@@ -2493,6 +2520,24 @@ impl Renderer {
         );
     }
 
+    /// Font size, in device pixels, the chrome timestamp watermark is drawn at.
+    fn timestamp_font_size(&self) -> f32 {
+        self.font_size * TIMESTAMP_FONT_SCALE * RENDER_SCALE as f32
+    }
+
+    /// Vertical strip, in device pixels, to reserve below the terminal for the
+    /// timestamp watermark: exactly one line of timestamp text plus a small gap
+    /// above and below it.
+    ///
+    /// [`Self::draw_text_at`] centers a line on the y it is given, so the text
+    /// occupies `line_height` around `bottom_pad / 2`; reserving at least that
+    /// much keeps it inside the frame, and the gap keeps it off both the last
+    /// row of output and the window's bottom edge.
+    fn timestamp_reserve(&self, fonts: &ThemeFonts) -> u32 {
+        let line_height = font_line_height(&fonts.font, self.timestamp_font_size()).ceil() as u32;
+        line_height + TIMESTAMP_GAP * RENDER_SCALE * 2
+    }
+
     fn text_width(&self, fonts: &ThemeFonts, text: &str, size: f32) -> u32 {
         // The chrome font is monospace, so every character occupies one fixed
         // cell whose width is derived from 'M'. Using a single cell advance for
@@ -2551,6 +2596,15 @@ impl Renderer {
         }
     }
 
+    /// Scan the screen buffer for the last row that holds meaningful content
+    /// and return the height, in cells, to render.
+    ///
+    /// No spare row is added. The image's normal [`Self::padding`] is the only
+    /// gap kept below the last line, so a capture has the same visual margin
+    /// above its first row and below its last one. Reserving an extra blank
+    /// terminal row here would double the bottom margin - a whole cell of
+    /// background plus the padding - and make every screenshot look
+    /// bottom-heavy.
     fn find_content_rows(&self, screen: &CapturedScreen, rows: u32, cols: u32) -> u32 {
         let mut last_row_with_content = 0u32;
         for row in 0..rows {
@@ -2567,7 +2621,9 @@ impl Renderer {
                 }
             }
         }
-        (last_row_with_content + 1).min(rows)
+        // A floor keeps an empty capture from collapsing to a zero-height
+        // image; it never extends output that already has content past it.
+        last_row_with_content.max(MIN_CONTENT_ROWS).min(rows)
     }
 
     /// Scan the screen buffer for the rightmost column that holds meaningful
@@ -3013,7 +3069,10 @@ struct ChromeMetrics {
 }
 
 impl ChromeMetrics {
-    fn new(chrome: &ChromeOptions, term_w: u32, term_h: u32) -> Self {
+    /// `timestamp_reserve` is the height the caller measured for the timestamp
+    /// watermark (see [`Renderer::timestamp_reserve`]); it is only used when
+    /// the timestamp is actually enabled.
+    fn new(chrome: &ChromeOptions, term_w: u32, term_h: u32, timestamp_reserve: u32) -> Self {
         let scale = RENDER_SCALE;
         let radius = if chrome.rounded {
             chrome.radius * scale
@@ -3026,8 +3085,12 @@ impl ChromeMetrics {
         };
         let shadow = if chrome.shadow { 16 * scale } else { 0 };
         let frame_pad = chrome.outer_padding * scale;
+        // Only a timestamp earns extra space below the terminal, and only as
+        // much as the text it has to hold: the terminal image already carries
+        // its own symmetric padding, so anything more would show up as a
+        // lopsided bottom margin.
         let bottom_pad = if chrome.timestamp {
-            frame_pad.max(18 * scale)
+            frame_pad.max(timestamp_reserve)
         } else {
             frame_pad
         };
@@ -3164,6 +3227,9 @@ mod tests {
         assert!(result.height() > 50);
     }
 
+    /// A timestamp is the only thing that earns space below the terminal, and
+    /// it earns only as much as the text needs: one line plus a small gap,
+    /// never the height of a terminal row.
     #[test]
     fn timestamp_reserves_bottom_padding() {
         let renderer = renderer_with_chrome(ChromeOptions {
@@ -3197,8 +3263,300 @@ mod tests {
             &chrome,
         );
         // Chrome metrics are drawn at RENDER_SCALE (2x): title bar 34*2=68 and
-        // the timestamp reserves max(0, 18*2)=36 of bottom padding.
-        assert_eq!(result.height(), 50 + 68 + 36);
+        // the timestamp reserves exactly one measured line of watermark text.
+        let reserve = renderer.timestamp_reserve(&renderer.default_fonts);
+        assert_eq!(result.height(), 50 + 68 + reserve);
+
+        // The reserve is the text plus its gap and nothing else - in
+        // particular it is smaller than the blank terminal row that used to
+        // pad the bottom of every capture.
+        let line_height =
+            font_line_height(&renderer.default_fonts.font, renderer.timestamp_font_size()).ceil()
+                as u32;
+        assert_eq!(reserve, line_height + TIMESTAMP_GAP * RENDER_SCALE * 2);
+        assert!(
+            reserve
+                < renderer.default_fonts.cell_height * RENDER_SCALE
+                    + renderer.padding * RENDER_SCALE,
+            "the timestamp reserve grew back into a blank terminal row: {reserve}"
+        );
+    }
+
+    /// Without a timestamp the frame adds nothing below the terminal beyond the
+    /// outer padding, so the terminal's own symmetric padding is the whole
+    /// bottom margin.
+    #[test]
+    fn no_timestamp_reserves_no_extra_bottom_space() {
+        let renderer = bare_renderer();
+        let base = ChromeOptions {
+            enabled: true,
+            preset: "report".to_string(),
+            title: None,
+            timestamp: false,
+            shadow: false,
+            radius: 14,
+            rounded: true,
+            outer_padding: 0,
+            title_bar_height: 34,
+        };
+        let with_stamp = ChromeOptions {
+            timestamp: true,
+            ..base.clone()
+        };
+
+        let compose = |chrome: &ChromeOptions| {
+            renderer.compose_with_chrome(
+                ImageBuffer::from_pixel(100, 50, Rgba([10, 10, 10, 255])),
+                &Theme::dark(),
+                &renderer.default_fonts,
+                chrome,
+            )
+        };
+
+        let plain = compose(&base);
+        assert_eq!(plain.height(), 50 + 34 * RENDER_SCALE);
+        assert_eq!(
+            compose(&with_stamp).height() - plain.height(),
+            renderer.timestamp_reserve(&renderer.default_fonts)
+        );
+    }
+
+    /// The timestamp watermark must sit entirely inside the image it is drawn
+    /// into: the reserve is measured from the same font metrics the text is
+    /// drawn with, so no glyph can spill past the bottom edge.
+    #[test]
+    fn timestamp_pixels_stay_inside_the_image() {
+        let mut renderer = bare_renderer();
+        renderer.themes.insert("dark".to_string(), Theme::dark());
+        let theme = Theme::dark();
+        let chrome = ChromeOptions {
+            enabled: true,
+            preset: "report".to_string(),
+            title: None,
+            timestamp: true,
+            shadow: false,
+            radius: 0,
+            rounded: false,
+            outer_padding: 0,
+            title_bar_height: 34,
+        };
+        let captured = screen_of(b"hello", 6, 40);
+        let img = renderer
+            .render_to_image(
+                &captured,
+                &theme,
+                &renderer.default_fonts,
+                &chrome,
+                None,
+                true,
+            )
+            .unwrap();
+
+        let layout = renderer.screen_layout(&captured, &renderer.default_fonts, true);
+        let reserve = renderer.timestamp_reserve(&renderer.default_fonts);
+        assert_eq!(
+            img.height(),
+            layout.height + 34 * RENDER_SCALE + reserve,
+            "the frame reserved something other than the timestamp strip"
+        );
+
+        // Ink from the watermark exists inside the reserved strip...
+        let strip_top = img.height() - reserve;
+        let inked_rows: Vec<u32> = (strip_top..img.height())
+            .filter(|&y| (0..img.width()).any(|x| *img.get_pixel(x, y) != theme.background))
+            .collect();
+        assert!(
+            !inked_rows.is_empty(),
+            "the timestamp was not drawn in its reserved strip"
+        );
+        // ...and it is clear of both edges of the strip, so it is neither
+        // clipped nor jammed against the last row of output.
+        assert!(
+            *inked_rows.first().unwrap() > strip_top,
+            "timestamp ink touches the top of its reserve"
+        );
+        assert!(
+            *inked_rows.last().unwrap() < img.height() - 1,
+            "timestamp ink touches the bottom edge of the image"
+        );
+    }
+
+    /// The bottom margin of a one-line capture matches its top margin: no
+    /// blank terminal row is padded in below the text.
+    ///
+    /// Measured on a row of colored background rather than on glyphs, because
+    /// a background block fills its cell exactly - so the ink band *is* the
+    /// terminal row and the gap on either side of it is the padding itself.
+    #[test]
+    fn a_single_line_has_matching_top_and_bottom_padding() {
+        let renderer = bare_renderer();
+        let theme = Theme::dark();
+        let captured = screen_of(b"\x1b[41m     \x1b[0m", 24, 80);
+        let img = renderer
+            .render_screen(&captured, &theme, &renderer.default_fonts, None, true)
+            .unwrap();
+
+        let cell_h = renderer.default_fonts.cell_height * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        assert_eq!(img.height(), cell_h + padding * 2);
+
+        let inked = |y: u32| (0..img.width()).any(|x| *img.get_pixel(x, y) != theme.background);
+        let top = (0..img.height())
+            .find(|&y| inked(y))
+            .expect("content drawn");
+        let bottom = (0..img.height()).rev().find(|&y| inked(y)).unwrap();
+        let top_margin = top;
+        let bottom_margin = img.height() - 1 - bottom;
+        assert_eq!(top_margin, padding);
+        assert!(
+            (top_margin as i32 - bottom_margin as i32).abs() <= 1,
+            "asymmetric vertical padding: {top_margin}px above, {bottom_margin}px below"
+        );
+    }
+
+    /// A one-line capture of ordinary text is one cell tall plus its padding:
+    /// the blank row the terminal leaves the cursor on is not drawn, and the
+    /// glyphs still sit inside that single cell, so the padding above and below
+    /// them is untouched on both sides.
+    #[test]
+    fn a_single_line_of_text_is_exactly_one_cell_tall() {
+        let renderer = renderer_with_measured_cells();
+        let theme = Theme::dark();
+        let captured = screen_of(b"hello, jq!", 24, 80);
+        let img = renderer
+            .render_screen(&captured, &theme, &renderer.default_fonts, None, true)
+            .unwrap();
+
+        let cell_h = renderer.default_fonts.cell_height * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        assert_eq!(img.height(), cell_h + padding * 2);
+
+        let inked = |y: u32| (0..img.width()).any(|x| *img.get_pixel(x, y) != theme.background);
+        let top = (0..img.height()).find(|&y| inked(y)).expect("text drawn");
+        let bottom = (0..img.height()).rev().find(|&y| inked(y)).unwrap();
+        assert!(
+            top >= padding && bottom < padding + cell_h,
+            "glyph ink escaped its cell: rows {top}..={bottom} of {}",
+            img.height()
+        );
+    }
+
+    /// Multi-line output ends at its last line: there is no full blank cell of
+    /// terminal background between the last glyph row and the bottom padding.
+    #[test]
+    fn multiple_lines_leave_no_blank_row_below_the_last_line() {
+        let renderer = bare_renderer();
+        let theme = Theme::dark();
+        let captured = screen_of(b"one\r\ntwo\r\nthree", 24, 80);
+        let img = renderer
+            .render_screen(&captured, &theme, &renderer.default_fonts, None, true)
+            .unwrap();
+
+        let cell_h = renderer.default_fonts.cell_height * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        assert_eq!(img.height(), 3 * cell_h + padding * 2);
+
+        let inked = |y: u32| (0..img.width()).any(|x| *img.get_pixel(x, y) != theme.background);
+        let bottom = (0..img.height()).rev().find(|&y| inked(y)).unwrap();
+        assert!(
+            img.height() - 1 - bottom < padding + cell_h,
+            "a blank terminal row was kept below the last line"
+        );
+    }
+
+    /// An empty capture still renders: it collapses to a single padded row
+    /// rather than to a zero-height PNG.
+    #[test]
+    fn an_empty_capture_still_renders_one_row() {
+        let renderer = bare_renderer();
+        let theme = Theme::dark();
+        let captured = screen_of(b"", 24, 80);
+        let img = renderer
+            .render_screen(&captured, &theme, &renderer.default_fonts, None, true)
+            .unwrap();
+
+        let cell_h = renderer.default_fonts.cell_height * RENDER_SCALE;
+        let cell_w = renderer.default_fonts.cell_width * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        assert_eq!(img.height(), cell_h + padding * 2);
+        assert_eq!(img.width(), cell_w + padding * 2);
+    }
+
+    /// Height trimming reads the terminal buffer, so a final row that is only
+    /// a colored background block is content and is kept.
+    #[test]
+    fn height_trim_keeps_a_trailing_styled_row() {
+        let renderer = bare_renderer();
+        let theme = Theme::dark();
+        // "hi", then a row that holds nothing but a green background run.
+        let captured = screen_of(b"hi\r\n\x1b[42m    \x1b[0m", 24, 80);
+        let img = renderer
+            .render_screen(&captured, &theme, &renderer.default_fonts, None, true)
+            .unwrap();
+
+        let cell_h = renderer.default_fonts.cell_height * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        assert_eq!(img.height(), 2 * cell_h + padding * 2);
+        assert_ne!(
+            *img.get_pixel(padding + 2, padding + cell_h + cell_h / 2),
+            theme.background,
+            "the trailing styled row was trimmed away"
+        );
+    }
+
+    /// Chrome does not change how much terminal is drawn: framed and bare
+    /// renders of the same capture hold the same terminal image, and the frame
+    /// only adds its own title bar and padding around it.
+    #[test]
+    fn chrome_and_bare_paths_trim_height_identically() {
+        let mut renderer = bare_renderer();
+        renderer.themes.insert("dark".to_string(), Theme::dark());
+        let theme = Theme::dark();
+        let captured = screen_of(b"one\r\ntwo", 24, 80);
+
+        let bare_chrome = ChromeOptions {
+            enabled: false,
+            preset: "none".to_string(),
+            title: None,
+            timestamp: false,
+            shadow: false,
+            radius: 0,
+            rounded: false,
+            outer_padding: 0,
+            title_bar_height: 0,
+        };
+        let framed = ChromeOptions {
+            enabled: true,
+            preset: "gnome".to_string(),
+            title: Some("demo".to_string()),
+            timestamp: false,
+            shadow: false,
+            radius: 0,
+            rounded: false,
+            outer_padding: 0,
+            title_bar_height: 34,
+        };
+
+        let render = |chrome: &ChromeOptions| {
+            renderer
+                .render_to_image(
+                    &captured,
+                    &theme,
+                    &renderer.default_fonts,
+                    chrome,
+                    None,
+                    true,
+                )
+                .unwrap()
+        };
+
+        let bare = render(&bare_chrome);
+        let with_chrome = render(&framed);
+        let cell_h = renderer.default_fonts.cell_height * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        assert_eq!(bare.height(), 2 * cell_h + padding * 2);
+        assert_eq!(with_chrome.height(), bare.height() + 34 * RENDER_SCALE);
+        assert_eq!(with_chrome.width(), bare.width());
     }
 
     #[test]
@@ -3490,6 +3848,25 @@ mod tests {
             outer_padding: 0,
             title_bar_height: 0,
         })
+    }
+
+    /// A bare renderer whose cell metrics are measured from the embedded font,
+    /// the way [`Renderer::new`] computes them, instead of the fixed 8x16 grid
+    /// [`test_fonts`] hard-codes. Tests that look at where glyph ink lands
+    /// inside its cell need the real numbers.
+    fn renderer_with_measured_cells() -> Renderer {
+        let fonts = ThemeFonts::load(
+            &FontChainSpec {
+                primary: None,
+                bold: None,
+                fallbacks: Vec::new(),
+            },
+            16.0,
+        )
+        .expect("the embedded font loads");
+        let mut renderer = bare_renderer();
+        renderer.default_fonts = Arc::new(fonts);
+        renderer
     }
 
     /// Width trimming must leave exactly the renderer's own padding to the
@@ -4975,8 +5352,9 @@ mod tests {
         let img = image::open(&path).unwrap().to_rgba8();
         let cell_h = renderer.default_fonts.cell_height * RENDER_SCALE;
         let padding = renderer.padding * RENDER_SCALE;
-        // 200 printed lines plus the row the cursor rests on.
-        assert_eq!(img.height(), 201 * cell_h + padding * 2);
+        // 200 printed lines; the row the cursor rests on is blank and is no
+        // longer padded out into an extra row of background.
+        assert_eq!(img.height(), 200 * cell_h + padding * 2);
 
         let description = read_png_description(&path).expect("description");
         assert!(description.starts_with("line 1\n"));

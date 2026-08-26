@@ -2160,9 +2160,10 @@ async fn redact_screenshot_rejects_a_trailing_blank_row() {
     let server = make_server(dir);
     let png = coordinate_fixture(&server, dir, "coord-row").await;
 
-    // Rows 4 and 5 are inside the 6-row capture and blank, so the render stops
-    // before them: accepting them would report a redaction that never appeared.
-    for row in [4u16, 5] {
+    // Rows 3, 4 and 5 are inside the 6-row capture and blank, so the render
+    // stops before them: accepting them would report a redaction that never
+    // appeared.
+    for row in [3u16, 4, 5] {
         let message = redact_coordinate(&server, &png, row, 0, 3)
             .await
             .err()
@@ -2174,7 +2175,7 @@ async fn redact_screenshot_rejects_a_trailing_blank_row() {
             "unhelpful error: {message}"
         );
         assert!(
-            message.contains("renders 4 row(s) x 5 column(s)"),
+            message.contains("renders 3 row(s) x 5 column(s)"),
             "the error must report the rendered dimensions: {message}"
         );
     }
@@ -2203,7 +2204,7 @@ async fn redact_screenshot_rejects_columns_past_the_rendered_width() {
         "unhelpful error: {message}"
     );
     assert!(
-        message.contains("renders 4 row(s) x 5 column(s)"),
+        message.contains("renders 3 row(s) x 5 column(s)"),
         "the error must report the rendered dimensions: {message}"
     );
 
@@ -2283,11 +2284,11 @@ async fn a_column_past_the_crop_is_accepted_without_auto_crop() {
 
     // Trailing blank rows are trimmed whatever auto_crop says, so the row bound
     // is unchanged.
-    let err = redact_coordinate(&server, &png, 4, 0, 3)
+    let err = redact_coordinate(&server, &png, 3, 0, 3)
         .await
         .expect_err("a blank trailing row is trimmed even without auto_crop");
     assert!(
-        err.to_string().contains("renders 4 row(s) x 20 column(s)"),
+        err.to_string().contains("renders 3 row(s) x 20 column(s)"),
         "unhelpful error: {err}"
     );
 }
@@ -2301,10 +2302,10 @@ async fn redact_screenshot_accepts_the_last_rendered_cell() {
     let server = make_server(dir);
     let png = coordinate_fixture(&server, dir, "coord-boundary").await;
 
-    // Last rendered row (3 of 4) and last rendered column (4 of 5) - blank
-    // cells, but ones the image draws.
+    // Last rendered row (2 of 3) and last rendered column (4 of 5) - the very
+    // last cell the image draws.
     let before = png_pixels(&png);
-    let result = redact_coordinate(&server, &png, 3, 4, 5)
+    let result = redact_coordinate(&server, &png, 2, 4, 5)
         .await
         .expect("the last rendered row and column are inside the image");
     let text = result_text(&result);
@@ -2811,8 +2812,8 @@ async fn inline_coordinates_are_validated_against_the_rendered_image() {
         "the range should mask `charlie` only: {description}"
     );
 
-    // The image renders three rows (two of content plus the cursor row), so
-    // row 3 is not addressable.
+    // The image renders exactly the two rows of content - the blank row the
+    // cursor rests on is trimmed - so row 3 is not addressable.
     let mut params = render_params(&input, "inline-coordinates-oob");
     params.redactions = Some(specs(&[r#"{"row":3,"col_start":0,"col_end":4}"#]));
     let err = server
@@ -2821,7 +2822,7 @@ async fn inline_coordinates_are_validated_against_the_rendered_image() {
         .expect_err("a row past the rendered image must be refused");
     let message = format!("{err}");
     assert!(
-        message.contains("renders 3 row(s) x 13 column(s)"),
+        message.contains("renders 2 row(s) x 13 column(s)"),
         "the error must name the rendered bounds: {message}"
     );
 
