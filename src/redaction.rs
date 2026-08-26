@@ -777,7 +777,7 @@ fn builtin_rules() -> Vec<RedactionRuleConfig> {
         ),
         r(
             "aws_secret",
-            r#"(?i)(?:aws_secret_access_key|aws_secret)\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#,
+            r#"(?i)(?:aws_secret_access_key|aws_secret)\s*[:=]\s*['"]?(?P<redact>[A-Za-z0-9/+=]{40})['"]?"#,
             "[REDACTED-KEY]",
         ),
         // PEM armor only. This rule used to carry an `[A-Za-z0-9+/]{60,}`
@@ -808,7 +808,7 @@ fn builtin_rules() -> Vec<RedactionRuleConfig> {
         // it, prose such as "rotate the api key regularly afterwards" matched.
         r(
             "api_key",
-            r#"(?i)(?:api[_-]?key|apikey|access[_-]?token|secret[_-]?key|auth[_-]?token|bearer)\s*[:=]\s*['"]?[A-Za-z0-9_\-\.]{16,}"#,
+            r#"(?i)(?:api[_-]?key|apikey|access[_-]?token|secret[_-]?key|auth[_-]?token|bearer)\s*[:=]\s*['"]?(?P<redact>[A-Za-z0-9_\-\.]{16,})"#,
             "[REDACTED-KEY]",
         ),
         // --- Additional provider tokens (sourced from / inspired by Betterleaks, MIT) ---
@@ -839,17 +839,17 @@ fn builtin_rules() -> Vec<RedactionRuleConfig> {
         ),
         r(
             "generic_api_key",
-            r#"(?i)(?:api[_-]?key|apikey)\s*[:=]\s*['"]?[A-Za-z0-9_\-]{20,}"#,
+            r#"(?i)(?:api[_-]?key|apikey)\s*[:=]\s*['"]?(?P<redact>[A-Za-z0-9_\-]{20,})"#,
             "[REDACTED-KEY]",
         ),
         r(
             "bearer_token",
-            r#"(?i)(?:bearer|authorization)\s*[:=]\s*['"]?[A-Za-z0-9_\-.]{20,}"#,
+            r#"(?i)(?:bearer|authorization)\s*[:=]\s*['"]?(?P<redact>[A-Za-z0-9_\-.]{20,})"#,
             "[REDACTED-TOKEN]",
         ),
         r(
             "connection_string",
-            r#"(?i)(?:connection.?string|conn.?str)\s*[:=]\s*['"]?[^'";\s]{20,}"#,
+            r#"(?i)(?:connection.?string|conn.?str)\s*[:=]\s*['"]?(?P<redact>[^'";\s]{20,})"#,
             "[REDACTED-SECRET]",
         ),
         r(
@@ -1074,8 +1074,31 @@ mod tests {
 
     #[test]
     fn aws_secret_matches_in_context() {
-        let map = redact("aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        let input = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let parser = screen_of(input, 120, 3);
+        let map = engine().redact_screen(parser.screen(), None);
         assert_eq!(count_of(&map, "aws_secret"), 1);
+        let text = map.redacted_plain_text(parser.screen());
+        assert!(text.contains("AWS_SECRET_ACCESS_KEY="));
+        assert!(!text.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
+    }
+
+    #[test]
+    fn contextual_rules_preserve_key_names() {
+        let input = concat!(
+            "API_KEY=abcdefghijklmnopqrstuvwx\n",
+            "Authorization=abcdefghijklmnopqrstuvwxyz012345\n",
+            "CONNECTION_STRING=postgresql://user:secret@db.example/app"
+        );
+        let parser = screen_of(input, 120, 5);
+        let map = engine().redact_screen(parser.screen(), None);
+        let text = map.redacted_plain_text(parser.screen());
+        assert!(text.contains("API_KEY="));
+        assert!(text.contains("Authorization="));
+        assert!(text.contains("CONNECTION_STRING="));
+        assert!(!text.contains("abcdefghijklmnopqrstuvwx"));
+        assert!(!text.contains("abcdefghijklmnopqrstuvwxyz012345"));
+        assert!(!text.contains("postgresql://user:secret@db.example/app"));
     }
 
     #[test]
