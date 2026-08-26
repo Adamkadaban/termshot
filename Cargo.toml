@@ -21,10 +21,36 @@ rmcp = { version = "3.1.4", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+# Async runtime. Only the subsystems this crate actually drives are enabled;
+# `pty-process` and `rmcp` add `fs`/`net` transitively where they need them.
+#   rt-multi-thread + macros -> #[tokio::main] / #[tokio::test]
+#   time                     -> tokio::time::{timeout, Instant}
+#   process                  -> tokio::process::Child reaping in executor.rs
+#   io-util                  -> AsyncReadExt / AsyncWriteExt
+#   io-std                   -> rmcp stdio transport
+#   sync                     -> rmcp channels
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "process",
+    "io-util",
+    "io-std",
+    "sync",
+] }
 
 # Terminal emulation
+#
+# NOTE (dependency policy): `vt100` and `pty-process` are low-popularity,
+# effectively single-maintainer crates, but both are *architectural* here -
+# `vt100` supplies the screen/scrollback model the renderer reads cell by
+# cell, and `pty-process` owns the async PTY spawn/resize/reap contract the
+# executor is built on. The plausible substitutes (`vte` + a hand-written
+# screen layer; `portable-pty`) are not drop-in and would change escape-
+# sequence handling and process-termination behavior. They are recorded here
+# as *future evaluation only*: any migration must be prototyped behind the
+# existing renderer/executor interfaces with regression tests for scrollback,
+# malformed escape sequences, PTY resize, timeouts and process-group kill.
 vt100 = "0.16"
 
 # PTY for command execution
@@ -32,7 +58,10 @@ pty-process = { version = "0.5", features = ["async"] }
 
 # Image rendering
 fontdue = "0.9"
-image = "0.25"
+# PNG only: `compose` reads and writes PNG screenshots exclusively, so the
+# default codec set (AVIF/EXR/TIFF/WebP/...) would only widen the parser
+# surface reachable from agent-supplied MCP paths.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Direct PNG encoding so screenshots can carry a UTF-8 `Description` iTXt chunk
 # (the `image` crate's PNG encoder exposes no metadata API).
 png = "0.18"
@@ -40,9 +69,11 @@ png = "0.18"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Config
-toml = "0.8"
-serde_yaml = "0.9"
+# Config. Only deserialization is used (`toml::from_str`), so the TOML
+# serializer (`display` -> `toml_writer`) stays out of the build.
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
+# Maintained fork of the archived/deprecated `serde_yaml`; API-compatible.
+serde_yaml_ng = "0.10"
 
 # Redaction rule matching
 regex = "1"
@@ -76,6 +107,10 @@ assets = [
     ["docs/man/termshot.1", "usr/share/man/man1/termshot.1", "644"],
     ["termshot.example.toml", "usr/share/doc/termshot/config.toml.example", "644"],
     ["LICENSE", "usr/share/doc/termshot/LICENSE", "644"],
+    # Third-party attribution required by the embedded JetBrains Mono font
+    # (OFL-1.1), rmcp (Apache-2.0) and the Betterleaks-derived rules (MIT).
+    ["THIRD_PARTY_NOTICES.md", "usr/share/doc/termshot/THIRD_PARTY_NOTICES.md", "644"],
+    ["LICENSES/*", "usr/share/doc/termshot/LICENSES/", "644"],
     ["README.md", "usr/share/doc/termshot/README.md", "644"],
     ["docs/*.md", "usr/share/doc/termshot/docs/", "644"],
     # The README and docs reference these screenshots, so they must ship too.
@@ -88,6 +123,8 @@ assets = [
     { source = "docs/man/termshot.1", dest = "/usr/share/man/man1/termshot.1", mode = "644", doc = true },
     { source = "termshot.example.toml", dest = "/usr/share/doc/termshot/config.toml.example", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/doc/termshot/LICENSE", mode = "644", doc = true },
+    { source = "THIRD_PARTY_NOTICES.md", dest = "/usr/share/doc/termshot/THIRD_PARTY_NOTICES.md", mode = "644", doc = true },
+    { source = "LICENSES/*", dest = "/usr/share/doc/termshot/LICENSES/", mode = "644", doc = true },
     { source = "README.md", dest = "/usr/share/doc/termshot/README.md", mode = "644", doc = true },
     { source = "docs/*.md", dest = "/usr/share/doc/termshot/docs/", mode = "644", doc = true },
     { source = "docs/assets/*.png", dest = "/usr/share/doc/termshot/docs/assets/", mode = "644", doc = true },

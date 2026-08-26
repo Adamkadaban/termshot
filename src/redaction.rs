@@ -1638,10 +1638,12 @@ pub fn load_rules_from_dir(dir: &std::path::Path) -> Vec<RedactionRuleConfig> {
                 Ok(f) => out.extend(f.rules),
                 Err(e) => tracing::warn!("Failed to parse TOML rules {:?}: {}", path, e),
             },
-            Some("yaml") | Some("yml") => match serde_yaml::from_str::<YamlRulesFile>(&contents) {
-                Ok(f) => out.extend(f.rules.into_iter().filter_map(YamlRule::into_rule)),
-                Err(e) => tracing::warn!("Failed to parse YAML rules {:?}: {}", path, e),
-            },
+            Some("yaml") | Some("yml") => {
+                match serde_yaml_ng::from_str::<YamlRulesFile>(&contents) {
+                    Ok(f) => out.extend(f.rules.into_iter().filter_map(YamlRule::into_rule)),
+                    Err(e) => tracing::warn!("Failed to parse YAML rules {:?}: {}", path, e),
+                }
+            }
             _ => {}
         }
     }
@@ -2259,6 +2261,81 @@ rules:
         assert!(slack.enabled);
         let disabled = rules.iter().find(|r| r.name == "disabled_rule").unwrap();
         assert!(!disabled.enabled);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The YAML backend moved from the archived `serde_yaml` to the maintained
+    /// `serde_yaml_ng` fork. Pin the behavior that swap must not change:
+    /// generic Kingfisher-style documents (anchors, aliases, quoted and block
+    /// scalars, unknown keys) still load, and a malformed document is still
+    /// skipped with a warning rather than aborting the whole directory.
+    #[test]
+    fn yaml_rules_keep_generic_syntax_and_rejection_semantics() {
+        let dir = std::path::Path::new("target/yaml-ng-test-rules");
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::create_dir_all(dir).unwrap();
+
+        // Anchors/aliases, a block scalar, a flow mapping, and keys this type
+        // does not model - all of which a generic rule file may carry.
+        std::fs::write(
+            dir.join("generic.yaml"),
+            r#"
+default_entropy: &entropy 3.5
+rules:
+  - name: anchored_rule
+    pattern: 'ANCHOR-[0-9a-f]{8}'
+    confidence: high
+    min_entropy: *entropy
+  - {id: flow_rule, regex: 'FLOW-\d+'}
+  - name: block_rule
+    pattern: >-
+      BLOCK-[A-Z]+
+    description: |
+      A key the rule type does not model; it must be ignored, not rejected.
+    tags: [one, two]
+"#,
+        )
+        .unwrap();
+
+        // Unparseable YAML: the file is skipped, the directory still loads.
+        std::fs::write(
+            dir.join("broken.yaml"),
+            "rules:\n  - name: x\n   pattern: [\n",
+        )
+        .unwrap();
+        // A `.yml` file is loaded too; a `.json` file is not.
+        std::fs::write(
+            dir.join("short.yml"),
+            "rules:\n  - name: yml_rule\n    pattern: 'YML-\\d+'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ignored.json"),
+            r#"{"rules":[{"name":"json_rule","pattern":"J-1"}]}"#,
+        )
+        .unwrap();
+
+        let rules = load_rules_from_dir(dir);
+        let names: BTreeSet<&str> = rules.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["anchored_rule", "flow_rule", "block_rule", "yml_rule"]),
+            "malformed YAML is skipped, .yml loads, non-YAML extensions are ignored"
+        );
+
+        let anchored = rules.iter().find(|r| r.name == "anchored_rule").unwrap();
+        assert_eq!(
+            anchored.min_entropy,
+            Some(3.5),
+            "an aliased anchor value still populates the rule"
+        );
+        assert!(anchored.enabled);
+        let block = rules.iter().find(|r| r.name == "block_rule").unwrap();
+        assert_eq!(
+            block.pattern, "BLOCK-[A-Z]+",
+            "a folded block scalar keeps its exact pattern text"
+        );
+
         std::fs::remove_dir_all(dir).ok();
     }
 

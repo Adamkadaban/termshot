@@ -1,0 +1,84 @@
+# cargo-deny configuration.
+#
+# Run locally with `cargo deny --locked check`. CI runs the same command.
+# The goal is a *meaningful* gate: everything listed below is an explicit,
+# reasoned decision, so a genuinely new advisory or license always fails.
+
+[graph]
+# termshot is Unix-only (it spawns PTYs through `pty-process`), so the graph is
+# evaluated for the platforms it is actually released for.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2026-0192 - `ttf-parser` is unmaintained (author announcement,
+    # 2026-06-28; suggested successor is `skrifa`).
+    #
+    # This is an *unmaintained* notice, not a vulnerability: no defect is
+    # known and no fixed release exists to upgrade to. `ttf-parser` reaches
+    # termshot only through `fontdue`, which has no alternative backend, so
+    # the only remedies are (a) waiting for `fontdue` to migrate or (b)
+    # replacing the rasterizer outright with `swash`/`cosmic-text` - a large,
+    # behaviour-changing rewrite of the glyph pipeline for a warning with no
+    # associated exploit.
+    #
+    # Scope of exposure: `ttf-parser` parses the embedded JetBrains Mono file
+    # and any font the operator points `--font` / `font_path` at. It is never
+    # reachable from captured command output or from MCP tool arguments.
+    #
+    # Review trigger: revisit when `fontdue` ships a release that drops
+    # `ttf-parser`, or if this advisory is ever upgraded to a vulnerability.
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained-only notice; no fix exists upstream and `fontdue` has no alternative backend. Fonts are operator-supplied, never agent- or output-supplied." },
+]
+
+[licenses]
+version = 2
+# Exactly the permissive set present in the resolved graph - no more, so that
+# `license-not-encountered` stays quiet and a genuinely new license always
+# fails. Extending this list is a deliberate act: add the identifier here and
+# record the election in THIRD_PARTY_NOTICES.md at the same time.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# `image` must stay PNG-only: its default feature set pulls ten more decoders
+# into a path that `compose_screenshots` reaches with agent-supplied file
+# paths. These bans make a silent re-enable fail the build.
+deny = [
+    { crate = "rav1e", reason = "AVIF encoder; only reachable if image's default features come back" },
+    { crate = "ravif", reason = "AVIF encoder; only reachable if image's default features come back" },
+    { crate = "exr", reason = "OpenEXR decoder; only reachable if image's default features come back" },
+    { crate = "tiff", reason = "TIFF decoder; only reachable if image's default features come back" },
+    { crate = "image-webp", reason = "WebP decoder; only reachable if image's default features come back" },
+    { crate = "zune-jpeg", reason = "JPEG decoder; only reachable if image's default features come back" },
+    { crate = "serde_yaml", reason = "archived and deprecated upstream; termshot uses the maintained serde_yaml_ng fork" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

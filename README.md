@@ -129,3 +129,5 @@ Prebuilt binaries, packages, and source builds: [docs/install.md](./docs/install
 ## License
 
 [MIT](./LICENSE)
+
+[Third-party notices](./THIRD_PARTY_NOTICES.md)
