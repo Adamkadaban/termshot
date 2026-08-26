@@ -696,11 +696,9 @@ fn render_options(
     lines: LineSelection,
     manual: Option<&ManualRedactions>,
 ) -> ExtendedRenderOptions<'_> {
-    let options = ExtendedRenderOptions::default().with_lines(lines);
-    match manual {
-        Some(manual) => options.with_manual(manual),
-        None => options,
-    }
+    ExtendedRenderOptions::default()
+        .with_lines(lines)
+        .with_optional_manual(manual)
 }
 
 /// Resolve whether redaction should run for this invocation and, if so, build

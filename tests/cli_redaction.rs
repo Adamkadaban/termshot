@@ -10,6 +10,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -90,6 +91,37 @@ impl Case {
         let path = self.dir.join(name);
         std::fs::write(&path, contents).expect("write ansi file");
         path
+    }
+
+    /// Install an isolated interactive Bash with a deterministic prompt and
+    /// point this case's config at it. This keeps prompt/echo tests independent
+    /// of the developer or CI runner's shell configuration.
+    fn use_deterministic_shell(&self) {
+        let root = std::env::current_dir()
+            .expect("current dir")
+            .join(&self.dir);
+        let rc = root.join("bashrc");
+        let wrapper = root.join("shell.sh");
+        std::fs::write(&rc, "PS1='termshot-test$ '\n").expect("write bashrc");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexec /bin/bash --noprofile --rcfile '{}' -i\n",
+                rc.display()
+            ),
+        )
+        .expect("write shell wrapper");
+        std::fs::set_permissions(&wrapper, Permissions::from_mode(0o755))
+            .expect("make shell wrapper executable");
+        std::fs::write(
+            &self.config,
+            format!(
+                "output_dir = {:?}\nshell = {:?}\n",
+                self.dir.display().to_string(),
+                wrapper.display().to_string()
+            ),
+        )
+        .expect("write deterministic config");
     }
 }
 
@@ -552,6 +584,7 @@ async fn cli_matches_the_equivalent_mcp_redaction() {
             auto_crop: None,
             redact: Some(false),
             redaction_rules: None,
+            redactions: None,
             redact_text: None,
             show_labels: None,
             head_lines: None,
@@ -633,6 +666,7 @@ async fn cli_matches_the_equivalent_mcp_redaction() {
 #[test]
 fn exec_manual_pattern_catches_the_command_echo_and_the_output() {
     let case = Case::new("exec-wrapped");
+    case.use_deterministic_shell();
     // The interactive prompt echoes the command, and at this width the hash in
     // the echo crosses the right margin onto the next row.
     let (png, stderr) = case.run_ok(&[

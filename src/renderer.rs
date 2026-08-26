@@ -1106,6 +1106,17 @@ impl<'a> ExtendedRenderOptions<'a> {
         self
     }
 
+    /// [`ExtendedRenderOptions::with_manual`] for a caller that may or may not
+    /// have any: `None` renders exactly as a call with no manual redactions.
+    ///
+    /// Both entry points build their options this way - the CLI from
+    /// `--redaction`, the MCP server from a tool's `redactions` array - so an
+    /// absent list means the same thing on either side.
+    pub fn with_optional_manual(mut self, manual: Option<&'a ManualRedactions>) -> Self {
+        self.manual = manual;
+        self
+    }
+
     /// Which of the retained lines to render.
     pub fn lines(&self) -> LineSelection {
         self.base.lines

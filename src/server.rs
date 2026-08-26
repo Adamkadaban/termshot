@@ -6,7 +6,7 @@ use crate::redaction::{
     explicit_request_is_blocked, resolve_should_redact,
 };
 use crate::renderer::{
-    ChromeOptions, ComposeLayout, RedactionRequest, RenderContext, RenderOptions, Renderer,
+    ChromeOptions, ComposeLayout, ExtendedRenderOptions, RedactionRequest, RenderContext, Renderer,
     TextOptions, fallback_output_name,
 };
 use rmcp::{
@@ -88,6 +88,16 @@ pub struct ExecuteAndScreenshotParams {
     /// Providing this implies redaction is enabled.
     #[serde(default)]
     pub redaction_rules: Option<Vec<String>>,
+
+    /// Manual redactions applied to this screenshot: regex patterns and/or
+    /// explicit cell ranges, exactly the specifications `redact_screenshot`
+    /// and the CLI's repeatable `--redaction '<JSON>'` option take. They are
+    /// applied in order (patterns first, then cell ranges) on top of any
+    /// rule-based redaction. Providing this masks the screenshot even when
+    /// `redact` is omitted; add `redact: true` (or `redaction_rules`) to run
+    /// the built-in rules as well. Conflicts with `redact: false`.
+    #[serde(default)]
+    pub redactions: Option<Vec<ManualRedactionSpec>>,
 
     /// Also redact the returned terminal text. By default only the PNG image is
     /// redacted and the returned text keeps the ORIGINAL (unredacted) content
@@ -204,6 +214,16 @@ pub struct RenderAnsiParams {
     /// Providing this implies redaction is enabled.
     #[serde(default)]
     pub redaction_rules: Option<Vec<String>>,
+
+    /// Manual redactions applied to this render: regex patterns and/or explicit
+    /// cell ranges, exactly the specifications `redact_screenshot` and the
+    /// CLI's repeatable `--redaction '<JSON>'` option take. They are applied in
+    /// order (patterns first, then cell ranges) on top of any rule-based
+    /// redaction. Providing this masks the render even when `redact` is
+    /// omitted; add `redact: true` (or `redaction_rules`) to run the built-in
+    /// rules as well. Conflicts with `redact: false`.
+    #[serde(default)]
+    pub redactions: Option<Vec<ManualRedactionSpec>>,
 
     /// Also redact the returned terminal text. By default only the PNG image
     /// is redacted and the returned text keeps the ORIGINAL content.
@@ -607,6 +627,12 @@ impl ScreenshotServer {
     /// Execute a shell command in a real terminal and capture a PNG screenshot
     /// of the output.
     ///
+    /// Manual redactions: `redactions` takes the same regex-pattern and
+    /// cell-range specifications as `redact_screenshot` and the CLI's
+    /// repeatable `--redaction '<JSON>'` option, applied to this screenshot as
+    /// it is rendered. Passing them masks the image even without `redact`; add
+    /// `redact: true` (or `redaction_rules`) to run the built-in rules too.
+    ///
     /// The command runs in a PTY (pseudo-terminal), so all ANSI escape
     /// sequences (colors, formatting, cursor movement) are rendered into an
     /// image that looks like a real terminal. When `show_prompt` is true
@@ -644,6 +670,11 @@ impl ScreenshotServer {
                 .unwrap_or(self.config.default_timeout_secs),
         );
         let lines = line_selection(params.head_lines, params.tail_lines)?;
+        let show_labels = params.show_labels.unwrap_or(true);
+        // Compile the caller's `redactions` before the command runs, so an
+        // invalid regex, color, or coordinate range fails without having
+        // executed anything - exactly as the CLI's `--redaction` does.
+        let manual = manual_redactions(params.redactions.as_deref(), params.redact, show_labels)?;
         let show_prompt = params.show_prompt.unwrap_or(true);
         let commands = params
             .commands
@@ -682,11 +713,8 @@ impl ScreenshotServer {
 
         // Resolve redaction: an explicit `redact` flag (or a rules list) wins;
         // otherwise fall back to the server's auto-redaction config.
-        let redaction_engine = self.resolve_redaction(
-            params.redact,
-            params.redaction_rules.as_ref(),
-            params.show_labels.unwrap_or(true),
-        )?;
+        let redaction_engine =
+            self.resolve_redaction(params.redact, params.redaction_rules.as_ref(), show_labels)?;
         let redaction_request = redaction_engine.as_ref().map(|engine| RedactionRequest {
             engine,
             rules: params.redaction_rules.clone(),
@@ -713,7 +741,7 @@ impl ScreenshotServer {
 
         let (image_path, plain_text, redactions, context) = self
             .renderer
-            .render_bytes_with_options(
+            .render_bytes_with_extended_options(
                 &exec_result.raw_output,
                 cols,
                 rows,
@@ -724,7 +752,9 @@ impl ScreenshotServer {
                 redaction_request.as_ref(),
                 text_options,
                 params.auto_crop.unwrap_or(true),
-                RenderOptions::default().with_lines(lines),
+                ExtendedRenderOptions::default()
+                    .with_lines(lines)
+                    .with_optional_manual(manual.as_ref()),
             )
             .map_err(|e| McpError::internal_error(format!("Rendering failed: {}", e), None))?;
 
@@ -771,6 +801,12 @@ impl ScreenshotServer {
     /// Takes a path to a file that contains terminal output with ANSI escape
     /// sequences and renders it to a PNG image. Useful for rendering
     /// previously captured output.
+    ///
+    /// Manual redactions: `redactions` takes the same regex-pattern and
+    /// cell-range specifications as `redact_screenshot` and the CLI's
+    /// repeatable `--redaction '<JSON>'` option, applied as the image is
+    /// rendered. Passing them masks the image even without `redact`; add
+    /// `redact: true` (or `redaction_rules`) to run the built-in rules too.
     #[tool(name = "render_ansi")]
     pub async fn render_ansi(
         &self,
@@ -780,6 +816,11 @@ impl ScreenshotServer {
         let rows = params.rows.unwrap_or(self.config.default_rows);
         validate_dimensions(cols, rows)?;
         let lines = line_selection(params.head_lines, params.tail_lines)?;
+        let show_labels = params.show_labels.unwrap_or(true);
+        // Compile the caller's `redactions` before the file is read, so an
+        // invalid regex, color, or coordinate range fails up front - exactly
+        // as the CLI's `--redaction` does.
+        let manual = manual_redactions(params.redactions.as_deref(), params.redact, show_labels)?;
         let theme_name = params.theme.as_deref();
         let chrome_options = chrome_options_from_params(
             &self.config,
@@ -807,11 +848,8 @@ impl ScreenshotServer {
         // Rendering a captured log honors the same redaction policy as
         // execution: this is exactly the case where the caller has not read
         // the content first.
-        let redaction_engine = self.resolve_redaction(
-            params.redact,
-            params.redaction_rules.as_ref(),
-            params.show_labels.unwrap_or(true),
-        )?;
+        let redaction_engine =
+            self.resolve_redaction(params.redact, params.redaction_rules.as_ref(), show_labels)?;
         let redaction_request = redaction_engine.as_ref().map(|engine| RedactionRequest {
             engine,
             rules: params.redaction_rules.clone(),
@@ -819,7 +857,7 @@ impl ScreenshotServer {
 
         let (image_path, plain_text, redactions, context) = self
             .renderer
-            .render_bytes_with_options(
+            .render_bytes_with_extended_options(
                 &data,
                 cols,
                 rows,
@@ -837,7 +875,9 @@ impl ScreenshotServer {
                     from_screen: false,
                 },
                 params.auto_crop.unwrap_or(true),
-                RenderOptions::default().with_lines(lines),
+                ExtendedRenderOptions::default()
+                    .with_lines(lines)
+                    .with_optional_manual(manual.as_ref()),
             )
             .map_err(|e| McpError::internal_error(format!("Rendering failed: {}", e), None))?;
 
@@ -1093,7 +1133,9 @@ impl ServerHandler for ScreenshotServer {
                 "Terminal screenshot MCP server. Use execute_and_screenshot to run \
                  commands and capture PNG screenshots of the terminal output, including \
                  PS1 prompt, colors, and full ANSI rendering. Use render_ansi to render \
-                 previously captured terminal output from a file. Use redact_screenshot \
+                 previously captured terminal output from a file. Both take an optional \
+                 `redactions` list (regex patterns and/or cell ranges) to mask sensitive \
+                 data as the image is rendered. Use redact_screenshot \
                  to selectively redact an existing screenshot by regex pattern or cell \
                  coordinates (run execute_and_screenshot first without redaction, inspect \
                  the plain text, then redact what is sensitive). Use compose_screenshots \
@@ -1115,6 +1157,46 @@ pub async fn run_mcp_server(config: Config, renderer: Renderer) -> anyhow::Resul
 /// selection, rejecting a request that sets both.
 fn line_selection(head: Option<usize>, tail: Option<usize>) -> Result<LineSelection, McpError> {
     LineSelection::from_head_tail(head, tail)
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))
+}
+
+/// Error for a request that supplies `redactions` and sets `redact: false`.
+///
+/// The two say opposite things - mask these cells, and do not redact - so the
+/// request is refused rather than answered with one of them. This is the MCP
+/// spelling of the CLI's `--redaction` / `--no-redact` conflict, which clap
+/// refuses the same way.
+const MANUAL_REDACTION_CONFLICT_MSG: &str = "`redactions` conflicts with `redact: false`: the request asks for manual masking \
+     and for redaction to be off at once. Drop `redact` (manual redactions apply on \
+     their own) or drop `redactions`. This mirrors the CLI, where `--redaction` \
+     conflicts with `--no-redact`.";
+
+/// Compile a tool's caller-supplied `redactions` into the shared applicable
+/// set, or `None` when none were given.
+///
+/// Shared by `execute_and_screenshot` and `render_ansi`, and built from exactly
+/// the specifications the CLI's `--redaction` option and `redact_screenshot`
+/// take, through the same [`ManualRedactions`] compiler - so a pattern or cell
+/// range behaves identically from any entry point, down to the audit names.
+/// Compiling here means an invalid regex, color, or empty range is refused
+/// before a command is run or an image is written.
+fn manual_redactions(
+    specs: Option<&[ManualRedactionSpec]>,
+    redact: Option<bool>,
+    show_labels: bool,
+) -> Result<Option<ManualRedactions>, McpError> {
+    let specs = match specs {
+        Some(specs) if !specs.is_empty() => specs,
+        _ => return Ok(None),
+    };
+    if redact == Some(false) {
+        return Err(McpError::invalid_params(
+            MANUAL_REDACTION_CONFLICT_MSG.to_string(),
+            None,
+        ));
+    }
+    ManualRedactions::new(specs, show_labels)
+        .map(Some)
         .map_err(|e| McpError::invalid_params(e.to_string(), None))
 }
 
