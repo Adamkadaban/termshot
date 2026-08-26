@@ -102,7 +102,7 @@ jobs:
           mkdir -p "$artifact"
           cp "target/${{ matrix.target }}/release/termshot" "$artifact/"
           cp README.md LICENSE termshot.example.toml "$artifact/"
-          cp doc/termshot.1 "$artifact/"
+          cp docs/man/termshot.1 "$artifact/"
           cp -r docs "$artifact/"
           tar -czf "$artifact.tar.gz" "$artifact"
           echo "ASSET=$artifact.tar.gz" >> "$GITHUB_ENV"

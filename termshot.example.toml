@@ -24,7 +24,7 @@ radius = 14
 # frame is rounded; without chrome the terminal image itself gets rounded
 # corners on a transparent background. Set false for square corners.
 rounded = true
-outer_padding = 18
+outer_padding = 0
 title_bar_height = 34
 
 # Optional overrides

@@ -119,9 +119,10 @@ pub struct ExecuteAndScreenshotParams {
     #[serde(default)]
     pub output_name: Option<String>,
 
-    /// Crop the rendered image width to fit the actual content instead of
-    /// using the full terminal width. Defaults to true. Set to false to keep
-    /// the full `cols` width.
+    /// Trim the rendered image width to the rightmost content, keeping the
+    /// same padding on the right as on the left, instead of using the full
+    /// terminal width. Defaults to true. Set to false to keep the full `cols`
+    /// width.
     #[serde(default)]
     pub auto_crop: Option<bool>,
 }
@@ -173,9 +174,10 @@ pub struct RenderAnsiParams {
     #[serde(default)]
     pub output_name: Option<String>,
 
-    /// Crop the rendered image width to fit the actual content instead of
-    /// using the full terminal width. Defaults to true. Set to false to keep
-    /// the full `cols` width.
+    /// Trim the rendered image width to the rightmost content, keeping the
+    /// same padding on the right as on the left, instead of using the full
+    /// terminal width. Defaults to true. Set to false to keep the full `cols`
+    /// width.
     #[serde(default)]
     pub auto_crop: Option<bool>,
 
@@ -837,9 +839,9 @@ impl ScreenshotServer {
     /// Compose two or more existing screenshots into a single image, placed
     /// side by side (horizontal) or stacked (vertical) like tmux split panes:
     /// adjacent with no gap, separated by a thin solid divider line. Panes are
-    /// stretched to a common height (horizontal) or width (vertical) so the
-    /// seams line up. Useful for comparing before/after runs, different themes,
-    /// or related outputs.
+    /// padded (never rescaled) to a common height (horizontal) or width
+    /// (vertical) so the seams line up. Useful for comparing before/after runs,
+    /// different themes, or related outputs.
     #[tool(name = "compose_screenshots")]
     pub async fn compose_screenshots(
         &self,

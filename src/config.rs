@@ -81,7 +81,7 @@ impl Default for ChromeConfig {
             shadow: false,
             radius: 14,
             rounded: true,
-            outer_padding: 18,
+            outer_padding: 0,
             title_bar_height: 34,
         }
     }
@@ -742,7 +742,7 @@ timestamp = false
 shadow = false
 radius = 14
 rounded = true
-outer_padding = 18
+outer_padding = 0
 title_bar_height = 34
 
 [redaction]

@@ -63,7 +63,7 @@ section = "utils"
 priority = "optional"
 assets = [
     ["target/release/termshot", "usr/bin/", "755"],
-    ["doc/termshot.1", "usr/share/man/man1/termshot.1", "644"],
+    ["docs/man/termshot.1", "usr/share/man/man1/termshot.1", "644"],
     ["termshot.example.toml", "usr/share/doc/termshot/config.toml.example", "644"],
     ["LICENSE", "usr/share/doc/termshot/LICENSE", "644"],
     ["README.md", "usr/share/doc/termshot/README.md", "644"],
@@ -75,7 +75,7 @@ assets = [
 [package.metadata.generate-rpm]
 assets = [
     { source = "target/release/termshot", dest = "/usr/bin/termshot", mode = "755" },
-    { source = "doc/termshot.1", dest = "/usr/share/man/man1/termshot.1", mode = "644", doc = true },
+    { source = "docs/man/termshot.1", dest = "/usr/share/man/man1/termshot.1", mode = "644", doc = true },
     { source = "termshot.example.toml", dest = "/usr/share/doc/termshot/config.toml.example", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/doc/termshot/LICENSE", mode = "644", doc = true },
     { source = "README.md", dest = "/usr/share/doc/termshot/README.md", mode = "644", doc = true },

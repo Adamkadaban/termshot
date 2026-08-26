@@ -112,8 +112,9 @@ enum Commands {
         #[arg(long = "plain-text", default_value_t = false)]
         plain_text: bool,
 
-        /// Crop the image width to fit the actual content instead of using the
-        /// full terminal width. Pass `--auto-crop false` to keep full width.
+        /// Trim the image width to the rightmost content, keeping the same
+        /// padding on the right as on the left, instead of using the full
+        /// terminal width. Pass `--auto-crop false` to keep full width.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         auto_crop: bool,
 
@@ -192,8 +193,9 @@ enum Commands {
         #[arg(long = "redact-text", default_value_t = false)]
         redact_text: bool,
 
-        /// Crop the image width to fit the actual content instead of using the
-        /// full terminal width. Pass `--auto-crop false` to keep full width.
+        /// Trim the image width to the rightmost content, keeping the same
+        /// padding on the right as on the left, instead of using the full
+        /// terminal width. Pass `--auto-crop false` to keep full width.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         auto_crop: bool,
 

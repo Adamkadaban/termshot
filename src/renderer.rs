@@ -26,6 +26,11 @@ const REDACT_BG: Rgba<u8> = Rgba([212, 25, 25, 255]);
 /// factor so terminal content and chrome stay proportional.
 const RENDER_SCALE: u32 = 2;
 
+/// Narrowest image, in terminal cells, that width trimming will produce, so an
+/// empty capture still renders as a small padded tile instead of a zero-width
+/// PNG. Any real content is trimmed to its exact bound.
+const MIN_CONTENT_COLS: u32 = 1;
+
 /// Metadata describing how a screenshot was rendered, so it can later be
 /// re-rendered (e.g. by the `redact_screenshot` MCP tool) with identical
 /// geometry and styling. The MCP server keeps this in memory (alongside the
@@ -57,9 +62,11 @@ pub type RenderOutput = (PathBuf, String, Vec<(String, usize)>, RenderMeta);
 /// How [`compose_images`] arranges multiple source screenshots on the canvas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposeLayout {
-    /// Place images left-to-right; canvas height is the tallest image.
+    /// Place images left-to-right; canvas height is the tallest image, and
+    /// shorter panes are padded (not stretched) to reach it.
     Horizontal,
-    /// Stack images top-to-bottom; canvas width is the widest image.
+    /// Stack images top-to-bottom; canvas width is the widest image, and
+    /// narrower panes are padded (not stretched) to reach it.
     Vertical,
 }
 
@@ -157,10 +164,12 @@ fn normalize_newlines(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 
 ///
 /// `divider` is the divider thickness in pixels. For a horizontal layout the
-/// panes are stretched to a common height (the tallest source) and separated by
-/// a vertical divider; for a vertical layout they are stretched to a common
-/// width (the widest source) and separated by a horizontal divider. Stretching
-/// keeps the panes aligned so the seams line up like real terminal splits.
+/// panes are padded to a common height (the tallest source) and separated by a
+/// vertical divider; for a vertical layout they are padded to a common width
+/// (the widest source) and separated by a horizontal divider, so the seams line
+/// up like real terminal splits. A pane is padded with its own background
+/// color - never rescaled - so its glyphs keep the crisp 2x rendering and their
+/// aspect ratio, exactly like a tmux pane that is smaller than its neighbour.
 pub fn compose_images(
     paths: &[PathBuf],
     layout: ComposeLayout,
@@ -184,36 +193,27 @@ pub fn compose_images(
     // mismatched margin. Falls back to the caller-supplied background.
     let canvas_bg = sample_background(&sources[0], background);
 
-    // Stretch every pane to a common cross-axis size so the panes align.
-    let filter = image::imageops::FilterType::Lanczos3;
-    let panes: Vec<RgbaImage> = match layout {
-        ComposeLayout::Horizontal => {
-            let target_h = sources.iter().map(|i| i.height()).max().unwrap_or(1).max(1);
-            sources
-                .into_iter()
-                .map(|img| {
-                    if img.height() == target_h {
-                        img
-                    } else {
-                        image::imageops::resize(&img, img.width().max(1), target_h, filter)
-                    }
-                })
-                .collect()
-        }
-        ComposeLayout::Vertical => {
-            let target_w = sources.iter().map(|i| i.width()).max().unwrap_or(1).max(1);
-            sources
-                .into_iter()
-                .map(|img| {
-                    if img.width() == target_w {
-                        img
-                    } else {
-                        image::imageops::resize(&img, target_w, img.height().max(1), filter)
-                    }
-                })
-                .collect()
-        }
+    // Pad every pane to a common cross-axis size so the panes align. Resizing
+    // would resample the text, so a smaller pane is extended with its own
+    // background instead and stays pixel-for-pixel as rendered.
+    let (target_w, target_h) = match layout {
+        ComposeLayout::Horizontal => (0, sources.iter().map(|i| i.height()).max().unwrap_or(1)),
+        ComposeLayout::Vertical => (sources.iter().map(|i| i.width()).max().unwrap_or(1), 0),
     };
+    let panes: Vec<RgbaImage> = sources
+        .into_iter()
+        .map(|img| {
+            let w = target_w.max(img.width()).max(1);
+            let h = target_h.max(img.height()).max(1);
+            if (w, h) == img.dimensions() {
+                return img;
+            }
+            let pane_bg = sample_background(&img, canvas_bg);
+            let mut padded: RgbaImage = ImageBuffer::from_pixel(w, h, pane_bg);
+            image::imageops::overlay(&mut padded, &img, 0, 0);
+            padded
+        })
+        .collect();
 
     let total_divider = divider * (panes.len() as u32 - 1);
     let (width, height) = match layout {
@@ -1184,10 +1184,10 @@ impl Renderer {
         let cols = screen.size().1 as u32;
 
         let content_rows = self.find_content_rows(screen, rows, cols);
-        // Optionally crop the image width to the rightmost column that
+        // Optionally trim the image width to the rightmost column that
         // actually holds content, so narrow output doesn't sit in a wide,
-        // mostly-empty frame. Skipped when content already fills most of the
-        // terminal width, to avoid awkward micro-crops.
+        // mostly-empty frame. The trim keeps the image's normal padding on the
+        // right and nothing more, so both margins match.
         let content_cols = if auto_crop {
             self.find_content_cols(screen, content_rows, cols)
         } else {
@@ -1882,13 +1882,22 @@ impl Renderer {
         (last_row_with_content + 1).min(rows)
     }
 
-    /// Scan the screen buffer to find the rightmost column that holds content
-    /// (visible text or a styled/inverse cell) and return the width, in cells,
-    /// to render. A small right padding is added and a minimum width enforced.
+    /// Scan the screen buffer for the rightmost column that holds meaningful
+    /// content - visible text, or a styled/inverse cell such as a colored
+    /// background block - and return the width, in cells, to render.
     ///
-    /// If the content already fills more than 90% of the terminal width the
-    /// full `cols` width is kept, so nearly-full output isn't shaved into an
-    /// awkward micro-crop.
+    /// The bound comes from the terminal buffer, never from the pixels of a
+    /// finished image: a composed screenshot's margin is the theme background,
+    /// which differs per theme and is indistinguishable from an empty cell.
+    ///
+    /// No spare cells are added. The image's normal [`Self::padding`] is the
+    /// only gap kept to the right of the last glyph, so a trimmed screenshot
+    /// has the same visual margin on the left and the right. That padding also
+    /// absorbs ink that legitimately overhangs its cell - anti-aliased edges,
+    /// the italic shear, the one-pixel faux-bold smear, and box drawing glyphs
+    /// that reach past their advance - so nothing is clipped. A double-width
+    /// character keeps its vt100 continuation cell, and a wrapped row reaches
+    /// the last column, so neither is cut in half.
     fn find_content_cols(&self, screen: &Screen, rows: u32, cols: u32) -> u32 {
         let mut max_col = 0u32;
         for row in 0..rows {
@@ -1898,21 +1907,19 @@ impl Renderer {
                     let has_text = !contents.is_empty() && contents != " ";
                     let styled = cell.bgcolor() != vt100::Color::Default || cell.inverse();
                     if has_text || styled {
-                        max_col = max_col.max(col + 1);
+                        // A double-width character owns this cell and the
+                        // (blank) continuation cell after it.
+                        let end = if cell.is_wide() { col + 2 } else { col + 1 };
+                        max_col = max_col.max(end.min(cols));
                         break;
                     }
                 }
             }
         }
 
-        // Only auto-crop when content is meaningfully narrower than the
-        // terminal; if it fills >90% of the width, keep the full width.
-        if max_col as f32 > cols as f32 * 0.9 {
-            return cols;
-        }
-
-        // Add a small right padding (2 cells) and ensure a minimum width.
-        (max_col + 2).min(cols).max(20).min(cols)
+        // A floor keeps an empty capture from collapsing to a zero-width
+        // image; it never widens output that already has content past it.
+        max_col.clamp(MIN_CONTENT_COLS.min(cols), cols)
     }
 
     fn resolve_cell_colors(&self, cell: &vt100::Cell, theme: &Theme) -> (Rgba<u8>, Rgba<u8>) {
@@ -2669,6 +2676,117 @@ mod tests {
             outer_padding: 0,
             title_bar_height: 0,
         })
+    }
+
+    /// Width trimming must leave exactly the renderer's own padding to the
+    /// right of the last glyph - the same gap as on the left - rather than a
+    /// handful of spare cells or the whole unused terminal width.
+    #[test]
+    fn width_trim_leaves_the_same_padding_on_both_sides() {
+        let renderer = bare_renderer();
+        let theme = Theme::dark();
+        let cols = 120u16;
+        // Fills 92% of the terminal: wide enough that an earlier "close
+        // enough to full width" shortcut would have kept all 120 columns.
+        let used = 110usize;
+        let mut parser = vt100::Parser::new(4, cols, 0);
+        parser.process("x".repeat(used).as_bytes());
+        let screen = parser.screen();
+
+        let img = renderer
+            .render_screen(screen, &theme, &renderer.default_fonts, None, true)
+            .unwrap();
+
+        let cell_w = renderer.default_fonts.cell_width * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        assert_eq!(img.width(), used as u32 * cell_w + padding * 2);
+
+        // The last cell still carries ink, so nothing was clipped, and the
+        // margins on either side of the text match to within a cell.
+        assert!(
+            ink_in_columns(
+                &img,
+                padding + (used as u32 - 1) * cell_w,
+                padding + used as u32 * cell_w
+            ) > 0,
+            "the last column of text was trimmed away"
+        );
+        let bg = theme.background;
+        let inked = |x: u32| (0..img.height()).any(|y| *img.get_pixel(x, y) != bg);
+        let left = (0..img.width()).find(|&x| inked(x)).expect("ink");
+        let right = (0..img.width()).rev().find(|&x| inked(x)).expect("ink");
+        let right_margin = img.width() - 1 - right;
+        assert!(
+            right_margin >= 1,
+            "anti-aliased glyph edge touches the right border"
+        );
+        assert!(
+            (left as i32 - right_margin as i32).unsigned_abs() <= cell_w,
+            "asymmetric margins: {left}px on the left, {right_margin}px on the right"
+        );
+    }
+
+    /// The trim bound is taken from the terminal buffer, so a styled cell with
+    /// no text (a colored background block) still counts as content.
+    #[test]
+    fn width_trim_keeps_trailing_styled_cells() {
+        let renderer = bare_renderer();
+        let theme = Theme::dark();
+        let mut parser = vt100::Parser::new(4, 80, 0);
+        // "hi" then a green background run of four blank cells.
+        parser.process(b"hi\x1b[42m    \x1b[0m");
+        let img = renderer
+            .render_screen(parser.screen(), &theme, &renderer.default_fonts, None, true)
+            .unwrap();
+
+        let cell_w = renderer.default_fonts.cell_width * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        assert_eq!(img.width(), 6 * cell_w + padding * 2);
+        assert_ne!(
+            *img.get_pixel(padding + 5 * cell_w + cell_w / 2, padding + 2),
+            theme.background,
+            "the trailing styled cell was trimmed away"
+        );
+    }
+
+    /// A double-width character owns a blank vt100 continuation cell; trimming
+    /// must keep it so the glyph is not sliced down the middle.
+    #[test]
+    fn width_trim_keeps_a_wide_characters_continuation_cell() {
+        let renderer = bare_renderer();
+        let theme = Theme::dark();
+        let mut parser = vt100::Parser::new(4, 80, 0);
+        parser.process("ab\u{4f60}".as_bytes());
+        let img = renderer
+            .render_screen(parser.screen(), &theme, &renderer.default_fonts, None, true)
+            .unwrap();
+
+        let cell_w = renderer.default_fonts.cell_width * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        assert_eq!(img.width(), 4 * cell_w + padding * 2);
+    }
+
+    /// Trimming is opt-out: `auto_crop = false` still renders the full
+    /// terminal width.
+    #[test]
+    fn width_trim_can_be_disabled() {
+        let renderer = bare_renderer();
+        let theme = Theme::dark();
+        let mut parser = vt100::Parser::new(4, 80, 0);
+        parser.process(b"hi");
+        let img = renderer
+            .render_screen(
+                parser.screen(),
+                &theme,
+                &renderer.default_fonts,
+                None,
+                false,
+            )
+            .unwrap();
+
+        let cell_w = renderer.default_fonts.cell_width * RENDER_SCALE;
+        let padding = renderer.padding * RENDER_SCALE;
+        assert_eq!(img.width(), 80 * cell_w + padding * 2);
     }
 
     #[test]
@@ -3551,6 +3669,39 @@ mod tests {
     // ---------------------------------------------------------------------
     // Composed image descriptions
     // ---------------------------------------------------------------------
+
+    /// Width trimming makes panes of different widths the normal case, so
+    /// composing must pad a narrower pane with its own background rather than
+    /// rescale it: every source pixel has to survive unchanged.
+    #[test]
+    fn compose_pads_narrow_panes_instead_of_rescaling_them() {
+        let dir = std::path::Path::new("target/compose-padding-test");
+        std::fs::create_dir_all(dir).unwrap();
+
+        let wide_path = dir.join("wide.png");
+        let narrow_path = dir.join("narrow.png");
+        let wide: RgbaImage = ImageBuffer::from_pixel(40, 10, Rgba([10, 10, 10, 255]));
+        let mut narrow: RgbaImage = ImageBuffer::from_pixel(20, 10, Rgba([80, 20, 20, 255]));
+        // A single bright pixel: any resample would smear it into neighbours.
+        narrow.put_pixel(5, 5, Rgba([255, 255, 0, 255]));
+        save_png(&wide, &wide_path, None).unwrap();
+        save_png(&narrow, &narrow_path, None).unwrap();
+
+        let composed = compose_images(
+            &[wide_path, narrow_path],
+            ComposeLayout::Vertical,
+            0,
+            Rgba([0, 0, 0, 255]),
+        )
+        .expect("compose");
+
+        assert_eq!(composed.dimensions(), (40, 20));
+        assert_eq!(*composed.get_pixel(5, 15), Rgba([255, 255, 0, 255]));
+        assert_eq!(*composed.get_pixel(6, 15), Rgba([80, 20, 20, 255]));
+        // The pad to the right of the narrow pane uses that pane's own
+        // background, so the seam is invisible.
+        assert_eq!(*composed.get_pixel(30, 15), Rgba([80, 20, 20, 255]));
+    }
 
     /// A composed image's description is the panes' descriptions, in order,
     /// with a clear separator and Unicode preserved.

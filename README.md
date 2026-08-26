@@ -26,8 +26,9 @@ termshot exec --chrome gnome --title 'termshot - ls src/' 'ls --color=always -la
 
 ## Highlights
 
-**Real ANSI rendering** - colors, bold, italic, underline, Unicode.
-Rendered at 2x resolution with your own font.
+**Real ANSI rendering** - colors, bold, italic, underline, Unicode, rendered
+at 2x resolution with your own font. Commands run in a PTY through your login
+shell, so your prompt, aliases, and `PATH` are in the image.
 
 <p align="center">
   <img src="docs/assets/ansi.png" alt="Screenshot of a colorized 'git log --graph --oneline' with orange commit hashes rendered next to the shell prompt" width="700">
@@ -38,26 +39,17 @@ termshot exec 'git log --graph --oneline --color=always -n 6'
 ```
 
 **Redaction** - opt-in masking of secrets in the image (`--redact`, or
-`auto = true` in config). Text returned to the caller preserves originals so
-agents can inspect and selectively redact.
+`auto = true` in config). The text returned to the caller keeps the originals,
+so an agent can inspect it and selectively redact.
+See [docs/redaction.md](./docs/redaction.md).
 
 <p align="center">
   <img src="docs/assets/redaction.png" alt="Screenshot of an accidentally cat'd .env.staging file where the AWS key, secret, database URL, GitHub token, and Stripe key are each partially masked by red blocks labeled AWSKEY, SECRET, DBURL, GITHUB, and STRIPE - the identifying prefix stays visible so you can see the secret type but not its value" width="700">
 </p>
 
 ```sh
-# `command cat` bypasses the shell alias: termshot runs your interactive shell,
-# where `cat` is often `bat`/`batcat` and would add its own frame and line numbers
 termshot exec --redact --chrome gnome 'command cat .env.staging'
-
-# the labelled, prefix-preserving blocks above come from custom rules using
-# `keep_prefix`: drop a .toml in ~/.config/termshot/rules/ and it is picked up
-# automatically - see docs/redaction.md
 ```
-
-Set `[redaction] enabled = false` in the config to turn redaction off entirely;
-with it off, an explicit `--redact` fails loudly instead of quietly writing an
-unredacted image.
 
 **Themes** - 11 built-in (using the bundled JetBrains Mono), plus any themes you
 drop in `~/.config/termshot/themes/`, each with its own fonts.
@@ -73,6 +65,26 @@ for theme in catppuccin-mocha dracula nord; do
 done
 termshot compose --divider 4 -o themes.png \
   catppuccin-mocha.png dracula.png nord.png
+```
+
+**Your prompt, whatever it is** - commands run through your login shell, so the
+prompt in the image is the one your own shell config draws. Prompts are
+independent of termshot themes, which only set colors, font, and background:
+the four panes below are four different shell prompts in the one built-in
+`dark` theme.
+
+<p align="center">
+  <img src="docs/assets/prompts.png" alt="Four stacked terminal panes, all rendered in the built-in dark theme, each running the same 'git status -sb' in the same demo repository behind a different real shell prompt, with a trailing shell comment naming the style: a distro-style bash PS1 with the user in green and the path in blue; Oh My Zsh's robbyrussell theme with its green arrow, cyan directory, blue git:(main) marker and yellow dirty cross; Oh My Zsh's bira theme, a two-line prompt whose box-drawing corners bracket the user, path and a yellow branch tag with a red dirty dot; and a personal zsh prompt that appends the branch as ~(main). The identical two lines of output under each prompt show that the prompt comes from the shell, not from termshot" width="820">
+</p>
+
+Starship, Powerlevel10k, Oh My Zsh themes, or a hand-rolled `PS1` show up the
+same way. The image uses isolated shell configs so it does not modify the
+user's normal setup.
+
+```sh
+TERMSHOT_SHELL=/path/to/shell-wrapper termshot exec \
+  --theme dark -o prompt.png 'git status -sb'
+termshot compose --divider 4 -o prompts.png prompt-*.png
 ```
 
 **Chrome frames** - title bar presets with optional timestamp. Good for
@@ -101,6 +113,10 @@ termshot compose --layout horizontal --chrome gnome \
   --title 'git status - before / after staging' -o compose.png before.png after.png
 ```
 
+**Accessible by default** - every PNG embeds its terminal text (redacted, when
+redaction ran) in a UTF-8 `Description` chunk so screen readers can read the
+screenshot. Turn it off with `--no-description` or `embed_description = false`.
+
 **MCP server** - four tools for agent workflows:
 `execute_and_screenshot`, `render_ansi`, `redact_screenshot`,
 `compose_screenshots`.
@@ -114,141 +130,34 @@ cargo build --release
 # binary at ./target/release/termshot
 ```
 
-### Prebuilt releases
+Tagged releases also publish Linux (x86_64, aarch64, static musl) and macOS
+(Intel, Apple Silicon) binaries plus `.deb` and `.rpm` packages.
 
-Each tagged release publishes:
-
-| Artifact | Contents |
-| --- | --- |
-| `termshot-<tag>-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 (glibc) |
-| `termshot-<tag>-aarch64-unknown-linux-gnu.tar.gz` | Linux aarch64 (glibc) |
-| `termshot-<tag>-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64, fully static (no glibc needed) |
-| `termshot-<tag>-x86_64-apple-darwin.tar.gz` | macOS Intel |
-| `termshot-<tag>-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
-| `termshot_<version>-1_amd64.deb` | Debian/Ubuntu x86_64 |
-| `termshot_<version>-1_arm64.deb` | Debian/Ubuntu aarch64 |
-| `termshot-<version>-1.x86_64.rpm` | Fedora/RHEL/openSUSE x86_64 |
-
-Every archive carries the binary, `LICENSE`, `README.md`, `docs/`, the man page
-(`termshot.1`), and `termshot.example.toml`.
-
-RPM is x86_64 only: the RPM tooling derives package dependencies by inspecting
-the built binary with the host's `ldd`, which cannot read a foreign-architecture
-ELF, so an aarch64 RPM would ship without a glibc requirement. On aarch64 RPM
-distros, install from the `aarch64-unknown-linux-gnu` archive (the static musl
-build is published for x86_64 only).
-
-### Debian/Ubuntu package
-
-Release builds publish a `.deb` for `x86_64` and `aarch64`. It installs the
-binary to `/usr/bin/termshot`, the man page to
-`/usr/share/man/man1/termshot.1.gz`, and the docs, `LICENSE`, and a sample
-config under `/usr/share/doc/termshot/` (the sample config is
-`config.toml.example`). The RPM lays out the same files.
-
-The package does not write a user config. On first run any command that touches
-config - for example `termshot themes` - bootstraps
-`~/.config/termshot/` (including `config.toml`), so your settings are never
-overwritten by upgrades.
+Linux and macOS only: termshot uses PTYs and POSIX signals.
 
 ## Usage
 
 ```sh
-# basic screenshot
-termshot exec 'ls --color=always -la'
+termshot exec 'ls --color=always -la'                          # basic screenshot
+termshot exec --chrome gnome --theme dracula 'git log'         # chrome + theme
+termshot exec --redact 'cat credentials.txt'                   # mask secrets
+termshot exec --no-rounded 'ls --color=always'                 # square corners
+termshot compose -o diff.png before.png after.png              # stack two shots
+termshot themes                                                # list themes
 
-# with chrome and theme
-termshot exec --chrome gnome --theme dracula 'git log --oneline'
-
-# auto-redact secrets in the image
-termshot exec --redact 'cat credentials.txt'
-
-# square (un-rounded) corners; corners are rounded by default
-termshot exec --no-rounded 'ls --color=always'
-
-# render pre-captured ANSI without executing anything: from a pipe or a file
+# render pre-captured ANSI without executing anything, from a file or a pipe
 cmd --color=always | termshot render -
 termshot render output.log --redact
-
-# side-by-side comparison
-termshot compose -o diff.png before.png after.png
-
-# list themes
-termshot themes
 ```
-
-`termshot render` reads raw ANSI data (from a file, or from stdin with `-`) and
-renders it to a PNG **without executing anything** - handy for piping the output
-of a command you have already run, or for previously saved logs. Bare `\n` line
-endings from non-TTY output are handled automatically. It takes the same
-`--redact` / `--no-redact` flags as `exec`.
-
-### Your shell, your environment
-
-`termshot exec` runs the command in a real PTY through your shell as a **login
-+ interactive** shell (`$SHELL -l -i`), so it sources your profile
-(`~/.bashrc`, `~/.zshrc`, ...) and inherits the environment you normally work
-in: prompt (PS1), aliases and shell functions, `PATH`, exports, and shell
-options. That is what makes a screenshot look like *your* terminal.
-
-It also means aliases apply. If `cat` is aliased to `bat`/`batcat`, then
-`termshot exec 'cat file'` screenshots *bat's* framed, line-numbered output.
-Bypass an alias the same way you would interactively:
-
-```sh
-termshot exec 'command cat .env.staging'   # ignore the alias, run the real cat
-termshot exec '\cat .env.staging'           # same, via backslash
-termshot exec --no-prompt 'cat .env.staging'  # non-interactive: no aliases at all
-```
-
-The screen is reset before the command runs, so shell startup banners (MOTD,
-version notices) stay out of the image and every capture shows exactly one
-prompt: the one in front of your command. The trailing prompt the shell draws
-afterwards is removed too, including the upper lines of a multi-line PS1.
-
-`--no-prompt` runs the command non-interactively instead (`$SHELL -c`), so
-there is no PS1 in the image and interactive-only startup files are not
-sourced. Set `shell` in the config (or `TERMSHOT_SHELL`) to capture with a
-different shell.
-
-**Accessibility** - every PNG embeds its terminal text (the redacted version
-when redaction ran) in a UTF-8 `Description` metadata chunk (PNG `iTXt`), so
-screen readers can read the screenshot and box drawing, Greek, and CJK survive
-intact. Disable per run with `--no-description`, or globally with
-`embed_description = false`. Composed images carry the same metadata: the
-panes' descriptions are read back and joined, separated by `--- Pane N ---`
-markers. The MCP tools have no toggle for this: the document or app that embeds
-a screenshot owns its alt text, so the server always follows the global config.
-
-### Known limitations
-
-- **Fallback covers common gaps, not everything.** Glyphs the configured font
-  lacks are taken from the bundled JetBrains Mono, which covers box drawing,
-  arrows, and common symbols (so `bat`, `btop`, and `eza` frames render even
-  under a font that lacks them). Scripts neither font has - CJK and most
-  Powerline/Nerd Font glyphs - still render as `.notdef` boxes until you add a
-  covering face to the theme's `fallback_fonts`. See
-  [docs/themes.md](./docs/themes.md#glyph-coverage-and-font-fallback).
-- **Unix only.** termshot uses PTYs and POSIX signals; Linux and macOS are
-  supported, Windows is not.
 
 ## Tips
 
 ```sh
-# screenshot the last command you ran (bash/zsh history expansion)
-termshot exec '!!'
-
-# alias for quick screenshots
+termshot exec '!!'                            # your shell expands !! first
+termshot exec 'command cat .env.staging'      # bypass a cat -> bat alias
+termshot exec --no-prompt 'cat .env.staging'  # no prompt, no aliases
 alias tshot='termshot exec'
-tshot 'git status'
-
-# render pre-captured ANSI output from a file or pipe
-cmd --color=always | termshot render -
-termshot render output.log
 ```
-
-`!!` is expanded by your shell before termshot ever sees it, so you get a
-screenshot of your previous command line and its output.
 
 ## MCP server
 
@@ -267,13 +176,10 @@ Add to your MCP client config:
 
 ## Docs
 
-- [docs/mcp.md](./docs/mcp.md) - MCP server setup, tool reference, and
-  agent workflow examples
-- [docs/themes.md](./docs/themes.md) - theme format, built-in list, user
-  themes, font config, and font fallback
-- [docs/redaction.md](./docs/redaction.md) - redaction rules, custom YAML
-  format, partial redaction, and labels
-- [docs/config.md](./docs/config.md) - full `config.toml` reference
+- [docs/mcp.md](./docs/mcp.md) - MCP setup, tool reference, agent workflows
+- [docs/themes.md](./docs/themes.md) - built-in and user themes, fonts, fallback
+- [docs/redaction.md](./docs/redaction.md) - rules, custom rules, partial redaction
+- [docs/config.md](./docs/config.md) - `config.toml` reference
 
 ## License
 
