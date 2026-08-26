@@ -40,11 +40,12 @@ termshot exec 'git log --graph --oneline --color=always -n 6'
 the caller keeps the originals. See [docs/redaction.md](./docs/redaction.md).
 
 <p align="center">
-  <img src="docs/assets/redaction.png" alt="Screenshot of command cat .env.staging in a GNOME window. The variable names AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, and STRIPE_SECRET_KEY remain visible while their values are masked by red blocks. The prefixes AKIA, ghp_, and sk_live_ remain visible to identify each secret type." width="700">
+  <img src="docs/assets/redaction.png" alt="Screenshot of command cat .env.staging in a macOS-style window. The variable names AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, and STRIPE_SECRET_KEY remain visible while their values are masked by labeled red blocks." width="700">
 </p>
 
 ```sh
-termshot exec --redact --chrome gnome 'command cat .env.staging'
+termshot exec --redact --chrome macos --title 'cat .env.staging' \
+  'command cat .env.staging'
 ```
 
 **Themes** - 11 built-in, plus your own in `~/.config/termshot/themes/`.
