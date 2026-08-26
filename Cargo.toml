@@ -1,9 +1,15 @@
 [package]
 name = "termshot"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 license = "MIT"
-description = "MCP server and CLI tool that captures terminal screenshots with full ANSI rendering"
+description = "Terminal screenshot CLI and MCP server with ANSI rendering, redaction, themes, and composition"
+repository = "https://github.com/Adamkadaban/termshot"
+homepage = "https://github.com/Adamkadaban/termshot"
+documentation = "https://docs.rs/termshot"
+readme = "README.md"
+keywords = ["terminal", "screenshot", "ansi", "mcp", "cli"]
+categories = ["command-line-utilities", "multimedia::images"]
 
 [[bin]]
 name = "termshot"
