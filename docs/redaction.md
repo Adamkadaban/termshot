@@ -1,230 +1,110 @@
 # Redaction
 
-termshot can mask sensitive data so screenshots are safe to share. Redaction
-masks the rendered IMAGE; by default the text returned to the caller keeps the
-ORIGINAL content, so an agent can see what was on screen and decide what else to
-hide.
+Redaction masks the rendered IMAGE. The text returned to the caller keeps the
+ORIGINAL content by default, so an agent can see what was on screen and decide
+what else to hide.
+
+## Default behavior
 
 Redaction is opt-in. Enable it per run with `--redact` or `--redact-rules a,b`
-(CLI), or `redact` / `redaction_rules` (MCP). To make it always-on, set
-`auto = true` in the config `[redaction]` section. Use `--redact-text` (or
-`redact_text: true`) to also scrub the returned text, and `--no-redact` (or
-`redact: false`) to force it off for one run.
+(CLI), or `redact` / `redaction_rules` (MCP); set `auto = true` in the config
+`[redaction]` section for always-on. `--redact-text` (`redact_text: true`) also
+scrubs the returned text, `--no-redact` (`redact: false`) forces redaction off
+for one run, and `[redaction] enabled = false` is the master switch under which
+no rule runs and an explicit `--redact` errors instead of returning an
+unredacted image. Defaults are `enabled = true`, `auto = false`.
 
-`[redaction] enabled` is the master switch. With `enabled = false` no rule ever
-runs, and an explicit `--redact` fails with an error rather than handing back an
-unredacted image. The shipped default is `enabled = true`, `auto = false`.
+Matches are covered with a colored block and a short `[LABEL]` tag. Rules run
+against logical lines, so a secret that wrapped across the right margin is
+masked on both rows. Non-sensitive values such as `127.0.0.1`, `::1`, and IPv6
+look-alikes in code (`std::fs::read`) are left visible.
 
 ## Built-in rules
 
-A set of rules is compiled in and enabled by default:
+Compiled in and enabled by default:
 
 ```
-ipv4, ipv6, mac, aws_key, aws_secret, private_key, jwt, email, hostname,
-api_key, github_token, slack_token, private_key_pem, gcp_service_account,
+ipv4, ipv6, mac, aws_key, aws_secret, private_key, private_key_pem, jwt, email,
+hostname, api_key, github_token, slack_token, discord_token, gcp_service_account,
 azure_client_secret, generic_api_key, bearer_token, connection_string,
-discord_token, hashicorp_vault_token
+hashicorp_vault_token
 ```
 
 Several provider-token patterns (GitHub, Slack, Discord, HashiCorp Vault, GCP,
 Azure, and the generic key/token/connection-string matchers) are sourced from
 and inspired by [Betterleaks](https://github.com/betterleaks/betterleaks) (MIT).
-
-Matches are covered with a colored block and a short `[LABEL]` tag. Rules run
-against logical lines, so a secret that crosses the right margin is masked on
-both rows. That works because a capture keeps the terminal's own soft-wrap
-information: the raw PTY bytes are sliced, never re-emitted row by row, so a
-value the terminal wrapped is still one value to the rules - including in the
-line the interactive shell echoes back before it runs your command. Hard
-newlines are never joined, so two unrelated lines cannot form a match between
-them. Obviously non-sensitive values such as `127.0.0.1`, `::1`, and IPv6
-look-alikes in code (`std::fs::read`) are left visible.
-
-The built-ins favor precision over recall: a silently corrupted screenshot is
-worse than one you chose not to redact. Review the returned text and use
-`--redaction` (CLI) or `redact_screenshot` (MCP) for anything the rules do not
-cover.
+They favor precision over recall: review the returned text and add a manual
+redaction for anything they miss.
 
 ## Custom rules
 
-Every `.toml`, `.yaml`, and `.yml` file in `~/.config/termshot/rules/` (created
-on first run) is loaded automatically. Supply an additional directory with
-`--rules-path <dir>` or the `[redaction] rules_path` config key; its rules are
-layered on top and win on name conflicts.
-
-TOML files use the native `[[rules]]` format:
+Every `.toml`, `.yaml`, and `.yml` file in `~/.config/termshot/rules/` is loaded
+automatically. Add another directory with `--rules-path <dir>` or the
+`[redaction] rules_path` key; its rules layer on top and win name conflicts.
 
 ```toml
 [[rules]]
 name = "ticket"
-pattern = 'TICKET-\d+'
+# Wrap the part to mask in (?P<redact>...) to match context without masking it:
+pattern = '(?:^|\s)(?P<redact>TICKET-\d+)\b'
 replacement = "[REDACTED-TICKET]"
 enabled = true
-# Optional per-rule block color, entropy floor, and partial-redaction counts:
-# color = "#ff6600"
-# min_entropy = 3.5
-# keep_prefix = 4
-# keep_suffix = 0
+# Optional: color = "#ff6600", min_entropy = 3.5, keep_prefix = 4, keep_suffix = 0
 ```
 
-Wrap the part to mask in a `(?P<redact>...)` group to match surrounding context
-without masking it, for example `'(?:^|\s)(?P<redact>TICKET-\d+)\b'`.
-
-Built-ins can be overridden or disabled by name. An override keeps the built-in
-label and can change the pattern, color, entropy floor, and `keep_prefix` /
-`keep_suffix`. An empty or omitted `pattern` keeps the built-in pattern:
-
-```toml
-# Disable a built-in.
-[[rules]]
-name = "email"
-enabled = false
-
-# Keep only the first 4 characters of every AWS key visible.
-[[rules]]
-name = "aws_key"
-keep_prefix = 4
-```
+Built-ins are overridden or disabled by reusing their name: `name = "email"` with
+`enabled = false` turns one off, and `name = "aws_key"` with `keep_prefix = 4`
+overrides one field while keeping the built-in label and pattern.
 
 YAML files use the Kingfisher rule format (Apache 2.0), a `rules:` list with
-`name`/`id` and `pattern`/`regex`:
-
-```yaml
-rules:
-  - name: ticket
-    id: ticket
-    pattern: 'TICKET-\d+'
-```
-
-## Partial redaction
-
-To reveal only part of a secret, either write a regex that matches just the
-sensitive portion, or set `keep_prefix` and/or `keep_suffix` (character counts)
-to leave leading and trailing characters visible and mask the middle. For an AWS
-key `AKIA...`, `keep_prefix: 4` shows `AKIA` followed by blocks. If the kept
-prefix and suffix cover the whole match, nothing is redacted.
-
-These work in config rules and in the manual specifications below, from both
-the CLI and MCP:
-
-```json
-{
-  "pattern": "AKIA[0-9A-Z]{16}",
-  "keep_prefix": 4
-}
-```
+`name`/`id` and `pattern`/`regex`.
 
 ## Manual redaction (CLI and MCP)
 
-A manual redaction masks something the rules do not know about. The CLI takes
-one per repeatable `--redaction '<JSON>'` option on `exec` and `render`, and
-MCP takes a list of them in `execute_and_screenshot`, `render_ansi`, and
-`redact_screenshot`'s `redactions`. All of them decode the same JSON with the
-same code, so a specification behaves identically either way - same blocks,
-same labels, same audit names, same pixels.
-
-A regex pattern, matched against every line the screenshot shows:
+The CLI takes one per repeatable `--redaction '<JSON>'` on `exec` and `render`;
+MCP takes a list in `redactions` on `execute_and_screenshot`, `render_ansi`, and
+`redact_screenshot`. All decode the same JSON. Either a regex pattern, matched
+against every line the screenshot shows:
 
 ```json
-{
-  "pattern": "[a-f0-9]{32}",
-  "replacement": "HASH",
-  "keep_prefix": 4,
-  "keep_suffix": 0,
-  "color": "#d41919"
-}
+{ "pattern": "[a-f0-9]{32}", "replacement": "HASH", "keep_prefix": 4, "color": "#d41919" }
 ```
 
-Only `pattern` is required. `replacement` (also accepted as `label`) is the
-short `[LABEL]` tag drawn over the block; omit it for a plain block.
-`keep_prefix` / `keep_suffix` leave that many characters visible, and `color`
-sets this redaction's block color.
-
-An explicit cell range on one row of the rendered screenshot:
+or an explicit cell range on one row (`label` and `color` optional):
 
 ```json
-{
-  "row": 3,
-  "col_start": 12,
-  "col_end": 44,
-  "label": "SECRET",
-  "color": "#d41919"
-}
+{ "row": 3, "col_start": 12, "col_end": 44, "label": "SECRET" }
 ```
-
-Coordinates are 0-based and counted in the image as rendered: row 0 is the top
-line the PNG shows, which for a `--head-lines` / `--tail-lines` render is the
-first line of that selection, and the width is the one `auto_crop` leaves. A
-row, column, or empty range outside those bounds is an error naming the
-rendered dimensions, never a block that quietly covers nothing.
 
 ```sh
-termshot exec \
-  --redaction '{"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_prefix":4}' \
-  'secretsdump.py corp.local/user@10.20.30.40'
-
-termshot render --redaction '{"pattern":"AKIA[0-9A-Z]{16}","keep_prefix":4}' \
-  capture.ansi
+termshot exec --redaction '{"pattern":"[a-f0-9]{32}","keep_prefix":4}' 'secretsdump.py 10.20.30.40'
 ```
 
-On the CLI:
+Only `pattern` (or a full `row`/`col_start`/`col_end` range) is required.
+Coordinates are 0-based and counted in the image as rendered, so row 0 is its
+top visible line; out-of-range values are an error naming the rendered
+dimensions rather than a block that quietly covers nothing. Specifications apply
+in the order given (patterns first, then cell ranges) and mask the image even
+without `--redact` / `redact: true`, which additionally runs the built-in rules.
+Combining them with `--no-redact` (`redact: false`) is refused, as is invalid
+JSON, an unknown field, a bad regex, or a bad color. See
+[mcp.md](./mcp.md#workflow-capture-inspect-redact) for the agent workflow.
 
-- The option is repeatable and applies in the order given; patterns run first,
-  then cell ranges.
-- Passing it redacts the screenshot even without `--redact`. Add `--redact` (or
-  `--redact-rules`) to run the built-in rules as well.
-- It conflicts with `--no-redact`: a run that asks for both is refused rather
-  than quietly returning an unredacted image.
-- `--redact-text` scrubs the returned text, and the PNG's `Description`
-  metadata always carries the redacted text, exactly as for rule-based
-  redaction.
-- Invalid JSON, an unknown field, an invalid regex, and an unparseable color
-  are refused before the command runs.
+## Partial redaction
 
-Over MCP, `execute_and_screenshot` and `render_ansi` take the same list inline:
-
-```json
-{
-  "command": "secretsdump.py corp.local/user@10.20.30.40",
-  "redactions": [
-    { "pattern": "[a-f0-9]{32}", "replacement": "HASH", "keep_prefix": 4,
-      "color": "#ff6600" }
-  ]
-}
-```
-
-The rules are the CLI's, point for point: the list applies in order (patterns
-first, then cell ranges), it masks the image even when `redact` is omitted,
-`redact: true` or `redaction_rules` runs the built-in rules alongside it, and
-`redact: false` with a non-empty list is an `invalid_params` error rather than
-an unredacted screenshot - the MCP spelling of `--redaction` conflicting with
-`--no-redact`. An invalid regex, color, or coordinate range is refused before
-the command runs. `redact_screenshot` is still there for what you only notice
-after reading the output.
-
-## Selective redaction workflow
-
-An agent can capture, read the real output, and mask exactly what matters:
-
-1. Capture with `execute_and_screenshot` (or `render_ansi`). The returned text
-   is the original content even when the PNG is masked.
-2. Inspect the text and decide what else is sensitive.
-3. Call `redact_screenshot` with the screenshot path and a list of redactions,
-   in the shared format above. The image is re-rendered in place from the
-   server's in-memory record of the capture (no sidecar files on disk).
-
-See [mcp.md](./mcp.md#workflow-capture-inspect-selectively-redact).
+To reveal part of a secret, write a regex matching only the sensitive portion,
+or set `keep_prefix` / `keep_suffix` (character counts, valid in config rules
+and manual specifications alike): for `AKIA...`, `keep_prefix: 4` shows `AKIA`
+followed by blocks. If they cover the whole match, nothing is redacted.
 
 ## Labels and colors
 
-Each block can carry a short tag. For a built-in it is a fixed abbreviation
-(`IP`, `KEY`, `JWT`); for a custom rule it is derived from `replacement`, so
-`[REDACTED-TICKET]` becomes `TICKET` and an empty `replacement` means no label.
-A manual redaction's label is its `replacement` (pattern) or `label`
-(coordinates); a coordinate range with no label is tagged `[REDACTED]`. Pass
-`show_labels: false` (on `execute_and_screenshot` or `redact_screenshot`) to
-draw plain solid blocks everywhere.
+Each block can carry a short tag: a fixed abbreviation for a built-in (`IP`,
+`KEY`, `JWT`), the `replacement` for a custom or pattern rule (`[REDACTED-TICKET]`
+becomes `TICKET`, an empty value means no label), or `label` for a coordinate
+range (untagged ranges become `[REDACTED]`). Pass `show_labels: false` over MCP
+for plain solid blocks.
 
-Block and label colors are set engine-wide with `[redaction] color` and
-`[redaction] label_color`, per rule with a rule's `color` field, and per manual
-redaction with its `color` field, all as `#RRGGBB`. The default block is bright red (`#d41919`) with a black label.
+Colors are `#RRGGBB`: engine-wide with `[redaction] color` and
+`[redaction] label_color` (see [config.md](./config.md)), and per rule or manual
+redaction with a `color` field. The default is bright red (`#d41919`).

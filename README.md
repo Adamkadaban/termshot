@@ -12,9 +12,8 @@
 
 ---
 
-Run a command, get a PNG that looks like your terminal. Works as a
-standalone CLI and as an MCP server for AI agents. Built for pentest
-reports, blog posts, and PR descriptions.
+Run a command, get a PNG that looks like your terminal. Standalone CLI and MCP
+server, built for pentest reports, blog posts, and PR descriptions.
 
 <p align="center">
   <img src="docs/assets/hero.png" alt="termshot capturing a colorized 'ls -la' of the source tree with the shell prompt visible, framed in a GNOME window with the command as its title" width="700">
@@ -26,9 +25,8 @@ termshot exec --chrome gnome --title 'termshot - ls src/' 'ls --color=always -la
 
 ## Highlights
 
-**Real ANSI rendering** - colors, bold, italic, underline, Unicode, rendered
-at 2x resolution with your own font. Commands run in a PTY through your login
-shell, so your prompt, aliases, and `PATH` are in the image.
+**Real ANSI rendering** - colors, bold, italic, underline, Unicode, at 2x
+resolution with your own font.
 
 <p align="center">
   <img src="docs/assets/ansi.png" alt="Screenshot of a colorized 'git log --graph --oneline' with orange commit hashes rendered next to the shell prompt" width="700">
@@ -38,10 +36,8 @@ shell, so your prompt, aliases, and `PATH` are in the image.
 termshot exec 'git log --graph --oneline --color=always -n 6'
 ```
 
-**Redaction** - opt-in masking of secrets in the image (`--redact`, or
-`auto = true` in config). The text returned to the caller keeps the originals,
-so an agent can inspect it and selectively redact.
-See [docs/redaction.md](./docs/redaction.md).
+**Redaction** - opt-in masking of secrets in the image; the text returned to
+the caller keeps the originals. See [docs/redaction.md](./docs/redaction.md).
 
 <p align="center">
   <img src="docs/assets/redaction.png" alt="Screenshot of command cat .env.staging in a GNOME window. The variable names AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, and STRIPE_SECRET_KEY remain visible while their values are masked by red blocks. The prefixes AKIA, ghp_, and sk_live_ remain visible to identify each secret type." width="700">
@@ -51,8 +47,8 @@ See [docs/redaction.md](./docs/redaction.md).
 termshot exec --redact --chrome gnome 'command cat .env.staging'
 ```
 
-**Themes** - 11 built-in (using the bundled JetBrains Mono), plus any themes you
-drop in `~/.config/termshot/themes/`, each with its own fonts.
+**Themes** - 11 built-in, plus your own in `~/.config/termshot/themes/`.
+See [docs/themes.md](./docs/themes.md).
 
 <p align="center">
   <img src="docs/assets/themes.png" alt="The same colorized 'git log' command rendered in three built-in themes - catppuccin-mocha, dracula, and nord - stacked with thin dividers to show their different backgrounds and palettes" width="700">
@@ -68,18 +64,12 @@ termshot compose --divider 4 -o themes.png \
 ```
 
 **Your prompt, whatever it is** - commands run through your login shell, so the
-prompt in the image is the one your own shell config draws. Prompts are
-independent of termshot themes, which only set colors, font, and background:
-the four panes below are four different shell prompts in the one built-in
-`dark` theme.
+image shows the prompt your own shell config draws: the four panes below are
+four different prompts in the one built-in `dark` theme.
 
 <p align="center">
   <img src="docs/assets/prompts.png" alt="Four stacked terminal panes, all rendered in the built-in dark theme, each running the same 'git status -sb' in the same demo repository behind a different real shell prompt, with a trailing shell comment naming the style: a distro-style bash PS1 with the user in green and the path in blue; Oh My Zsh's robbyrussell theme with its green arrow, cyan directory, blue git:(main) marker and yellow dirty cross; Oh My Zsh's bira theme, a two-line prompt whose box-drawing corners bracket the user, path and a yellow branch tag with a red dirty dot; and a personal zsh prompt that appends the branch as ~(main). The identical two lines of output under each prompt show that the prompt comes from the shell, not from termshot" width="820">
 </p>
-
-Starship, Powerlevel10k, Oh My Zsh themes, or a hand-rolled `PS1` show up the
-same way. The image uses isolated shell configs so it does not modify the
-user's normal setup.
 
 ```sh
 TERMSHOT_SHELL=/path/to/shell-wrapper termshot exec \
@@ -87,8 +77,7 @@ TERMSHOT_SHELL=/path/to/shell-wrapper termshot exec \
 termshot compose --divider 4 -o prompts.png prompt-*.png
 ```
 
-**Chrome frames** - title bar presets with optional timestamp. Good for
-reports and blog posts.
+**Chrome frames** - title bar presets with optional timestamp.
 
 <p align="center">
   <img src="docs/assets/chrome.png" alt="An 'nmap -F localhost' service scan showing port 3000 open, rendered with a GNOME-style title bar, rounded corners, and a UTC timestamp watermark in the corner like a pentest report screenshot" width="700">
@@ -98,8 +87,7 @@ reports and blog posts.
 termshot exec --chrome gnome --timestamp 'nmap -F localhost'
 ```
 
-**Composition** - combine screenshots side by side or stacked (tmux-style)
-for before/after comparisons.
+**Composition** - combine screenshots side by side or stacked, tmux-style.
 
 <p align="center">
   <img src="docs/assets/compose.png" alt="A side-by-side before/after of 'git status -su' while staging a feature in a rate-limiter crate: the left pane lists five modified files and three untracked ones in red, the right pane shows the same eight files staged in green after git add, both with the shell prompt and command visible, joined by a thin vertical tmux-style divider in one window" width="820">
@@ -113,128 +101,28 @@ termshot compose --layout horizontal --chrome gnome \
   --title 'git status - before / after staging' -o compose.png before.png after.png
 ```
 
-**Full output, not the last screenful** - `--rows` is the terminal *viewport*
-(it decides where lines wrap), not a limit on what you see. Everything that
-scrolls past is kept and rendered, so `termshot exec --rows 10 'seq 1 200'`
-gives you all 200 lines. Narrow it with `--head-lines N` or `--tail-lines N`
-when you only want one end; `--head-lines` is the first N lines of the output
-however long the run turned out to be. Full-screen programs (`vim`, `htop`) are
-the exception: they repaint the viewport, so only their active screen is
-captured.
-
-```sh
-termshot exec 'cargo build 2>&1'               # every line, however long
-termshot exec --tail-lines 20 'cargo test'     # just the summary
-termshot exec --head-lines 15 'dmesg'          # just the top
-```
+**MCP server** - four tools for agent workflows, see [docs/mcp.md](./docs/mcp.md).
 
 **Accessible by default** - every PNG embeds its terminal text (redacted, when
-redaction ran) in a UTF-8 `Description` chunk so screen readers can read the
-screenshot. Turn it off with `--no-description` or `embed_description = false`.
-
-**MCP server** - four tools for agent workflows:
-`execute_and_screenshot`, `render_ansi`, `redact_screenshot`,
-`compose_screenshots`.
+redaction ran) in a UTF-8 `Description` chunk for screen readers.
 
 ## Install
 
 ```sh
-git clone https://github.com/Adamkadaban/screenshot-mcp termshot
-cd termshot
-cargo build --release
-# binary at ./target/release/termshot
+cargo install termshot
 ```
 
-Tagged releases also publish Linux (x86_64, aarch64, static musl) and macOS
-(Intel, Apple Silicon) binaries plus `.deb` and `.rpm` packages.
-
-Linux and macOS only: termshot uses PTYs and POSIX signals.
-
-## Usage
-
-```sh
-termshot exec 'ls --color=always -la'                          # basic screenshot
-termshot exec --chrome gnome --theme dracula 'git log'         # chrome + theme
-termshot exec --redact 'cat credentials.txt'                   # mask secrets
-termshot exec --redaction '{"pattern":"AKIA[0-9A-Z]{16}","keep_prefix":4}' \
-  'cat credentials.txt'                                        # mask your own pattern
-termshot exec --no-rounded 'ls --color=always'                 # square corners
-termshot exec --tail-lines 20 'cargo test'                     # last 20 lines
-termshot exec --head-lines 20 'dmesg'                          # first 20 lines
-termshot compose -o diff.png before.png after.png              # stack two shots
-termshot themes                                                # list themes
-
-# render pre-captured ANSI without executing anything, from a file or a pipe
-cmd --color=always | termshot render -
-termshot render output.log --redact
-termshot render --tail-lines 30 build.log
-```
-
-`--rows`/`--cols` set the terminal the command believes it is running in, which
-is what makes long lines wrap the way they would on your screen. The screenshot
-shows every line the command produced, including the ones that scrolled out of
-that viewport, up to the `max_scrollback_lines` safety limit (10,000 by
-default, and lower on a very wide terminal - see
-[docs/config.md](./docs/config.md)). If a command overruns it, termshot says so
-instead of quietly dropping the start, and a capture too tall to render fails
-with an error pointing at `--head-lines` / `--tail-lines`.
-
-`--head-lines` is not subject to that limit: it is captured as those lines
-scroll past, so it is the first N lines of the output at any configured
-capacity.
-
-`--redaction '<JSON>'` masks something the built-in rules do not know about.
-It is repeatable, applies in the order given, and takes exactly the
-specifications the MCP `redact_screenshot` tool takes - a regex pattern or an
-explicit cell range of the rendered screenshot:
-
-```sh
-termshot exec \
-  --redaction '{"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_prefix":4}' \
-  'secretsdump.py corp.local/user@10.20.30.40'
-
-termshot render --redaction '{"row":3,"col_start":12,"col_end":44,"label":"SECRET"}' \
-  capture.ansi
-```
-
-Passing it redacts the screenshot even without `--redact` (add `--redact` to
-run the built-in rules as well), and it conflicts with `--no-redact` rather
-than being silently ignored. The MCP `execute_and_screenshot` and `render_ansi`
-tools take the same specifications inline, as a `redactions` array. See
-[docs/redaction.md](./docs/redaction.md#manual-redaction-cli-and-mcp).
-
-## Tips
-
-```sh
-termshot exec '!!'                            # your shell expands !! first
-termshot exec 'command cat .env.staging'      # bypass a cat -> bat alias
-termshot exec --no-prompt 'cat .env.staging'  # no prompt, no aliases
-termshot exec --redact --redaction '{"pattern":"TCK-[0-9]+","replacement":"TICKET"}' \
-  'cat notes.txt'                             # built-in rules plus your own
-alias tshot='termshot exec'
-```
-
-## MCP server
-
-Add to your MCP client config:
-
-```json
-{
-  "mcpServers": {
-    "termshot": {
-      "command": "/path/to/termshot",
-      "args": ["mcp"]
-    }
-  }
-}
-```
+Prebuilt binaries, packages, and source builds: [docs/install.md](./docs/install.md).
 
 ## Docs
 
+- [docs/install.md](./docs/install.md) - install methods, platform support
+- [docs/tips.md](./docs/tips.md) - shell recipes and workflow shortcuts
 - [docs/mcp.md](./docs/mcp.md) - MCP setup, tool reference, agent workflows
 - [docs/themes.md](./docs/themes.md) - built-in and user themes, fonts, fallback
 - [docs/redaction.md](./docs/redaction.md) - rules, custom rules, partial redaction
 - [docs/config.md](./docs/config.md) - `config.toml` reference
+- [docs/man/termshot.1](./docs/man/termshot.1) - full CLI reference
 
 ## License
 
