@@ -3,7 +3,7 @@ use crate::capture::{
     effective_scrollback_lines,
 };
 use crate::config::{ChromeConfig, ThemeConfig};
-use crate::redaction::{RedactionEngine, RedactionMap};
+use crate::redaction::{ManualRedactions, RedactionEngine, RedactionMap};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use fontdue::{Font, FontSettings};
@@ -1024,6 +1024,13 @@ impl RendererOptions {
 ///
 /// Defaults to rendering every retained line, which is exactly what the
 /// 1.0.0 [`Renderer::render_bytes`] does.
+///
+/// This is the struct published in 1.0.0 and it keeps exactly the one field it
+/// was published with, so an exhaustive literal - `RenderOptions { lines }`,
+/// written with no `..Default::default()` - still compiles. Settings added
+/// since live in [`ExtendedRenderOptions`], which borrows rather than owns and
+/// therefore could not have been added here without giving this type a
+/// lifetime parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RenderOptions {
     /// Which of the retained lines to render.
@@ -1035,6 +1042,73 @@ impl RenderOptions {
     pub fn with_lines(mut self, selection: LineSelection) -> Self {
         self.lines = selection;
         self
+    }
+
+    /// Add manual redactions, producing the extended options
+    /// [`Renderer::render_bytes_with_extended_options`] takes.
+    pub fn with_manual(self, manual: &ManualRedactions) -> ExtendedRenderOptions<'_> {
+        ExtendedRenderOptions::from(self).with_manual(manual)
+    }
+}
+
+/// Per-render settings for [`Renderer::render_bytes_with_extended_options`]:
+/// the published [`RenderOptions`] plus everything termshot has gained since
+/// 1.0.0.
+///
+/// Defaults to exactly what a 1.0.0 render does - every retained line, no
+/// manual redactions - so `ExtendedRenderOptions::default()` and
+/// `RenderOptions::default().into()` render identically.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExtendedRenderOptions<'a> {
+    /// The settings 1.0.0 published, unchanged.
+    pub base: RenderOptions,
+    /// Caller-supplied redactions (the CLI's `--redaction`, the MCP
+    /// `redact_screenshot` specifications) to apply on top of any rule-based
+    /// redaction, before the image is drawn. Their coordinates are validated
+    /// against the bounds this very render paints, so an out-of-bounds range
+    /// fails instead of quietly covering nothing.
+    pub manual: Option<&'a ManualRedactions>,
+}
+
+/// A 1.0.0 option set is an extended one with nothing extra set.
+impl From<RenderOptions> for ExtendedRenderOptions<'_> {
+    fn from(base: RenderOptions) -> Self {
+        Self { base, manual: None }
+    }
+}
+
+/// Two option sets are equal when they select the same lines and carry the
+/// same manual redactions. [`ManualRedactions`] holds compiled regexes, which
+/// have no meaningful equality, so it is compared by identity.
+impl PartialEq for ExtendedRenderOptions<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.base == other.base
+            && match (self.manual, other.manual) {
+                (None, None) => true,
+                (Some(a), Some(b)) => std::ptr::eq(a, b),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for ExtendedRenderOptions<'_> {}
+
+impl<'a> ExtendedRenderOptions<'a> {
+    /// Render only the lines `selection` names.
+    pub fn with_lines(mut self, selection: LineSelection) -> Self {
+        self.base.lines = selection;
+        self
+    }
+
+    /// Apply `manual` redactions to this render.
+    pub fn with_manual(mut self, manual: &'a ManualRedactions) -> Self {
+        self.manual = Some(manual);
+        self
+    }
+
+    /// Which of the retained lines to render.
+    pub fn lines(&self) -> LineSelection {
+        self.base.lines
     }
 }
 
@@ -1252,6 +1326,10 @@ impl Renderer {
     /// A head or tail selection also decides what the returned text and the
     /// PNG's `Description` metadata contain: text that does not match the
     /// picture would only mislead.
+    ///
+    /// This is the signature published in 1.0.0. Use
+    /// [`Renderer::render_bytes_with_extended_options`] to also apply
+    /// caller-supplied redactions.
     #[allow(clippy::too_many_arguments)]
     pub fn render_bytes_with_options(
         &self,
@@ -1267,7 +1345,44 @@ impl Renderer {
         auto_crop: bool,
         options: RenderOptions,
     ) -> Result<RenderOutputWithContext> {
-        let lines = options.lines;
+        self.render_bytes_with_extended_options(
+            data,
+            cols,
+            rows,
+            output_dir,
+            output_name,
+            theme_name,
+            chrome,
+            redaction,
+            text,
+            auto_crop,
+            options.into(),
+        )
+    }
+
+    /// [`Renderer::render_bytes_with_options`], also applying the manual
+    /// redactions `options` carries.
+    ///
+    /// This is the render path the CLI (`--redaction`) and the MCP server use.
+    /// Manual coordinate ranges are validated against the bounds this very
+    /// render paints, so a range that would land outside the image is an error
+    /// rather than a redaction that covers nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_bytes_with_extended_options(
+        &self,
+        data: &[u8],
+        cols: u16,
+        rows: u16,
+        output_dir: &Path,
+        output_name: Option<&str>,
+        theme_name: Option<&str>,
+        chrome: Option<&ChromeOptions>,
+        redaction: Option<&RedactionRequest>,
+        text: TextOptions,
+        auto_crop: bool,
+        options: ExtendedRenderOptions<'_>,
+    ) -> Result<RenderOutputWithContext> {
+        let lines = options.base.lines;
         let capture = self.capture(data, rows, cols, lines);
         let screen = &capture;
         if capture.truncated() {
@@ -1291,8 +1406,23 @@ impl Renderer {
         if let Some(req) = redaction {
             tracing::debug!("redaction: {} active rule(s)", req.engine.rule_count());
         }
-        let redaction_map =
+        let mut redaction_map =
             redaction.map(|req| req.engine.redact_screen(screen, req.rules.as_deref()));
+
+        // Caller-supplied redactions are applied to the same capture, on top of
+        // whatever the rules matched. Their coordinates address the image this
+        // call is about to draw, so they are checked against its rendered
+        // bounds - which the line selection and `auto_crop` decide - rather
+        // than against the retained grid.
+        if let Some(manual) = options.manual.filter(|manual| !manual.is_empty()) {
+            let (rendered_rows, rendered_cols) =
+                self.rendered_bounds(screen, theme_name, auto_crop);
+            manual.validate_bounds(rendered_rows, rendered_cols)?;
+            manual.apply_to(
+                screen,
+                redaction_map.get_or_insert_with(RedactionMap::default),
+            );
+        }
 
         if let Some(map) = &redaction_map
             && !map.is_empty()
@@ -4894,7 +5024,7 @@ mod tests {
                         ..TextOptions::default()
                     },
                     true,
-                    RenderOptions { lines },
+                    RenderOptions::default().with_lines(lines),
                 )
                 .unwrap()
         };

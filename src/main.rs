@@ -5,10 +5,11 @@ use std::time::Duration;
 use termshot::capture::LineSelection;
 use termshot::config::Config;
 use termshot::redaction::{
-    REDACTION_DISABLED_MSG, RedactionEngine, explicit_request_is_blocked, resolve_should_redact,
+    ManualRedactionSpec, ManualRedactions, REDACTION_DISABLED_MSG, RedactionEngine,
+    explicit_request_is_blocked, resolve_should_redact,
 };
 use termshot::renderer::{
-    ChromeOptions, ComposeLayout, FontSelection, RedactionRequest, RenderOptions, Renderer,
+    ChromeOptions, ComposeLayout, ExtendedRenderOptions, FontSelection, RedactionRequest, Renderer,
     RendererOptions, TextOptions, fallback_output_name,
 };
 use termshot::{executor, server};
@@ -122,6 +123,28 @@ enum Commands {
         #[arg(long = "redact-text", default_value_t = false)]
         redact_text: bool,
 
+        /// Apply a manual redaction given as JSON. Repeatable, applied in order.
+        ///
+        /// Takes exactly the specifications the MCP `redact_screenshot` tool
+        /// takes - a regex pattern:
+        ///
+        ///   {"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_prefix":4,"keep_suffix":0,"color":"#d41919"}
+        ///
+        /// or an explicit cell range of the rendered screenshot:
+        ///
+        ///   {"row":3,"col_start":12,"col_end":44,"label":"SECRET","color":"#d41919"}
+        ///
+        /// Only `pattern` (or the three coordinates) is required. Passing this
+        /// redacts the screenshot even without --redact; add --redact to run
+        /// the built-in rules too. Conflicts with --no-redact.
+        #[arg(
+            long = "redaction",
+            value_name = "JSON",
+            conflicts_with = "no_redact",
+            verbatim_doc_comment
+        )]
+        redaction: Vec<String>,
+
         /// Return plain text with ANSI color codes stripped. By default the
         /// original output is returned with colors preserved.
         #[arg(long = "plain-text", default_value_t = false)]
@@ -219,6 +242,28 @@ enum Commands {
         /// is redacted and the text keeps the original (unredacted) content.
         #[arg(long = "redact-text", default_value_t = false)]
         redact_text: bool,
+
+        /// Apply a manual redaction given as JSON. Repeatable, applied in order.
+        ///
+        /// Takes exactly the specifications the MCP `redact_screenshot` tool
+        /// takes - a regex pattern:
+        ///
+        ///   {"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_prefix":4,"keep_suffix":0,"color":"#d41919"}
+        ///
+        /// or an explicit cell range of the rendered screenshot:
+        ///
+        ///   {"row":3,"col_start":12,"col_end":44,"label":"SECRET","color":"#d41919"}
+        ///
+        /// Only `pattern` (or the three coordinates) is required. Passing this
+        /// redacts the screenshot even without --redact; add --redact to run
+        /// the built-in rules too. Conflicts with --no-redact.
+        #[arg(
+            long = "redaction",
+            value_name = "JSON",
+            conflicts_with = "no_redact",
+            verbatim_doc_comment
+        )]
+        redaction: Vec<String>,
 
         /// Trim the image width to the rightmost content, keeping the same
         /// padding on the right as on the left, instead of using the full
@@ -327,6 +372,7 @@ async fn main() -> anyhow::Result<()> {
             redact_rules,
             no_redact,
             redact_text,
+            redaction,
             plain_text,
             auto_crop,
             no_description,
@@ -346,6 +392,11 @@ async fn main() -> anyhow::Result<()> {
 
             let lines = line_selection(head_lines, tail_lines)?;
             let timeout = Duration::from_secs(timeout);
+
+            // Compile any --redaction specifications before the command runs,
+            // so an invalid regex, color, or JSON object fails without having
+            // executed anything.
+            let manual = manual_redactions(&redaction)?;
 
             let exec_result = if !no_prompt {
                 // Each CLI argument is a separate command. The shell will
@@ -382,7 +433,7 @@ async fn main() -> anyhow::Result<()> {
                 fallback_output_name(cwd.as_deref(), &command.join(" "))
             };
             let (image_path, terminal_text, redactions, meta) = renderer
-                .render_bytes_with_options(
+                .render_bytes_with_extended_options(
                     &exec_result.raw_output,
                     cols,
                     rows,
@@ -401,7 +452,7 @@ async fn main() -> anyhow::Result<()> {
                         from_screen: !no_prompt,
                     },
                     auto_crop,
-                    RenderOptions { lines },
+                    render_options(lines, manual.as_ref()),
                 )?;
 
             if meta.truncated {
@@ -454,6 +505,7 @@ async fn main() -> anyhow::Result<()> {
             redact_rules,
             no_redact,
             redact_text,
+            redaction,
             auto_crop,
             no_description,
             rounded,
@@ -461,6 +513,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let renderer = build_renderer(&config, max_scrollback_lines, None, None)?;
             let lines = line_selection(head_lines, tail_lines)?;
+            let manual = manual_redactions(&redaction)?;
 
             let data = if input == "-" {
                 use std::io::Read;
@@ -500,26 +553,27 @@ async fn main() -> anyhow::Result<()> {
                 rules: redact_rules.as_ref().map(|s| parse_rule_list(s)),
             });
 
-            let (image_path, plain_text, redactions, meta) = renderer.render_bytes_with_options(
-                &data,
-                cols,
-                rows,
-                &config.output_dir,
-                output_name.as_deref(),
-                theme_name,
-                chrome_options.as_ref(),
-                redaction_request.as_ref(),
-                TextOptions {
-                    strip_ansi: plain_text,
-                    redact_text,
-                    embed_description: config.embed_description && !no_description,
-                    // The file's bytes *are* the document here, so they are
-                    // returned whole rather than clipped to the last screenful.
-                    from_screen: false,
-                },
-                auto_crop,
-                RenderOptions { lines },
-            )?;
+            let (image_path, plain_text, redactions, meta) = renderer
+                .render_bytes_with_extended_options(
+                    &data,
+                    cols,
+                    rows,
+                    &config.output_dir,
+                    output_name.as_deref(),
+                    theme_name,
+                    chrome_options.as_ref(),
+                    redaction_request.as_ref(),
+                    TextOptions {
+                        strip_ansi: plain_text,
+                        redact_text,
+                        embed_description: config.embed_description && !no_description,
+                        // The file's bytes *are* the document here, so they are
+                        // returned whole rather than clipped to the last screenful.
+                        from_screen: false,
+                    },
+                    auto_crop,
+                    render_options(lines, manual.as_ref()),
+                )?;
 
             if meta.truncated {
                 eprintln!("{}", truncation_notice(&renderer, rows, cols));
@@ -619,6 +673,34 @@ fn build_renderer(
         &config.chrome,
         RendererOptions::default().with_max_scrollback_lines(max_scrollback_lines),
     )
+}
+
+/// Compile the repeatable `--redaction '<JSON>'` options into the shared
+/// manual redaction set, or `None` when none were given.
+///
+/// The specifications are exactly the ones the MCP `redact_screenshot` tool
+/// takes, parsed by the same code, so a pattern or cell range behaves
+/// identically from either entry point - including the on-image `[LABEL]` tags,
+/// which the CLI draws just as the MCP default does.
+fn manual_redactions(specs: &[String]) -> anyhow::Result<Option<ManualRedactions>> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let parsed = ManualRedactionSpec::parse_all(specs)?;
+    Ok(Some(ManualRedactions::new(&parsed, true)?))
+}
+
+/// Per-render options for a subcommand: the line selection plus any manual
+/// redactions, which the renderer applies to the capture it is about to draw.
+fn render_options(
+    lines: LineSelection,
+    manual: Option<&ManualRedactions>,
+) -> ExtendedRenderOptions<'_> {
+    let options = ExtendedRenderOptions::default().with_lines(lines);
+    match manual {
+        Some(manual) => options.with_manual(manual),
+        None => options,
+    }
 }
 
 /// Resolve whether redaction should run for this invocation and, if so, build

@@ -12,10 +12,11 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 
 use termshot::config::{ChromeConfig, Config, LoadedConfig, ThemeConfig};
+use termshot::redaction::ManualRedactionSpec;
 use termshot::redaction::RedactionConfig;
 use termshot::renderer::{FontSelection, Renderer, RendererOptions};
 use termshot::server::{
-    ComposeScreenshotsParams, ExecuteAndScreenshotParams, RedactScreenshotParams, RedactionSpec,
+    ComposeScreenshotsParams, ExecuteAndScreenshotParams, RedactScreenshotRequest,
     RenderAnsiParams, ScreenshotServer,
 };
 
@@ -344,20 +345,22 @@ async fn redact_screenshot_pattern_and_coordinate_flow() {
 
     // Step 2: agent decides to redact the IP by pattern and the word "secret"
     // by coordinates (cols 0..6 on the output row). Request redacted text back.
-    let redact_params = RedactScreenshotParams {
+    let redact_params = RedactScreenshotRequest {
         screenshot_path: png.display().to_string(),
         redactions: vec![
-            RedactionSpec::Pattern {
+            ManualRedactionSpec::Pattern {
                 pattern: r"10\.20\.30\.40".to_string(),
                 replacement: Some("[REDACTED-IP]".to_string()),
                 keep_prefix: None,
                 keep_suffix: None,
+                color: None,
             },
-            RedactionSpec::Coordinate {
+            ManualRedactionSpec::Coordinate {
                 row: 0,
                 col_start: 0,
                 col_end: 6,
                 label: Some("SECRET".to_string()),
+                color: None,
             },
         ],
         redact_text: Some(true),
@@ -365,7 +368,7 @@ async fn redact_screenshot_pattern_and_coordinate_flow() {
         strip_ansi: None,
     };
     let redacted = server
-        .redact_screenshot(Parameters(redact_params))
+        .redact_screenshot_tool(Parameters(redact_params))
         .await
         .expect("redact");
     let redacted_text = result_text(&redacted);
@@ -690,38 +693,45 @@ async fn redact_screenshot_uses_in_memory_record_not_sidecars() {
     assert!(!png.with_extension("meta.json").exists());
 
     // Redaction works purely from the in-memory record.
-    let redact_params = RedactScreenshotParams {
+    let redact_params = RedactScreenshotRequest {
         screenshot_path: png.display().to_string(),
-        redactions: vec![RedactionSpec::Pattern {
+        redactions: vec![ManualRedactionSpec::Pattern {
             pattern: r"10\.20\.30\.40".to_string(),
             replacement: Some("[REDACTED-IP]".to_string()),
             keep_prefix: None,
             keep_suffix: None,
+            color: None,
         }],
         redact_text: Some(true),
         show_labels: None,
         strip_ansi: None,
     };
     let redacted = server
-        .redact_screenshot(Parameters(redact_params))
+        .redact_screenshot_tool(Parameters(redact_params))
         .await
         .expect("redact");
     assert!(!result_text(&redacted).contains("10.20.30.40"));
 
     // A path the server never produced has no record and must error.
-    let missing = RedactScreenshotParams {
+    let missing = RedactScreenshotRequest {
         screenshot_path: dir.join("nonexistent.png").display().to_string(),
-        redactions: vec![RedactionSpec::Pattern {
+        redactions: vec![ManualRedactionSpec::Pattern {
             pattern: "x".to_string(),
             replacement: None,
             keep_prefix: None,
             keep_suffix: None,
+            color: None,
         }],
         redact_text: None,
         show_labels: None,
         strip_ansi: None,
     };
-    assert!(server.redact_screenshot(Parameters(missing)).await.is_err());
+    assert!(
+        server
+            .redact_screenshot_tool(Parameters(missing))
+            .await
+            .is_err()
+    );
 }
 
 /// With the master switch off, an explicit `redact: true` must fail loudly
@@ -918,7 +928,7 @@ fn mcp_params_reject_unknown_fields() {
         );
     }
     assert!(
-        serde_json::from_value::<RedactScreenshotParams>(serde_json::json!({
+        serde_json::from_value::<RedactScreenshotRequest>(serde_json::json!({
             "screenshot_path": "x.png",
             "redactions": [],
             "embed_description": true,
@@ -956,6 +966,185 @@ fn published_tool_schemas_forbid_additional_properties() {
             tool.name
         );
     }
+}
+
+/// The tool the router publishes is unchanged by the handler split: same four
+/// names, and `redact_screenshot` still carries the description its doc comment
+/// gives it. Only the Rust entry point moved.
+#[test]
+fn the_published_tool_set_is_unchanged() {
+    let tools = ScreenshotServer::tool_definitions();
+    let mut names: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "compose_screenshots",
+            "execute_and_screenshot",
+            "redact_screenshot",
+            "render_ansi",
+        ]
+    );
+
+    let description = tools
+        .iter()
+        .find(|tool| tool.name == "redact_screenshot")
+        .and_then(|tool| tool.description.clone())
+        .expect("redact_screenshot is described");
+    assert!(
+        description.starts_with("Apply selective redactions to a screenshot"),
+        "unexpected description: {description}"
+    );
+    for mentioned in ["keep_prefix", "show_labels", "col_start"] {
+        assert!(
+            description.contains(mentioned),
+            "the description stopped documenting {mentioned}: {description}"
+        );
+    }
+}
+
+/// The `redact_screenshot` schema a live `tools/list` publishes must describe
+/// exactly what the parser accepts: every field, both variants, nothing extra.
+/// A client builds its call from this schema, so a field the schema hides is a
+/// feature nobody can reach and a field it invents is a call that fails.
+#[test]
+fn published_redaction_schema_matches_the_parser() {
+    let (pattern, coordinate) = published_redaction_variants();
+
+    for (variant, expected_fields, expected_required) in [
+        (
+            &pattern,
+            vec![
+                "color",
+                "keep_prefix",
+                "keep_suffix",
+                "label",
+                "pattern",
+                "replacement",
+            ],
+            vec!["pattern"],
+        ),
+        (
+            &coordinate,
+            vec!["col_end", "col_start", "color", "label", "row"],
+            vec!["row", "col_start", "col_end"],
+        ),
+    ] {
+        assert_eq!(
+            variant.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false)),
+            "a redaction variant accepts unknown fields: {variant}"
+        );
+        assert_eq!(variant["type"], "object", "{variant}");
+
+        let fields: Vec<&str> = variant["properties"]
+            .as_object()
+            .expect("properties is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(fields, expected_fields, "wrong fields in {variant}");
+
+        let required: Vec<&str> = variant["required"]
+            .as_array()
+            .expect("required is an array")
+            .iter()
+            .map(|value| value.as_str().expect("a field name"))
+            .collect();
+        assert_eq!(required, expected_required, "wrong required in {variant}");
+    }
+}
+
+/// Every field the published schema names is a field the parser accepts, and
+/// every one it marks required really is - checked by feeding the schema's own
+/// vocabulary back through the decoder the tool uses.
+#[test]
+fn the_published_schema_and_the_parser_agree_field_by_field() {
+    let (pattern, coordinate) = published_redaction_variants();
+
+    // A pattern object carrying every published field but `label` (which is an
+    // alias for `replacement`, so the two are mutually exclusive) parses.
+    serde_json::from_value::<ManualRedactionSpec>(serde_json::json!({
+        "pattern": "x",
+        "replacement": "TAG",
+        "keep_prefix": 1,
+        "keep_suffix": 2,
+        "color": "#d41919",
+    }))
+    .expect("the parser accepts every published pattern field");
+    serde_json::from_value::<ManualRedactionSpec>(serde_json::json!({
+        "pattern": "x", "label": "TAG",
+    }))
+    .expect("the parser accepts the published `label` alias");
+
+    serde_json::from_value::<ManualRedactionSpec>(serde_json::json!({
+        "row": 0, "col_start": 0, "col_end": 4, "label": "L", "color": "#00ff00",
+    }))
+    .expect("the parser accepts every published coordinate field");
+
+    // A field the schema does not publish is refused, matching
+    // `additionalProperties: false`.
+    for variant in [&pattern, &coordinate] {
+        let mut object = serde_json::Map::new();
+        for field in variant["properties"].as_object().unwrap().keys() {
+            // `label` and `replacement` are the same field under two names.
+            if field == "label" {
+                continue;
+            }
+            let value = match field.as_str() {
+                "pattern" => serde_json::json!("x"),
+                "replacement" => serde_json::json!("TAG"),
+                "color" => serde_json::json!("#d41919"),
+                "keep_prefix" | "keep_suffix" => serde_json::json!(1),
+                "col_end" => serde_json::json!(4),
+                _ => serde_json::json!(0),
+            };
+            object.insert(field.clone(), value);
+        }
+        object.insert("not_a_field".to_string(), serde_json::json!(1));
+        let err = serde_json::from_value::<ManualRedactionSpec>(serde_json::Value::Object(object))
+            .expect_err("an unpublished field must be refused");
+        assert!(
+            err.to_string().contains("not_a_field"),
+            "the error must name the offending field: {err}"
+        );
+    }
+
+    // A required field left out is refused too.
+    assert!(
+        serde_json::from_value::<ManualRedactionSpec>(serde_json::json!({
+            "row": 0, "col_start": 0,
+        }))
+        .is_err(),
+        "a coordinate redaction without `col_end` must be refused"
+    );
+}
+
+/// The two `redact_screenshot` redaction variants, as a live `tools/list`
+/// publishes them.
+fn published_redaction_variants() -> (serde_json::Value, serde_json::Value) {
+    let tool = ScreenshotServer::tool_definitions()
+        .into_iter()
+        .find(|tool| tool.name == "redact_screenshot")
+        .expect("redact_screenshot is published");
+    let schema = serde_json::to_value(&tool.input_schema).expect("schema serializes");
+
+    // The array items reference the shared definition the schema carries.
+    let reference = schema["properties"]["redactions"]["items"]["$ref"]
+        .as_str()
+        .expect("redactions items are a $ref")
+        .to_string();
+    let name = reference
+        .strip_prefix("#/$defs/")
+        .expect("a local definition");
+    let spec = schema["$defs"][name].clone();
+
+    let variants = spec["oneOf"]
+        .as_array()
+        .expect("the redaction spec is a oneOf of its two variants")
+        .clone();
+    assert_eq!(variants.len(), 2, "expected exactly two variants: {spec}");
+    (variants[0].clone(), variants[1].clone())
 }
 
 // -------------------------------------------------------------------------
@@ -1190,20 +1379,21 @@ async fn redact_screenshot_masks_a_secret_split_by_a_soft_wrap() {
     );
 
     // Step 2: the agent masks the hash, keeping its first 4 characters.
-    let redact_params = RedactScreenshotParams {
+    let redact_params = RedactScreenshotRequest {
         screenshot_path: png.display().to_string(),
-        redactions: vec![RedactionSpec::Pattern {
+        redactions: vec![ManualRedactionSpec::Pattern {
             pattern: "[a-f0-9]{32}".to_string(),
             replacement: None,
             keep_prefix: Some(4),
             keep_suffix: None,
+            color: None,
         }],
         redact_text: Some(true),
         show_labels: None,
         strip_ansi: None,
     };
     let redacted = server
-        .redact_screenshot(Parameters(redact_params))
+        .redact_screenshot_tool(Parameters(redact_params))
         .await
         .expect("redact");
     let redacted_text = result_text(&redacted);
@@ -1379,20 +1569,21 @@ async fn hard_newlines_are_not_joined_into_a_match() {
         .expect("render");
     let png = screenshot_path(&result_text(&rendered));
 
-    let redact_params = RedactScreenshotParams {
+    let redact_params = RedactScreenshotRequest {
         screenshot_path: png.display().to_string(),
-        redactions: vec![RedactionSpec::Pattern {
+        redactions: vec![ManualRedactionSpec::Pattern {
             pattern: "[a-f0-9]{32}".to_string(),
             replacement: None,
             keep_prefix: Some(4),
             keep_suffix: None,
+            color: None,
         }],
         redact_text: Some(true),
         show_labels: None,
         strip_ansi: None,
     };
     let redacted = server
-        .redact_screenshot(Parameters(redact_params))
+        .redact_screenshot_tool(Parameters(redact_params))
         .await
         .expect("redact");
     let text = result_text(&redacted);
@@ -1825,21 +2016,23 @@ async fn redact_screenshot_preserves_the_original_line_selection() {
         "line 99\nline 100\ntoken AKIAIOSFODNN7EXAMPLE"
     );
 
-    let params = RedactScreenshotParams {
+    let params = RedactScreenshotRequest {
         screenshot_path: png.display().to_string(),
         redactions: vec![
-            RedactionSpec::Pattern {
+            ManualRedactionSpec::Pattern {
                 pattern: r"AKIA[0-9A-Z]{16}".to_string(),
                 replacement: Some("[KEY]".to_string()),
                 keep_prefix: None,
                 keep_suffix: None,
+                color: None,
             },
             // Row 0 of the *selection*, i.e. the first line the image shows.
-            RedactionSpec::Coordinate {
+            ManualRedactionSpec::Coordinate {
                 row: 0,
                 col_start: 0,
                 col_end: 7,
                 label: Some("L".to_string()),
+                color: None,
             },
         ],
         redact_text: Some(true),
@@ -1847,7 +2040,7 @@ async fn redact_screenshot_preserves_the_original_line_selection() {
         strip_ansi: Some(true),
     };
     let result = server
-        .redact_screenshot(Parameters(params))
+        .redact_screenshot_tool(Parameters(params))
         .await
         .expect("redact_screenshot");
     let text = result_text(&result);
@@ -1916,19 +2109,20 @@ async fn redact_coordinate(
     col_start: u16,
     col_end: u16,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let params = RedactScreenshotParams {
+    let params = RedactScreenshotRequest {
         screenshot_path: png.display().to_string(),
-        redactions: vec![RedactionSpec::Coordinate {
+        redactions: vec![ManualRedactionSpec::Coordinate {
             row,
             col_start,
             col_end,
             label: Some("X".to_string()),
+            color: None,
         }],
         redact_text: Some(true),
         show_labels: Some(false),
         strip_ansi: Some(true),
     };
-    server.redact_screenshot(Parameters(params)).await
+    server.redact_screenshot_tool(Parameters(params)).await
 }
 
 /// Decode a rendered PNG into `(width, height, rgba bytes)`.
@@ -2156,20 +2350,21 @@ async fn pattern_redaction_still_reaches_the_rightmost_content_cell() {
     .expect("render_ansi");
     let png = screenshot_path(&result_text(&result));
 
-    let params = RedactScreenshotParams {
+    let params = RedactScreenshotRequest {
         screenshot_path: png.display().to_string(),
-        redactions: vec![RedactionSpec::Pattern {
+        redactions: vec![ManualRedactionSpec::Pattern {
             pattern: "AKIA[0-9A-Z]{16}".to_string(),
             replacement: None,
             keep_prefix: None,
             keep_suffix: None,
+            color: None,
         }],
         redact_text: Some(true),
         show_labels: Some(false),
         strip_ansi: Some(true),
     };
     let result = server
-        .redact_screenshot(Parameters(params))
+        .redact_screenshot_tool(Parameters(params))
         .await
         .expect("pattern redaction");
     let text = result_text(&result);
@@ -2232,4 +2427,77 @@ async fn coordinate_bounds_follow_the_rendered_line_selection() {
     redact_coordinate(&server, &png, 2, 0, 4)
         .await
         .expect("row 2 is the last row of a three-row selection");
+}
+
+/// The parameters published in 1.0.0 still drive the tool: an old caller
+/// converts them with one `.into()` and gets exactly the redaction it always
+/// got.
+#[tokio::test]
+async fn the_1_0_0_redact_parameters_still_drive_the_tool() {
+    use termshot::server::{RedactScreenshotParams, RedactionSpec};
+
+    let dir = Path::new("target/mcp-int/redact-1-0-0-params");
+    let server = make_server(dir);
+
+    let input_path = dir.join("legacy-params.ansi");
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(&input_path, "secret 10.20.30.40 end\n").unwrap();
+    let rendered = server
+        .render_ansi(Parameters(RenderAnsiParams {
+            input_path: input_path.display().to_string(),
+            cols: Some(40),
+            rows: Some(3),
+            theme: None,
+            chrome: None,
+            title: None,
+            timestamp: None,
+            rounded: None,
+            strip_ansi: None,
+            output_name: Some("legacy-params".to_string()),
+            auto_crop: None,
+            redact: Some(false),
+            redaction_rules: None,
+            redact_text: None,
+            show_labels: None,
+            head_lines: None,
+            tail_lines: None,
+        }))
+        .await
+        .expect("render_ansi");
+    let png = screenshot_path(&result_text(&rendered));
+
+    // Written exactly as a 1.0.0 caller would have written it: no `color`, no
+    // spread, `Vec<RedactionSpec>`.
+    let legacy = RedactScreenshotParams {
+        screenshot_path: png.display().to_string(),
+        redactions: vec![
+            RedactionSpec::Pattern {
+                pattern: r"10\.20\.30\.40".to_string(),
+                replacement: Some("[REDACTED-IP]".to_string()),
+                keep_prefix: None,
+                keep_suffix: None,
+            },
+            RedactionSpec::Coordinate {
+                row: 0,
+                col_start: 0,
+                col_end: 6,
+                label: Some("SECRET".to_string()),
+            },
+        ],
+        redact_text: Some(true),
+        show_labels: None,
+        strip_ansi: None,
+    };
+
+    let redacted = server
+        .redact_screenshot(Parameters(legacy))
+        .await
+        .expect("the 1.0.0 method still takes the 1.0.0 parameters");
+    let text = result_text(&redacted);
+    let terminal = text
+        .split("--- Terminal Output ---")
+        .nth(1)
+        .expect("terminal output");
+    assert!(!terminal.contains("10.20.30.40"), "{terminal}");
+    assert!(!terminal.contains("secret"), "{terminal}");
 }

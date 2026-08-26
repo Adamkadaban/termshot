@@ -106,9 +106,19 @@ whole, not clipped to its last screenful.
 
 Re-renders a screenshot produced by the running server with selective
 redactions, overwriting the PNG. Each entry in `redactions` is either a regex
-`pattern` (optional `replacement` for the on-image label, `keep_prefix`,
-`keep_suffix`) or an explicit cell range (`row`, `col_start`, `col_end`,
-optional `label`). `show_labels: false` draws plain blocks.
+`pattern` (optional `replacement` - also accepted as `label` - for the on-image
+tag, plus `keep_prefix`, `keep_suffix`, and a `#RRGGBB` `color`) or an explicit
+cell range (`row`, `col_start`, `col_end`, optional `label` and `color`).
+`show_labels: false` draws plain blocks. An unknown field, an invalid regex, or
+an unparseable color is rejected with an `invalid_params` error.
+
+These are the same specifications the CLI takes through its repeatable
+`--redaction '<JSON>'` option on `exec` and `render`, decoded by the same code,
+so a redaction behaves identically from either entry point. The schema
+`tools/list` publishes says exactly that: two mutually exclusive variants
+(`oneOf`), each naming every field it accepts and refusing anything else
+(`additionalProperties: false`). See
+[redaction.md](./redaction.md#manual-redaction-cli-and-mcp).
 
 Rows are counted in the image the screenshot actually shows: the original
 `head_lines` / `tail_lines` selection is reproduced, so `row: 0` is the first

@@ -180,6 +180,33 @@ Force redaction off even when auto\-redaction is enabled in the config.
 Also redact the returned plain text. By default only the PNG is redacted and
 the text keeps the original (unredacted) content.
 .TP
+.BI \-\-redaction " JSON"
+Apply a manual redaction, given as JSON, on top of any rule\-based redaction.
+Repeatable; the specifications apply in the order given. Accepts exactly what
+the MCP
+.B redact_screenshot
+tool accepts: a regex pattern
+.RB ( pattern ,
+optional
+.BR replacement / label ,
+.BR keep_prefix ,
+.BR keep_suffix ,
+.BR color )
+or an explicit cell range of the rendered screenshot
+.RB ( row ,
+.BR col_start ,
+.BR col_end ,
+optional
+.B label
+and
+.BR color ).
+Passing it redacts the screenshot even without
+.BR \-\-redact ,
+and it conflicts with
+.BR \-\-no\-redact .
+See
+.BR REDACTION .
+.TP
 .B \-\-plain\-text
 Return plain text with ANSI color codes stripped. By default the original
 output is returned with colors preserved.
@@ -269,6 +296,12 @@ Force redaction off even when auto\-redaction is enabled in the config.
 .TP
 .B \-\-redact\-text
 Also redact the returned plain text.
+.TP
+.BI \-\-redaction " JSON"
+Apply a manual redaction, given as JSON, exactly as
+.B exec
+does. Repeatable, implies redaction on its own, and conflicts with
+.BR \-\-no\-redact .
 .TP
 .BI \-\-auto\-crop " BOOL"
 Trim the image width to the rightmost content instead of using the full
@@ -469,7 +502,9 @@ sensitive portion, or set
 .B keep_prefix
 and/or
 .B keep_suffix
-(character counts) on a rule or a
+(character counts) on a rule or on a manual
+.B \-\-redaction
+/
 .B redact_screenshot
 pattern. Those leave the first and last characters visible and mask only the
 middle: for an AWS key
@@ -478,6 +513,45 @@ middle: for an AWS key
 shows
 .I AKIA
 followed by blocks.
+.SS Manual redactions
+A manual redaction masks something the rules do not know about. The CLI takes
+one per repeatable
+.BI \-\-redaction " JSON"
+option on
+.B exec
+and
+.BR render ;
+MCP takes a list of them in
+.BR redact_screenshot .
+Both decode the same JSON with the same code, so a specification behaves
+identically either way.
+.PP
+A regex pattern is
+.IR "{\(dqpattern\(dq: \(dq[a-f0-9]{32}\(dq, \(dqreplacement\(dq: \(dqHASH\(dq, \(dqkeep_prefix\(dq: 4}" :
+only
+.B pattern
+is required, and
+.B replacement
+(also accepted as
+.BR label )
+is the on\-image tag, omitted for a plain block.
+.PP
+A cell range is
+.IR "{\(dqrow\(dq: 3, \(dqcol_start\(dq: 12, \(dqcol_end\(dq: 44, \(dqlabel\(dq: \(dqSECRET\(dq}" .
+Coordinates are 0\-based and counted in the image as rendered, so
+.B row 0
+is the top line the PNG shows \- for a
+.BR \-\-head\-lines / \-\-tail\-lines
+render, the first line of that selection \- and the width is the one
+.B \-\-auto\-crop
+leaves. A row, column, or empty range outside those bounds is an error naming
+the rendered dimensions rather than a block that covers nothing.
+.PP
+Either variant may set a
+.B color
+.RI ( #RRGGBB )
+for its own block. Invalid JSON, an unknown field, an invalid regex, and an
+unparseable color are refused before the command runs.
 .SS Agent workflow
 The recommended flow for selective redaction over MCP:
 .IP 1. 4
@@ -510,7 +584,9 @@ engine\-wide via
 .B [redaction] color
 and
 .BR "[redaction] label_color" ,
-and per rule via a rule\(aqs
+per rule via a rule\(aqs
+.B color
+field, and per manual redaction via its own
 .B color
 field (all as
 .IR #RRGGBB ).
@@ -654,6 +730,16 @@ Produce a redacted, timestamped finding image for a pentest report:
 .RS 4
 .EX
 termshot exec \-\-redact \-\-timestamp \-\-chrome report \-o finding\-01.png 'nmap \-sV target'
+.EE
+.RE
+.PP
+Mask a hash the built\-in rules do not know about, keeping its first four
+characters visible:
+.PP
+.RS 4
+.EX
+termshot exec \-\-redaction '{"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_prefix":4}' \\
+    'secretsdump.py corp.local/user@10.20.30.40'
 .EE
 .RE
 .PP

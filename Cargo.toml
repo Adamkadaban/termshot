@@ -41,6 +41,10 @@ serde_yaml = "0.9"
 # Redaction rule matching
 regex = "1"
 
+# Manual redaction specifications: the CLI's `--redaction '<JSON>'` option and
+# the MCP `redact_screenshot` tool decode the same JSON into the same type.
+serde_json = "1"
+
 # Utilities
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -48,11 +52,6 @@ libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
-
-[dev-dependencies]
-# Used by the MCP integration tests to decode tool parameters exactly the way
-# the server does, so unknown-field rejection is tested against real JSON.
-serde_json = "1"
 
 [package.metadata.deb]
 maintainer = "Adam Hassan <adam@hackback.zip>"

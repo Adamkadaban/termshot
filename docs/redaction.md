@@ -42,7 +42,8 @@ look-alikes in code (`std::fs::read`) are left visible.
 
 The built-ins favor precision over recall: a silently corrupted screenshot is
 worse than one you chose not to redact. Review the returned text and use
-`redact_screenshot` (MCP) for anything the rules do not cover.
+`--redaction` (CLI) or `redact_screenshot` (MCP) for anything the rules do not
+cover.
 
 ## Custom rules
 
@@ -103,7 +104,8 @@ to leave leading and trailing characters visible and mask the middle. For an AWS
 key `AKIA...`, `keep_prefix: 4` shows `AKIA` followed by blocks. If the kept
 prefix and suffix cover the whole match, nothing is redacted.
 
-These work in config rules and on `redact_screenshot` patterns over MCP:
+These work in config rules and in the manual specifications below, from both
+the CLI and MCP:
 
 ```json
 {
@@ -111,6 +113,72 @@ These work in config rules and on `redact_screenshot` patterns over MCP:
   "keep_prefix": 4
 }
 ```
+
+## Manual redaction (CLI and MCP)
+
+A manual redaction masks something the rules do not know about. The CLI takes
+one per repeatable `--redaction '<JSON>'` option on `exec` and `render`, and
+MCP takes a list of them in `redact_screenshot`'s `redactions`. Both decode the
+same JSON with the same code, so a specification behaves identically either
+way - same blocks, same labels, same audit names.
+
+A regex pattern, matched against every line the screenshot shows:
+
+```json
+{
+  "pattern": "[a-f0-9]{32}",
+  "replacement": "HASH",
+  "keep_prefix": 4,
+  "keep_suffix": 0,
+  "color": "#d41919"
+}
+```
+
+Only `pattern` is required. `replacement` (also accepted as `label`) is the
+short `[LABEL]` tag drawn over the block; omit it for a plain block.
+`keep_prefix` / `keep_suffix` leave that many characters visible, and `color`
+sets this redaction's block color.
+
+An explicit cell range on one row of the rendered screenshot:
+
+```json
+{
+  "row": 3,
+  "col_start": 12,
+  "col_end": 44,
+  "label": "SECRET",
+  "color": "#d41919"
+}
+```
+
+Coordinates are 0-based and counted in the image as rendered: row 0 is the top
+line the PNG shows, which for a `--head-lines` / `--tail-lines` render is the
+first line of that selection, and the width is the one `auto_crop` leaves. A
+row, column, or empty range outside those bounds is an error naming the
+rendered dimensions, never a block that quietly covers nothing.
+
+```sh
+termshot exec \
+  --redaction '{"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_prefix":4}' \
+  'secretsdump.py corp.local/user@10.20.30.40'
+
+termshot render --redaction '{"pattern":"AKIA[0-9A-Z]{16}","keep_prefix":4}' \
+  capture.ansi
+```
+
+On the CLI:
+
+- The option is repeatable and applies in the order given; patterns run first,
+  then cell ranges.
+- Passing it redacts the screenshot even without `--redact`. Add `--redact` (or
+  `--redact-rules`) to run the built-in rules as well.
+- It conflicts with `--no-redact`: a run that asks for both is refused rather
+  than quietly returning an unredacted image.
+- `--redact-text` scrubs the returned text, and the PNG's `Description`
+  metadata always carries the redacted text, exactly as for rule-based
+  redaction.
+- Invalid JSON, an unknown field, an invalid regex, and an unparseable color
+  are refused before the command runs.
 
 ## Selective redaction workflow
 
@@ -120,9 +188,8 @@ An agent can capture, read the real output, and mask exactly what matters:
    is the original content even when the PNG is masked.
 2. Inspect the text and decide what else is sensitive.
 3. Call `redact_screenshot` with the screenshot path and a list of redactions,
-   each either a regex `pattern` (with optional `replacement`, `keep_prefix`,
-   `keep_suffix`) or an explicit cell range (`row`, `col_start`, `col_end`,
-   optional `label`). The image is re-rendered in place.
+   in the shared format above. The image is re-rendered in place from the
+   server's in-memory record of the capture (no sidecar files on disk).
 
 See [mcp.md](./mcp.md#workflow-capture-inspect-selectively-redact).
 
@@ -131,9 +198,11 @@ See [mcp.md](./mcp.md#workflow-capture-inspect-selectively-redact).
 Each block can carry a short tag. For a built-in it is a fixed abbreviation
 (`IP`, `KEY`, `JWT`); for a custom rule it is derived from `replacement`, so
 `[REDACTED-TICKET]` becomes `TICKET` and an empty `replacement` means no label.
-Pass `show_labels: false` (on `execute_and_screenshot` or `redact_screenshot`)
-to draw plain solid blocks everywhere.
+A manual redaction's label is its `replacement` (pattern) or `label`
+(coordinates); a coordinate range with no label is tagged `[REDACTED]`. Pass
+`show_labels: false` (on `execute_and_screenshot` or `redact_screenshot`) to
+draw plain solid blocks everywhere.
 
 Block and label colors are set engine-wide with `[redaction] color` and
-`[redaction] label_color`, and per rule with a rule's `color` field, all as
-`#RRGGBB`. The default block is bright red (`#d41919`) with a black label.
+`[redaction] label_color`, per rule with a rule's `color` field, and per manual
+redaction with its `color` field, all as `#RRGGBB`. The default block is bright red (`#d41919`) with a black label.

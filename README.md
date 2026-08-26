@@ -156,6 +156,8 @@ Linux and macOS only: termshot uses PTYs and POSIX signals.
 termshot exec 'ls --color=always -la'                          # basic screenshot
 termshot exec --chrome gnome --theme dracula 'git log'         # chrome + theme
 termshot exec --redact 'cat credentials.txt'                   # mask secrets
+termshot exec --redaction '{"pattern":"AKIA[0-9A-Z]{16}","keep_prefix":4}' \
+  'cat credentials.txt'                                        # mask your own pattern
 termshot exec --no-rounded 'ls --color=always'                 # square corners
 termshot exec --tail-lines 20 'cargo test'                     # last 20 lines
 termshot exec --head-lines 20 'dmesg'                          # first 20 lines
@@ -181,12 +183,33 @@ with an error pointing at `--head-lines` / `--tail-lines`.
 scroll past, so it is the first N lines of the output at any configured
 capacity.
 
+`--redaction '<JSON>'` masks something the built-in rules do not know about.
+It is repeatable, applies in the order given, and takes exactly the
+specifications the MCP `redact_screenshot` tool takes - a regex pattern or an
+explicit cell range of the rendered screenshot:
+
+```sh
+termshot exec \
+  --redaction '{"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_prefix":4}' \
+  'secretsdump.py corp.local/user@10.20.30.40'
+
+termshot render --redaction '{"row":3,"col_start":12,"col_end":44,"label":"SECRET"}' \
+  capture.ansi
+```
+
+Passing it redacts the screenshot even without `--redact` (add `--redact` to
+run the built-in rules as well), and it conflicts with `--no-redact` rather
+than being silently ignored. See
+[docs/redaction.md](./docs/redaction.md#manual-redaction-cli-and-mcp).
+
 ## Tips
 
 ```sh
 termshot exec '!!'                            # your shell expands !! first
 termshot exec 'command cat .env.staging'      # bypass a cat -> bat alias
 termshot exec --no-prompt 'cat .env.staging'  # no prompt, no aliases
+termshot exec --redact --redaction '{"pattern":"TCK-[0-9]+","replacement":"TICKET"}' \
+  'cat notes.txt'                             # built-in rules plus your own
 alias tshot='termshot exec'
 ```
 

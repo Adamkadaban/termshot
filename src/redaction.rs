@@ -170,6 +170,7 @@ pub const REDACTION_DISABLED_MSG: &str = "redaction was requested but is disable
      set enabled = true to use --redact / redact: true";
 
 /// A compiled rule ready to match against terminal text.
+#[derive(Debug)]
 struct CompiledRule {
     name: String,
     /// On-image label, or `None` to draw a plain block with no text overlay.
@@ -214,6 +215,7 @@ impl CompiledRule {
 }
 
 /// A compiled set of redaction rules.
+#[derive(Debug)]
 pub struct RedactionEngine {
     rules: Vec<CompiledRule>,
 }
@@ -581,11 +583,32 @@ impl RedactionMap {
     /// `Some` (and it fits); `None` draws a plain block. Counted in the audit
     /// under the label when present, otherwise under `manual`.
     pub fn add_manual(&mut self, row: u16, col_start: u16, col_end: u16, label: Option<&str>) {
+        self.add_manual_with_color(
+            row,
+            col_start,
+            col_end,
+            label,
+            DEFAULT_BLOCK_COLOR,
+            DEFAULT_LABEL_COLOR,
+        );
+    }
+
+    /// [`RedactionMap::add_manual`] with explicit colors, so a caller-supplied
+    /// per-redaction `color` paints this block without changing any other.
+    pub fn add_manual_with_color(
+        &mut self,
+        row: u16,
+        col_start: u16,
+        col_end: u16,
+        label: Option<&str>,
+        block_color: [u8; 3],
+        label_color: [u8; 3],
+    ) {
         if col_end <= col_start {
             return;
         }
         let cells: Vec<(u16, u16)> = (col_start..col_end).map(|col| (row, col)).collect();
-        self.apply_run(&cells, label, DEFAULT_BLOCK_COLOR, DEFAULT_LABEL_COLOR);
+        self.apply_run(&cells, label, block_color, label_color);
         let name = match label {
             Some(l) if !l.is_empty() => format!("manual:{}", l),
             _ => "manual".to_string(),
@@ -648,6 +671,617 @@ impl RedactionMap {
         }
         out_rows.join("\n").trim_end().to_string()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Manual redaction specifications (shared by the CLI and the MCP server)
+// ---------------------------------------------------------------------------
+
+/// A single manual redaction: either a regex pattern (redacts every match) or
+/// an explicit cell range.
+///
+/// This is the one representation of a caller-supplied redaction in termshot:
+/// the MCP `redact_screenshot` tool decodes its `redactions` array into it, and
+/// the CLI's repeatable `--redaction '<JSON>'` option parses the same JSON into
+/// the same type, so both entry points accept exactly the same specifications
+/// and apply them the same way.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ManualRedactionSpec {
+    /// Redact every match of a regex pattern.
+    Pattern {
+        /// Regex pattern to match against the terminal text.
+        pattern: String,
+        /// Replacement marker used to derive the on-image `[LABEL]` tag. May
+        /// also be given as `label`. Omitted (or empty) draws a plain block
+        /// with no text overlay.
+        #[serde(default, alias = "label")]
+        replacement: Option<String>,
+        /// Number of leading matched characters to leave unmasked. When set,
+        /// only the characters after the prefix are blocked out (e.g. show
+        /// `AKIA****` for an AWS key). Defaults to 0 (mask everything).
+        #[serde(default)]
+        keep_prefix: Option<usize>,
+        /// Number of trailing matched characters to leave unmasked. When set,
+        /// only the characters before the suffix are blocked out. Defaults to
+        /// 0 (mask everything).
+        #[serde(default)]
+        keep_suffix: Option<usize>,
+        /// Block color for this redaction as `#RRGGBB`. Defaults to the
+        /// built-in red.
+        #[serde(default)]
+        color: Option<String>,
+    },
+    /// Redact an explicit cell range on a single row (0-based).
+    ///
+    /// Coordinates are validated against the screenshot before anything is
+    /// drawn: a row at or past its last row, a column at or past its last
+    /// column, or a `col_start` that is not before `col_end` is rejected with
+    /// an error naming the screenshot's real dimensions.
+    Coordinate {
+        /// Row index (0-based), counted in the screenshot as rendered: row 0 is
+        /// the topmost line the PNG shows, which for a `head_lines` /
+        /// `tail_lines` capture is the first line of that selection. Must be
+        /// less than the number of rows the screenshot shows.
+        row: u16,
+        /// First column to redact (0-based, inclusive). Must be less than both
+        /// `col_end` and the screenshot's width.
+        col_start: u16,
+        /// One past the last column to redact (exclusive). Must be greater than
+        /// `col_start` and no greater than the screenshot's width.
+        col_end: u16,
+        /// Short label drawn over the redaction block.
+        #[serde(default)]
+        label: Option<String>,
+        /// Block color for this redaction as `#RRGGBB`. Defaults to the
+        /// built-in red.
+        #[serde(default)]
+        color: Option<String>,
+    },
+}
+
+/// Field names a `pattern` redaction accepts, used to reject typos with a
+/// message that names the alternatives.
+const PATTERN_FIELDS: &[&str] = &[
+    "pattern",
+    "replacement",
+    "label",
+    "keep_prefix",
+    "keep_suffix",
+    "color",
+];
+/// The pattern fields that must be present.
+const PATTERN_REQUIRED: &[&str] = &["pattern"];
+/// Field names a coordinate redaction accepts.
+const COORDINATE_FIELDS: &[&str] = &["row", "col_start", "col_end", "label", "color"];
+/// The coordinate fields that must all be present.
+const COORDINATE_REQUIRED: &[&str] = &["row", "col_start", "col_end"];
+
+/// Description published for the `pattern` variant.
+const PATTERN_DESCRIPTION: &str = "Redact every match of a regex pattern. \
+     `replacement` (also accepted as `label`) is drawn as the on-image \
+     `[LABEL]` tag; omitting it draws a plain block with no text overlay.";
+/// Description published for the coordinate variant.
+const COORDINATE_DESCRIPTION: &str = "Redact an explicit cell range on a single row (0-based). Coordinates are \
+     validated against the screenshot before anything is drawn: a row at or past \
+     its last row, a column at or past its last column, or a `col_start` that is \
+     not before `col_end` is rejected with an error naming the screenshot's real \
+     dimensions.";
+
+/// The JSON Schema of one accepted field, by name.
+///
+/// The published schema is generated from the very lists the parser validates
+/// against ([`PATTERN_FIELDS`], [`COORDINATE_FIELDS`]), so a field this crate
+/// accepts cannot go unpublished and a field it refuses cannot be advertised.
+fn field_schema(name: &str, is_pattern: bool) -> serde_json::Value {
+    match name {
+        "pattern" => serde_json::json!({
+            "type": "string",
+            "description": "Regex pattern to match against the terminal text.",
+        }),
+        "replacement" => serde_json::json!({
+            "type": ["string", "null"],
+            "default": null,
+            "description": "Replacement marker used to derive the on-image `[LABEL]` tag. \
+                            May also be given as `label`. Omitted (or empty) draws a plain \
+                            block with no text overlay.",
+        }),
+        "label" if is_pattern => serde_json::json!({
+            "type": ["string", "null"],
+            "default": null,
+            "description": "Alias for `replacement`: the on-image `[LABEL]` tag for this \
+                            pattern. Pass one or the other, not both.",
+        }),
+        "label" => serde_json::json!({
+            "type": ["string", "null"],
+            "default": null,
+            "description": "Short label drawn over the redaction block. Defaults to \
+                            `REDACTED`.",
+        }),
+        "keep_prefix" => serde_json::json!({
+            "type": ["integer", "null"],
+            "format": "uint",
+            "minimum": 0,
+            "default": null,
+            "description": "Number of leading matched characters to leave unmasked. When \
+                            set, only the characters after the prefix are blocked out (e.g. \
+                            show `AKIA****` for an AWS key). Defaults to 0 (mask everything).",
+        }),
+        "keep_suffix" => serde_json::json!({
+            "type": ["integer", "null"],
+            "format": "uint",
+            "minimum": 0,
+            "default": null,
+            "description": "Number of trailing matched characters to leave unmasked. When \
+                            set, only the characters before the suffix are blocked out. \
+                            Defaults to 0 (mask everything).",
+        }),
+        "color" => serde_json::json!({
+            "type": ["string", "null"],
+            "default": null,
+            "description": "Block color for this redaction as `#RRGGBB`. Defaults to the \
+                            built-in red.",
+        }),
+        "row" => serde_json::json!({
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535,
+            "description": "Row index (0-based), counted in the screenshot as rendered: row \
+                            0 is the topmost line the PNG shows, which for a `head_lines` / \
+                            `tail_lines` capture is the first line of that selection. Must \
+                            be less than the number of rows the screenshot shows.",
+        }),
+        "col_start" => serde_json::json!({
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535,
+            "description": "First column to redact (0-based, inclusive). Must be less than \
+                            both `col_end` and the screenshot's width.",
+        }),
+        "col_end" => serde_json::json!({
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535,
+            "description": "One past the last column to redact (exclusive). Must be greater \
+                            than `col_start` and no greater than the screenshot's width.",
+        }),
+        other => unreachable!("no schema for redaction field {:?}", other),
+    }
+}
+
+/// Build the schema of one variant: exactly the fields it accepts, exactly the
+/// ones it requires, and nothing else (`additionalProperties: false`, matching
+/// the parser, which names unknown keys rather than ignoring them).
+fn variant_schema(
+    description: &str,
+    fields: &[&str],
+    required: &[&str],
+    is_pattern: bool,
+) -> serde_json::Value {
+    let properties: serde_json::Map<String, serde_json::Value> = fields
+        .iter()
+        .map(|field| ((*field).to_string(), field_schema(field, is_pattern)))
+        .collect();
+    serde_json::json!({
+        "type": "object",
+        "description": description,
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    })
+}
+
+/// The published JSON Schema for a manual redaction, as `tools/list` shows it.
+///
+/// Hand-written rather than derived: the derive had no way to know about the
+/// `label` alias a pattern accepts, and it published an untagged `anyOf` whose
+/// branches allowed any extra property - so the schema promised to accept
+/// specifications [`ManualRedactionSpec::from_value`] refuses, and hid one it
+/// takes. A tool schema that disagrees with the parser is worse than none: the
+/// client is told the call will work and only finds out otherwise at run time.
+///
+/// The two branches are mutually exclusive (`oneOf`), matching how the parser
+/// discriminates: an object with `pattern` is a pattern redaction, one with
+/// `row`/`col_start`/`col_end` is a coordinate redaction, and one with keys
+/// from both is refused by either branch's `additionalProperties: false`.
+pub fn manual_redaction_schema() -> serde_json::Value {
+    serde_json::json!({
+        "description": "A single manual redaction: either a regex pattern (redacts every \
+                        match) or an explicit cell range. The CLI's repeatable \
+                        `--redaction '<JSON>'` option takes exactly the same specification.",
+        "oneOf": [
+            variant_schema(PATTERN_DESCRIPTION, PATTERN_FIELDS, PATTERN_REQUIRED, true),
+            variant_schema(
+                COORDINATE_DESCRIPTION,
+                COORDINATE_FIELDS,
+                COORDINATE_REQUIRED,
+                false,
+            ),
+        ],
+    })
+}
+
+impl schemars::JsonSchema for ManualRedactionSpec {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ManualRedactionSpec".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::ManualRedactionSpec").into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::Schema::try_from(manual_redaction_schema())
+            .expect("the manual redaction schema is a JSON object")
+    }
+}
+
+/// The `pattern` variant's fields, used to decode one after the object has
+/// been recognized as a pattern redaction.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatternFields {
+    pattern: String,
+    #[serde(default, alias = "label")]
+    replacement: Option<String>,
+    #[serde(default)]
+    keep_prefix: Option<usize>,
+    #[serde(default)]
+    keep_suffix: Option<usize>,
+    #[serde(default)]
+    color: Option<String>,
+}
+
+/// The coordinate variant's fields.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoordinateFields {
+    row: u16,
+    col_start: u16,
+    col_end: u16,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    color: Option<String>,
+}
+
+impl ManualRedactionSpec {
+    /// Parse one `--redaction '<JSON>'` argument.
+    pub fn from_json(input: &str) -> Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(input).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid redaction JSON: {}. Expected an object such as \
+                 '{{\"pattern\":\"[a-f0-9]{{32}}\",\"replacement\":\"HASH\",\"keep_prefix\":4}}' \
+                 or '{{\"row\":3,\"col_start\":12,\"col_end\":44,\"label\":\"SECRET\"}}', got: {}",
+                e,
+                input
+            )
+        })?;
+        Self::from_value(value).with_context(|| format!("in redaction: {}", input))
+    }
+
+    /// Decode one redaction from an already-parsed JSON value.
+    ///
+    /// This is the single decoder both entry points use: the CLI reaches it
+    /// through [`ManualRedactionSpec::from_json`] and the MCP server through the
+    /// `Deserialize` implementation below, so a specification that one accepts
+    /// the other accepts, with the same message when it does not.
+    ///
+    /// Deserializing an untagged enum directly would answer a typo with "data
+    /// did not match any variant", so the object is inspected first: the
+    /// variant is chosen by the keys present, unknown keys are named alongside
+    /// the ones that variant accepts, and only then is the value decoded.
+    pub fn from_value(value: serde_json::Value) -> Result<Self> {
+        let object = value.as_object().ok_or_else(|| {
+            anyhow::anyhow!(
+                "a redaction must be a JSON object with either a \"pattern\" or \
+                 \"row\"/\"col_start\"/\"col_end\""
+            )
+        })?;
+
+        let is_pattern = object.contains_key("pattern");
+        let allowed = if is_pattern {
+            PATTERN_FIELDS
+        } else if COORDINATE_REQUIRED
+            .iter()
+            .any(|field| object.contains_key(*field))
+        {
+            for field in COORDINATE_REQUIRED {
+                if !object.contains_key(*field) {
+                    anyhow::bail!(
+                        "a coordinate redaction needs \"row\", \"col_start\" and \"col_end\"; \
+                         \"{}\" is missing",
+                        field
+                    );
+                }
+            }
+            COORDINATE_FIELDS
+        } else {
+            anyhow::bail!(
+                "a redaction needs either a \"pattern\" or \"row\"/\"col_start\"/\"col_end\""
+            );
+        };
+
+        let unknown: Vec<&str> = object
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !allowed.contains(key))
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "unknown field(s) {} in redaction; this redaction accepts: {}",
+                unknown.join(", "),
+                allowed.join(", ")
+            );
+        }
+
+        if is_pattern {
+            let fields: PatternFields =
+                serde_json::from_value(value).context("invalid pattern redaction")?;
+            Ok(Self::Pattern {
+                pattern: fields.pattern,
+                replacement: fields.replacement,
+                keep_prefix: fields.keep_prefix,
+                keep_suffix: fields.keep_suffix,
+                color: fields.color,
+            })
+        } else {
+            let fields: CoordinateFields =
+                serde_json::from_value(value).context("invalid coordinate redaction")?;
+            Ok(Self::Coordinate {
+                row: fields.row,
+                col_start: fields.col_start,
+                col_end: fields.col_end,
+                label: fields.label,
+                color: fields.color,
+            })
+        }
+    }
+
+    /// Parse every `--redaction` argument, in the order they were given.
+    pub fn parse_all<S: AsRef<str>>(inputs: &[S]) -> Result<Vec<Self>> {
+        inputs
+            .iter()
+            .enumerate()
+            .map(|(i, input)| {
+                Self::from_json(input.as_ref()).with_context(|| format!("--redaction #{}", i + 1))
+            })
+            .collect()
+    }
+}
+
+/// Hand-written so an MCP `redact_screenshot` request is decoded by exactly the
+/// same rules as a CLI `--redaction` argument: same accepted fields, same
+/// `label` alias, same rejection of typos, and the same messages.
+impl<'de> Deserialize<'de> for ManualRedactionSpec {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Self::from_value(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One resolved [`ManualRedactionSpec::Coordinate`], with its color already parsed.
+#[derive(Debug, Clone)]
+pub struct CoordinateRedaction {
+    pub row: u16,
+    pub col_start: u16,
+    pub col_end: u16,
+    pub label: Option<String>,
+    pub block_color: [u8; 3],
+}
+
+/// A validated set of manual redactions, ready to apply to a capture.
+///
+/// Built once from [`ManualRedactionSpec`]s (compiling every pattern and parsing
+/// every color, so bad input fails before a command is run or an image is
+/// written), then applied to the screen the renderer is about to draw. The CLI
+/// and the MCP server both go through this type, so a given JSON specification
+/// produces the same blocks, the same labels, and the same audit counts from
+/// either entry point.
+#[derive(Debug)]
+pub struct ManualRedactions {
+    /// Engine holding the caller's `pattern` specs, in order, named
+    /// `custom_0`, `custom_1`, ... - the names the audit reports.
+    engine: Option<RedactionEngine>,
+    coordinates: Vec<CoordinateRedaction>,
+    show_labels: bool,
+}
+
+impl ManualRedactions {
+    /// Compile `specs` into an applicable set, rejecting an invalid regex, an
+    /// unparseable color, or an empty coordinate range up front.
+    ///
+    /// `show_labels` mirrors the MCP `show_labels` parameter: when false every
+    /// block is drawn plain, with no text overlay.
+    pub fn new(specs: &[ManualRedactionSpec], show_labels: bool) -> Result<Self> {
+        let mut pattern_rules: Vec<RedactionRuleConfig> = Vec::new();
+        let mut coordinates: Vec<CoordinateRedaction> = Vec::new();
+
+        for (i, spec) in specs.iter().enumerate() {
+            match spec {
+                ManualRedactionSpec::Pattern {
+                    pattern,
+                    replacement,
+                    keep_prefix,
+                    keep_suffix,
+                    color,
+                } => {
+                    if pattern.is_empty() {
+                        anyhow::bail!("redaction #{}: \"pattern\" must not be empty", i + 1);
+                    }
+                    Regex::new(pattern).with_context(|| {
+                        format!("redaction #{}: invalid regex {:?}", i + 1, pattern)
+                    })?;
+                    // Use the caller-supplied `replacement` as the on-image
+                    // label. When it is omitted, leave it empty so the block
+                    // renders with no label (never a misleading built-in tag).
+                    let replacement = replacement.clone().unwrap_or_default();
+                    let mut rule =
+                        RedactionRuleConfig::new(&format!("custom_{}", i), pattern, &replacement);
+                    rule.keep_prefix = *keep_prefix;
+                    rule.keep_suffix = *keep_suffix;
+                    if let Some(color) = color {
+                        parse_color(color, i)?;
+                        rule.color = Some(color.clone());
+                    }
+                    pattern_rules.push(rule);
+                }
+                ManualRedactionSpec::Coordinate {
+                    row,
+                    col_start,
+                    col_end,
+                    label,
+                    color,
+                } => {
+                    let block_color = match color {
+                        Some(color) => parse_color(color, i)?,
+                        None => DEFAULT_BLOCK_COLOR,
+                    };
+                    coordinates.push(CoordinateRedaction {
+                        row: *row,
+                        col_start: *col_start,
+                        col_end: *col_end,
+                        label: label.clone(),
+                        block_color,
+                    });
+                }
+            }
+        }
+
+        let engine = if pattern_rules.is_empty() {
+            None
+        } else {
+            Some(RedactionEngine::from_rules_with_labels(
+                &pattern_rules,
+                show_labels,
+            )?)
+        };
+
+        Ok(Self {
+            engine,
+            coordinates,
+            show_labels,
+        })
+    }
+
+    /// True when there is nothing to apply.
+    pub fn is_empty(&self) -> bool {
+        self.engine.is_none() && self.coordinates.is_empty()
+    }
+
+    /// The coordinate redactions, in the order they were given.
+    pub fn coordinates(&self) -> &[CoordinateRedaction] {
+        &self.coordinates
+    }
+
+    /// Check every coordinate range against the cells a render actually paints.
+    ///
+    /// A coordinate redaction is a promise to cover specific cells, so a range
+    /// that lands outside the image must fail loudly: silently clamping it (or
+    /// dropping it, as the redaction map does for an empty interval) would
+    /// report "redacted" for a screenshot where the secret is still legible.
+    /// The bounds are the *rendered* ones - the retained capture, narrowed to
+    /// the head/tail selection it is drawn with, then to the rows and columns
+    /// that survive trailing-blank trimming and `auto_crop` - not the PTY
+    /// viewport and not the raw grid.
+    ///
+    /// This applies to manual coordinates only. Pattern redactions are matched
+    /// against the capture itself, so a match on the rightmost content cell (or
+    /// the continuation cell of a double-width character) is masked as usual:
+    /// wherever text is drawn, the renderer is already inside these bounds.
+    pub fn validate_bounds(&self, rendered_rows: u16, rendered_cols: u16) -> Result<()> {
+        for coordinate in &self.coordinates {
+            let CoordinateRedaction {
+                row,
+                col_start,
+                col_end,
+                ..
+            } = *coordinate;
+            let invalid = |detail: String| -> Result<()> {
+                anyhow::bail!(
+                    "invalid redaction coordinate (row {}, col_start {}, col_end {}): {}. \
+                     The screenshot renders {} row(s) x {} column(s); rows are 0..{} and \
+                     columns are 0..{} (col_end is exclusive). Cells outside that are \
+                     retained by the capture but never drawn, so redacting them would \
+                     change nothing.",
+                    row,
+                    col_start,
+                    col_end,
+                    detail,
+                    rendered_rows,
+                    rendered_cols,
+                    rendered_rows,
+                    rendered_cols
+                )
+            };
+            if row >= rendered_rows {
+                return invalid(format!("row {} is past the last rendered row", row));
+            }
+            if col_start >= col_end {
+                return invalid(format!(
+                    "col_start {} is not before col_end {}, so the range is empty",
+                    col_start, col_end
+                ));
+            }
+            if col_start >= rendered_cols {
+                return invalid(format!(
+                    "col_start {} is past the last rendered column",
+                    col_start
+                ));
+            }
+            if col_end > rendered_cols {
+                return invalid(format!(
+                    "col_end {} is past the last rendered column boundary",
+                    col_end
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply these redactions to `screen`, merging them into `map`: pattern
+    /// matches first (in the order the specs were given), then the coordinate
+    /// ranges. Call [`ManualRedactions::validate_bounds`] first.
+    pub fn apply_to<S: ScreenView + ?Sized>(&self, screen: &S, map: &mut RedactionMap) {
+        if let Some(engine) = &self.engine {
+            // Matched on the capture the renderer will draw, so a match found
+            // here masks the cell it draws - including rows that scrolled out
+            // of the viewport.
+            engine.redact_screen_into(screen, None, map);
+        }
+        for coordinate in &self.coordinates {
+            let label = if self.show_labels {
+                coordinate.label.as_deref().or(Some("REDACTED"))
+            } else {
+                None
+            };
+            map.add_manual_with_color(
+                coordinate.row,
+                coordinate.col_start,
+                coordinate.col_end,
+                label,
+                coordinate.block_color,
+                DEFAULT_LABEL_COLOR,
+            );
+        }
+    }
+}
+
+/// Parse a per-redaction `#RRGGBB` color, naming the offending redaction.
+fn parse_color(color: &str, index: usize) -> Result<[u8; 3]> {
+    parse_hex_rgb(color).ok_or_else(|| {
+        anyhow::anyhow!(
+            "redaction #{}: invalid color {:?}; expected a hex color such as \"#d41919\"",
+            index + 1,
+            color
+        )
+    })
 }
 
 /// Short visual label for a rule, used inside the redaction block.
@@ -1018,6 +1652,7 @@ pub fn load_rules_from_dir(dir: &std::path::Path) -> Vec<RedactionRuleConfig> {
 mod tests {
     use super::*;
     use crate::capture::{CapturedScreen, DEFAULT_MAX_SCROLLBACK_LINES};
+    use std::collections::BTreeSet;
 
     fn engine() -> RedactionEngine {
         RedactionEngine::from_config(&RedactionConfig::default()).unwrap()
@@ -1642,5 +2277,283 @@ replacement = "[REDACTED-TICKET]"
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].name, "ticket");
         std::fs::remove_dir_all(dir).ok();
+    }
+    // ---------------------------------------------------------------------
+    // Manual redaction specifications
+    // ---------------------------------------------------------------------
+
+    /// A pattern specification decodes every field the MCP tool documents,
+    /// including `label` as an alias for `replacement`.
+    #[test]
+    fn pattern_specs_decode_every_documented_field() {
+        let spec = ManualRedactionSpec::from_json(
+            r##"{"pattern":"[a-f0-9]{32}","replacement":"HASH","keep_prefix":4,"keep_suffix":2,"color":"#00ff00"}"##,
+        )
+        .expect("valid pattern spec");
+        match spec {
+            ManualRedactionSpec::Pattern {
+                pattern,
+                replacement,
+                keep_prefix,
+                keep_suffix,
+                color,
+            } => {
+                assert_eq!(pattern, "[a-f0-9]{32}");
+                assert_eq!(replacement.as_deref(), Some("HASH"));
+                assert_eq!(keep_prefix, Some(4));
+                assert_eq!(keep_suffix, Some(2));
+                assert_eq!(color.as_deref(), Some("#00ff00"));
+            }
+            other => panic!("expected a pattern spec, got {:?}", other),
+        }
+
+        // `label` is accepted as the on-image tag for a pattern too.
+        match ManualRedactionSpec::from_json(r#"{"pattern":"x","label":"TAG"}"#).unwrap() {
+            ManualRedactionSpec::Pattern { replacement, .. } => {
+                assert_eq!(replacement.as_deref(), Some("TAG"))
+            }
+            other => panic!("expected a pattern spec, got {:?}", other),
+        }
+    }
+
+    /// A coordinate specification decodes its range, label, and color.
+    #[test]
+    fn coordinate_specs_decode_their_range() {
+        match ManualRedactionSpec::from_json(
+            r##"{"row":3,"col_start":12,"col_end":44,"label":"SECRET","color":"#d41919"}"##,
+        )
+        .unwrap()
+        {
+            ManualRedactionSpec::Coordinate {
+                row,
+                col_start,
+                col_end,
+                label,
+                color,
+            } => {
+                assert_eq!((row, col_start, col_end), (3, 12, 44));
+                assert_eq!(label.as_deref(), Some("SECRET"));
+                assert_eq!(color.as_deref(), Some("#d41919"));
+            }
+            other => panic!("expected a coordinate spec, got {:?}", other),
+        }
+    }
+
+    /// The MCP path decodes through the same function, so JSON that the CLI
+    /// refuses is refused identically when it arrives as a tool parameter.
+    #[test]
+    fn the_cli_and_serde_paths_share_one_decoder() {
+        for bad in [
+            r#"{"pattern":"x","replacment":"y"}"#,
+            r#"{"row":0,"col_start":0}"#,
+            r#"{"label":"x"}"#,
+            r#"[1,2,3]"#,
+        ] {
+            let cli = ManualRedactionSpec::from_json(bad).expect_err("the CLI must refuse it");
+            let serde = serde_json::from_str::<ManualRedactionSpec>(bad)
+                .expect_err("the MCP path must refuse it too");
+            let cli = cli.to_string();
+            assert!(
+                serde.to_string().contains(&cli) || cli.contains("in redaction"),
+                "the two paths disagree about {bad}: {cli} vs {serde}"
+            );
+        }
+
+        let good = r#"{"pattern":"x","keep_prefix":1}"#;
+        assert!(serde_json::from_str::<ManualRedactionSpec>(good).is_ok());
+        assert!(ManualRedactionSpec::from_json(good).is_ok());
+    }
+
+    /// Bad regexes and bad colors are refused when the set is compiled, before
+    /// a command runs or an image is written.
+    #[test]
+    fn manual_redactions_reject_invalid_input_up_front() {
+        let bad_regex = ManualRedactionSpec::from_json(r#"{"pattern":"([a-"}"#).unwrap();
+        let err = ManualRedactions::new(&[bad_regex], true).unwrap_err();
+        assert!(err.to_string().contains("invalid regex"), "{err}");
+
+        let bad_color =
+            ManualRedactionSpec::from_json(r#"{"pattern":"x","color":"nope"}"#).unwrap();
+        let err = ManualRedactions::new(&[bad_color], true).unwrap_err();
+        assert!(err.to_string().contains("invalid color"), "{err}");
+
+        let bad_coord_color = ManualRedactionSpec::from_json(
+            r#"{"row":0,"col_start":0,"col_end":1,"color":"12345"}"#,
+        )
+        .unwrap();
+        let err = ManualRedactions::new(&[bad_coord_color], true).unwrap_err();
+        assert!(err.to_string().contains("invalid color"), "{err}");
+    }
+
+    /// Coordinates are checked against the rendered bounds, and the message
+    /// names both the request and the dimensions.
+    #[test]
+    fn manual_coordinates_are_bounds_checked() {
+        let specs =
+            vec![ManualRedactionSpec::from_json(r#"{"row":0,"col_start":0,"col_end":4}"#).unwrap()];
+        let manual = ManualRedactions::new(&specs, true).unwrap();
+        assert!(manual.validate_bounds(4, 8).is_ok());
+
+        let err = manual.validate_bounds(4, 3).unwrap_err().to_string();
+        assert!(
+            err.contains("col_end 4 is past the last rendered column boundary"),
+            "{err}"
+        );
+        assert!(err.contains("renders 4 row(s) x 3 column(s)"), "{err}");
+
+        let err = ManualRedactions::new(&specs, true)
+            .unwrap()
+            .validate_bounds(0, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("row 0 is past the last rendered row"), "{err}");
+    }
+
+    /// A compiled set masks a pattern (keeping its prefix) and a cell range in
+    /// the caller's color, and names them in the audit the way the MCP tool
+    /// reports them.
+    #[test]
+    fn manual_redactions_apply_patterns_and_coordinates() {
+        let specs = vec![
+            ManualRedactionSpec::from_json(
+                r#"{"pattern":"AKIA[0-9A-Z]{16}","replacement":"KEY","keep_prefix":4}"#,
+            )
+            .unwrap(),
+            ManualRedactionSpec::from_json(
+                r##"{"row":0,"col_start":0,"col_end":4,"label":"SECRET","color":"#00ff00"}"##,
+            )
+            .unwrap(),
+        ];
+        let manual = ManualRedactions::new(&specs, true).unwrap();
+        assert!(!manual.is_empty());
+        assert_eq!(manual.coordinates().len(), 1);
+
+        let mut parser = vt100::Parser::new(4, 40, 0);
+        parser.process(
+            b"user AKIAIOSFODNN7EXAMPLE
+",
+        );
+        let mut map = RedactionMap::default();
+        manual.apply_to(parser.screen(), &mut map);
+
+        // The key is masked except for its first four characters.
+        let text = map.redacted_plain_text(parser.screen());
+        assert!(text.contains("AKIA\u{2588}"), "{text}");
+        assert!(!text.contains("AKIAIOSFODNN7EXAMPLE"), "{text}");
+        // The coordinate range is painted in the requested color.
+        assert_eq!(map.get(0, 0).unwrap().block_color, [0, 255, 0]);
+        // The pattern keeps the built-in red.
+        assert_eq!(map.get(0, 9).unwrap().block_color, DEFAULT_BLOCK_COLOR);
+        assert_eq!(
+            map.audit_summary(),
+            "1x custom_0, 1x manual:SECRET",
+            "the audit must name the specs the way the MCP tool does"
+        );
+    }
+
+    /// With labels suppressed every block is drawn plain, matching
+    /// `show_labels: false`.
+    #[test]
+    fn manual_redactions_can_suppress_labels() {
+        let specs =
+            vec![ManualRedactionSpec::from_json(r#"{"row":0,"col_start":0,"col_end":4}"#).unwrap()];
+        let manual = ManualRedactions::new(&specs, false).unwrap();
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"secret\r\n");
+        let mut map = RedactionMap::default();
+        manual.apply_to(parser.screen(), &mut map);
+        for col in 0..4 {
+            assert!(map.get(0, col).unwrap().label_char.is_none());
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Published schema
+    // ---------------------------------------------------------------------
+
+    /// The two variants of the published schema, in order.
+    fn schema_variants() -> (serde_json::Value, serde_json::Value) {
+        let schema = manual_redaction_schema();
+        let variants = schema["oneOf"]
+            .as_array()
+            .expect("the schema discriminates with oneOf, as the parser does")
+            .clone();
+        assert_eq!(variants.len(), 2, "expected two variants: {schema}");
+        (variants[0].clone(), variants[1].clone())
+    }
+
+    /// Each variant publishes exactly the fields the parser accepts, exactly
+    /// the ones it requires, and refuses anything else.
+    #[test]
+    fn the_schema_publishes_exactly_what_the_parser_accepts() {
+        let (pattern, coordinate) = schema_variants();
+
+        for (variant, fields, required) in [
+            (&pattern, PATTERN_FIELDS, PATTERN_REQUIRED),
+            (&coordinate, COORDINATE_FIELDS, COORDINATE_REQUIRED),
+        ] {
+            assert_eq!(variant["type"], "object", "{variant}");
+            assert_eq!(
+                variant.get("additionalProperties"),
+                Some(&serde_json::Value::Bool(false)),
+                "a variant that allows unknown fields promises what the parser refuses: \
+                 {variant}"
+            );
+
+            let published: BTreeSet<&str> = variant["properties"]
+                .as_object()
+                .expect("properties is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                published,
+                fields.iter().copied().collect::<BTreeSet<&str>>(),
+                "the published fields must be the accepted fields: {variant}"
+            );
+
+            let published_required: Vec<&str> = variant["required"]
+                .as_array()
+                .expect("required is an array")
+                .iter()
+                .map(|value| value.as_str().expect("a field name"))
+                .collect();
+            assert_eq!(published_required, required, "{variant}");
+
+            // Every published field has a real schema, not an empty stub.
+            for (name, field) in variant["properties"].as_object().unwrap() {
+                assert!(
+                    field.get("type").is_some(),
+                    "field {name} has no type: {field}"
+                );
+                assert!(
+                    field
+                        .get("description")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|d| !d.is_empty()),
+                    "field {name} has no description: {field}"
+                );
+            }
+        }
+
+        // The pattern variant is the one carrying the `label` alias, and the
+        // one keyed on `pattern`.
+        assert!(pattern["properties"].get("pattern").is_some());
+        assert!(pattern["properties"].get("label").is_some());
+        assert!(coordinate["properties"].get("pattern").is_none());
+    }
+
+    /// The type's `JsonSchema` implementation is the schema above, so what
+    /// `tools/list` publishes is what these tests check.
+    #[test]
+    fn the_json_schema_impl_publishes_the_same_document() {
+        let mut generator = schemars::SchemaGenerator::default();
+        let schema =
+            <ManualRedactionSpec as schemars::JsonSchema>::json_schema(&mut generator).to_value();
+        assert_eq!(schema, manual_redaction_schema());
+        assert_eq!(
+            <ManualRedactionSpec as schemars::JsonSchema>::schema_name(),
+            "ManualRedactionSpec"
+        );
     }
 }

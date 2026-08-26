@@ -2,7 +2,7 @@ use crate::capture::LineSelection;
 use crate::config::Config;
 use crate::executor;
 use crate::redaction::{
-    REDACTION_DISABLED_MSG, RedactionEngine, RedactionMap, RedactionRuleConfig,
+    ManualRedactionSpec, ManualRedactions, REDACTION_DISABLED_MSG, RedactionEngine, RedactionMap,
     explicit_request_is_blocked, resolve_should_redact,
 };
 use crate::renderer::{
@@ -229,6 +229,16 @@ pub struct RenderAnsiParams {
 
 /// A single selective redaction for `redact_screenshot`: either a regex
 /// pattern (redacts every match) or an explicit cell range.
+///
+/// This is the enum published in 1.0.0 and it keeps exactly the variants and
+/// fields it was published with, so an old literal - written with no `..` and
+/// no knowledge of per-redaction colors - still compiles.
+///
+/// New work should use [`ManualRedactionSpec`], the specification the CLI's
+/// `--redaction` option and the `redact_screenshot` tool schema share: it adds
+/// a per-redaction `color` and accepts `label` as an alias for a pattern's
+/// `replacement`. Converting is infallible ([`From`]), because everything this
+/// type can express the shared one can.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum RedactionSpec {
@@ -274,6 +284,46 @@ pub enum RedactionSpec {
     },
 }
 
+/// A 1.0.0 specification is a shared one that never sets a color.
+impl From<RedactionSpec> for ManualRedactionSpec {
+    fn from(spec: RedactionSpec) -> Self {
+        match spec {
+            RedactionSpec::Pattern {
+                pattern,
+                replacement,
+                keep_prefix,
+                keep_suffix,
+            } => ManualRedactionSpec::Pattern {
+                pattern,
+                replacement,
+                keep_prefix,
+                keep_suffix,
+                color: None,
+            },
+            RedactionSpec::Coordinate {
+                row,
+                col_start,
+                col_end,
+                label,
+            } => ManualRedactionSpec::Coordinate {
+                row,
+                col_start,
+                col_end,
+                label,
+                color: None,
+            },
+        }
+    }
+}
+
+/// The parameters `redact_screenshot` was published with in 1.0.0.
+///
+/// Kept verbatim - including `redactions: Vec<RedactionSpec>` - so a 1.0.0
+/// literal still compiles, and [`ScreenshotServer::redact_screenshot`] still
+/// takes it. The published tool schema describes
+/// [`RedactScreenshotRequest`], which carries the shared
+/// [`ManualRedactionSpec`]; `From`/[`RedactScreenshotParams::into_request`]
+/// converts between the two, and both run the same implementation.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RedactScreenshotParams {
@@ -285,6 +335,72 @@ pub struct RedactScreenshotParams {
 
     /// Redactions to apply: regex patterns and/or explicit cell ranges.
     pub redactions: Vec<RedactionSpec>,
+
+    /// Also redact the returned terminal text. By default the returned text is
+    /// the ORIGINAL (unredacted) content; only the PNG is redacted. Defaults to
+    /// false.
+    #[serde(default)]
+    pub redact_text: Option<bool>,
+
+    /// Whether to draw a label over each redaction block. Defaults to true.
+    /// For a regex `pattern`, the label is the `replacement` field (drawn only
+    /// when provided); for a coordinate redaction it is the `label` field. Set
+    /// to false to draw plain solid blocks with no text overlay.
+    #[serde(default)]
+    pub show_labels: Option<bool>,
+
+    /// Strip ANSI color codes from the returned terminal text. By default the
+    /// raw output is returned WITH colors preserved. Defaults to false.
+    #[serde(default)]
+    pub strip_ansi: Option<bool>,
+}
+
+impl RedactScreenshotParams {
+    /// Convert the 1.0.0 parameters into the request the tool takes today.
+    pub fn into_request(self) -> RedactScreenshotRequest {
+        self.into()
+    }
+}
+
+impl From<RedactScreenshotParams> for RedactScreenshotRequest {
+    fn from(params: RedactScreenshotParams) -> Self {
+        Self {
+            screenshot_path: params.screenshot_path,
+            redactions: params
+                .redactions
+                .into_iter()
+                .map(ManualRedactionSpec::from)
+                .collect(),
+            redact_text: params.redact_text,
+            show_labels: params.show_labels,
+            strip_ansi: params.strip_ansi,
+        }
+    }
+}
+
+/// The parameters the `redact_screenshot` tool takes, and the ones its
+/// published schema describes.
+///
+/// Identical to the 1.0.0 [`RedactScreenshotParams`] except that its
+/// redactions are [`ManualRedactionSpec`]s - the specification the CLI's
+/// `--redaction` option parses - so the tool and the CLI accept exactly the
+/// same JSON. It is a separate struct because changing the field type in place
+/// would break every 1.0.0 literal, and it is taken by a separate handler
+/// ([`ScreenshotServer::redact_screenshot_tool`]) so that the 1.0.0
+/// [`ScreenshotServer::redact_screenshot`] keeps its published signature.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedactScreenshotRequest {
+    /// Path to a screenshot PNG produced by THIS server instance in the current
+    /// session (via execute_and_screenshot or render_ansi). The raw output and
+    /// render metadata are kept in memory, so this only works for screenshots
+    /// created since the server last started, and not for CLI-produced images.
+    pub screenshot_path: String,
+
+    /// Redactions to apply: regex patterns and/or explicit cell ranges. This
+    /// is the same specification the CLI takes through its repeatable
+    /// `--redaction '<JSON>'` option on `exec` and `render`.
+    pub redactions: Vec<ManualRedactionSpec>,
 
     /// Also redact the returned terminal text. By default the returned text is
     /// the ORIGINAL (unredacted) content; only the PNG is redacted. Defaults to
@@ -608,7 +724,7 @@ impl ScreenshotServer {
                 redaction_request.as_ref(),
                 text_options,
                 params.auto_crop.unwrap_or(true),
-                RenderOptions { lines },
+                RenderOptions::default().with_lines(lines),
             )
             .map_err(|e| McpError::internal_error(format!("Rendering failed: {}", e), None))?;
 
@@ -721,7 +837,7 @@ impl ScreenshotServer {
                     from_screen: false,
                 },
                 params.auto_crop.unwrap_or(true),
-                RenderOptions { lines },
+                RenderOptions::default().with_lines(lines),
             )
             .map_err(|e| McpError::internal_error(format!("Rendering failed: {}", e), None))?;
 
@@ -771,8 +887,9 @@ impl ScreenshotServer {
     /// from the top of the image.
     ///
     /// Each redaction is either a regex `pattern` (with optional `replacement`
-    /// used as the on-image `[LABEL]` tag) or an explicit cell range (`row`,
-    /// `col_start`, `col_end`, optional `label`). A pattern with no
+    /// - also accepted as `label` - used as the on-image `[LABEL]` tag) or an
+    /// explicit cell range (`row`, `col_start`, `col_end`, optional `label`).
+    /// Either kind may set its own `#RRGGBB` `color`. A pattern with no
     /// `replacement` draws a plain block with no label. Set `show_labels: false`
     /// to draw plain blocks for every redaction in the call.
     ///
@@ -794,9 +911,35 @@ impl ScreenshotServer {
     /// By default the returned text is the ORIGINAL content; set `redact_text`
     /// to return the scrubbed text.
     #[tool(name = "redact_screenshot")]
+    pub async fn redact_screenshot_tool(
+        &self,
+        Parameters(params): Parameters<RedactScreenshotRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        self.redact_screenshot_impl(params).await
+    }
+
+    /// [`ScreenshotServer::redact_screenshot_tool`], called with the parameter
+    /// struct published in 1.0.0.
+    ///
+    /// This is the method signature 1.0.0 exposed - `Parameters` of
+    /// [`RedactScreenshotParams`], whose redactions are
+    /// [`RedactionSpec`]s - kept so a Rust caller that drives the server
+    /// directly still compiles. It converts to the shared specification and
+    /// runs the same implementation the tool does, so the two can never
+    /// disagree. The MCP wire name and schema belong to
+    /// [`ScreenshotServer::redact_screenshot_tool`], which is what the router
+    /// publishes.
     pub async fn redact_screenshot(
         &self,
         Parameters(params): Parameters<RedactScreenshotParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.redact_screenshot_impl(params.into()).await
+    }
+
+    /// The one implementation behind both entry points above.
+    async fn redact_screenshot_impl(
+        &self,
+        params: RedactScreenshotRequest,
     ) -> Result<CallToolResult, McpError> {
         let png_path = std::path::PathBuf::from(&params.screenshot_path);
         let key = cache_key(&png_path);
@@ -821,38 +964,11 @@ impl ScreenshotServer {
 
         let show_labels = params.show_labels.unwrap_or(true);
 
-        // Split the requested redactions into regex patterns and explicit
-        // coordinate ranges.
-        let mut pattern_rules: Vec<RedactionRuleConfig> = Vec::new();
-        let mut coordinates: Vec<(u16, u16, u16, Option<String>)> = Vec::new();
-        for (i, spec) in params.redactions.iter().enumerate() {
-            match spec {
-                RedactionSpec::Pattern {
-                    pattern,
-                    replacement,
-                    keep_prefix,
-                    keep_suffix,
-                } => {
-                    // Use the caller-supplied `replacement` as the on-image
-                    // label. When it is omitted, leave it empty so the block
-                    // renders with no label (never a misleading built-in tag).
-                    let replacement = replacement.clone().unwrap_or_default();
-                    let mut rule =
-                        RedactionRuleConfig::new(&format!("custom_{}", i), pattern, &replacement);
-                    rule.keep_prefix = *keep_prefix;
-                    rule.keep_suffix = *keep_suffix;
-                    pattern_rules.push(rule);
-                }
-                RedactionSpec::Coordinate {
-                    row,
-                    col_start,
-                    col_end,
-                    label,
-                } => {
-                    coordinates.push((*row, *col_start, *col_end, label.clone()));
-                }
-            }
-        }
+        // Compile the requested redactions - the same shared specification the
+        // CLI's `--redaction` option parses - so an invalid regex or color is
+        // refused before anything is drawn.
+        let manual = ManualRedactions::new(&params.redactions, show_labels)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         // The capture the re-render will draw, built once: patterns are matched
         // against it and coordinates are validated against the part of it the
@@ -862,30 +978,15 @@ impl ScreenshotServer {
         // masked.
         let screen = self.renderer.capture_for(&data, &context);
         let (rendered_rows, rendered_cols) = self.renderer.rendered_bounds_for(&screen, &context);
-        validate_coordinates(&coordinates, rendered_rows, rendered_cols)?;
+        manual
+            .validate_bounds(rendered_rows, rendered_cols)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
         // Build the combined redaction map: regex matches first, then manual
         // coordinate ranges.
         let mut map = RedactionMap::default();
-        if !pattern_rules.is_empty() {
-            let engine = RedactionEngine::from_rules_with_labels(&pattern_rules, show_labels)
-                .map_err(|e| {
-                    McpError::internal_error(format!("Invalid redaction pattern: {}", e), None)
-                })?;
-            // Matched on the capture the renderer will draw, so a match found
-            // here masks the cell it draws - including rows that scrolled out
-            // of the viewport.
-            engine.redact_screen_into(&screen, None, &mut map);
-        }
+        manual.apply_to(&screen, &mut map);
         drop(screen);
-        for (row, col_start, col_end, label) in &coordinates {
-            let label = if show_labels {
-                label.as_deref().or(Some("REDACTED"))
-            } else {
-                None
-            };
-            map.add_manual(*row, *col_start, *col_end, label);
-        }
 
         let (plain_text, audit) = self
             .renderer
@@ -1015,75 +1116,6 @@ pub async fn run_mcp_server(config: Config, renderer: Renderer) -> anyhow::Resul
 fn line_selection(head: Option<usize>, tail: Option<usize>) -> Result<LineSelection, McpError> {
     LineSelection::from_head_tail(head, tail)
         .map_err(|e| McpError::invalid_params(e.to_string(), None))
-}
-
-/// Check every manual `row`/`col_start`/`col_end` range against the cells the
-/// screenshot will actually be re-rendered with.
-///
-/// A coordinate redaction is a promise to cover specific cells, so a range that
-/// lands outside the image must fail loudly: silently clamping it (or dropping
-/// it, as the redaction map does for an empty interval) would report "redacted"
-/// for a screenshot where the secret is still legible. The bounds are the
-/// *rendered* ones from [`Renderer::rendered_bounds_for`] - the retained
-/// capture, narrowed to the `head_lines`/`tail_lines` selection it was drawn
-/// with, then to the rows and columns that survive trailing-blank trimming and
-/// `auto_crop` - not the PTY viewport and not the raw grid. A cell the capture
-/// holds but the renderer never paints cannot be redacted, and saying so is
-/// better than accepting a redaction that leaves no mark.
-///
-/// This applies to manual coordinates only. Pattern redactions are matched
-/// against the capture itself, so a match on the rightmost content cell (or the
-/// continuation cell of a double-width character) is masked exactly as before:
-/// wherever text is drawn, the renderer is already inside these bounds.
-fn validate_coordinates(
-    coordinates: &[(u16, u16, u16, Option<String>)],
-    rendered_rows: u16,
-    rendered_cols: u16,
-) -> Result<(), McpError> {
-    for (row, col_start, col_end, _) in coordinates {
-        let invalid = |detail: String| {
-            Err(McpError::invalid_params(
-                format!(
-                    "invalid redaction coordinate (row {}, col_start {}, col_end {}): {}. \
-                     The screenshot renders {} row(s) x {} column(s); rows are 0..{} and \
-                     columns are 0..{} (col_end is exclusive). Cells outside that are \
-                     retained by the capture but never drawn, so redacting them would \
-                     change nothing.",
-                    row,
-                    col_start,
-                    col_end,
-                    detail,
-                    rendered_rows,
-                    rendered_cols,
-                    rendered_rows,
-                    rendered_cols
-                ),
-                None,
-            ))
-        };
-        if *row >= rendered_rows {
-            return invalid(format!("row {} is past the last rendered row", row));
-        }
-        if col_start >= col_end {
-            return invalid(format!(
-                "col_start {} is not before col_end {}, so the range is empty",
-                col_start, col_end
-            ));
-        }
-        if *col_start >= rendered_cols {
-            return invalid(format!(
-                "col_start {} is past the last rendered column",
-                col_start
-            ));
-        }
-        if *col_end > rendered_cols {
-            return invalid(format!(
-                "col_end {} is past the last rendered column boundary",
-                col_end
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Message returned alongside a screenshot that lost output, so the caller
