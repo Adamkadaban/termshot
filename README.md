@@ -109,6 +109,8 @@ redaction ran) in a UTF-8 `Description` chunk for screen readers.
 ## Install
 
 ```sh
+cargo binstall termshot
+# or build from source:
 cargo install termshot
 ```
 

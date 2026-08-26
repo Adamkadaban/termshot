@@ -1,12 +1,26 @@
 # Install
 
-## crates.io (recommended)
+## Prebuilt with cargo-binstall (recommended)
+
+```sh
+cargo binstall termshot
+```
+
+This downloads the matching binary from GitHub Releases and installs it into
+`~/.cargo/bin`. If no matching binary exists, cargo-binstall can fall back to a
+source build.
+
+Install cargo-binstall first if needed:
+
+```sh
+cargo install cargo-binstall
+```
+
+## Build from crates.io
 
 ```sh
 cargo install termshot
 ```
-
-Installs the `termshot` binary into `~/.cargo/bin`.
 
 ## Prebuilt releases
 
