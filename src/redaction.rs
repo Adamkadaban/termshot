@@ -1211,6 +1211,37 @@ mod tests {
         assert!(!map.redacted_plain_text(parser.screen()).contains("AKIA"));
     }
 
+    /// Only *soft* wraps are joined. Two hard-separated lines whose text would
+    /// form a match when concatenated must stay unmatched: joining them would
+    /// scatter phantom redactions across ordinary output.
+    #[test]
+    fn hard_newlines_are_not_joined_into_a_match() {
+        let rule = RedactionRuleConfig::new("hash", "[a-f0-9]{32}", "HASH");
+        let engine = RedactionEngine::from_rules(&[rule]).unwrap();
+        // Each half fits well inside the row, so neither line wrapped.
+        let parser = screen_of("8846f7eaee8fb117ad06\r\nbdd830b7586c\r\n", 60, 6);
+        let map = engine.redact_screen(parser.screen(), None);
+        assert!(
+            map.is_empty(),
+            "hard-separated lines were joined into a match: {}",
+            map.audit_summary()
+        );
+    }
+
+    /// The same two halves *are* one value when the terminal itself wrapped
+    /// them, which is the case the join exists for.
+    #[test]
+    fn soft_wrapped_halves_are_joined_into_a_match() {
+        let rule = RedactionRuleConfig::new("hash", "[a-f0-9]{32}", "HASH");
+        let engine = RedactionEngine::from_rules(&[rule]).unwrap();
+        // 20 columns splits the 32-character hash across two rows.
+        let parser = screen_of("8846f7eaee8fb117ad06bdd830b7586c\r\n", 20, 6);
+        let map = engine.redact_screen(parser.screen(), None);
+        assert_eq!(count_of(&map, "hash"), 1, "wrapped hash missed");
+        assert!(map.get(0, 19).is_some(), "first row not masked");
+        assert!(map.get(1, 0).is_some(), "second row not masked");
+    }
+
     /// A `redact` capture group lets a rule require context without masking
     /// it: only the group's span is blocked out.
     #[test]

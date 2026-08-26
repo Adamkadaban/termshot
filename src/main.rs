@@ -355,6 +355,10 @@ async fn main() -> anyhow::Result<()> {
                     strip_ansi: plain_text,
                     redact_text,
                     embed_description: config.embed_description && !no_description,
+                    // An interactive capture's raw stream is a terminal
+                    // session, not a document: its text comes from the screen
+                    // so it matches the image exactly.
+                    from_screen: !no_prompt,
                 },
                 auto_crop,
             )?;
@@ -461,6 +465,9 @@ async fn main() -> anyhow::Result<()> {
                     strip_ansi: plain_text,
                     redact_text,
                     embed_description: config.embed_description && !no_description,
+                    // The file's bytes *are* the document here, so they are
+                    // returned whole rather than clipped to the last screenful.
+                    from_screen: false,
                 },
                 auto_crop,
             )?;

@@ -43,6 +43,10 @@ optional redaction audit, and the terminal text.
 - `output_name`: preferred way to name the file, for example `finding-01-sqli`.
 - `strip_ansi`: return text without ANSI color codes.
 
+With `show_prompt: true` the returned text is the terminal screen with its
+colors, so it matches the image line for line - the shell's own redraws, window
+titles, and the trailing prompt are not part of it.
+
 ```json
 { "command": "nmap -F target", "chrome": "gnome", "redact": true,
   "output_name": "finding-01-portscan" }

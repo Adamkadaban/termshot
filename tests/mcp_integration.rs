@@ -1030,3 +1030,351 @@ async fn composed_png_omits_description_when_disabled() {
         "composed PNG embedded a description while embed_description is off"
     );
 }
+
+/// A 32-hex-character hash: long enough that an 80-column terminal wraps it in
+/// the middle when the shell echoes the command that prints it.
+const WRAPPED_SECRET: &str = "8846f7eaee8fb117ad06bdd830b7586c";
+
+/// Write a shell whose PS1 is exactly `$ `, and return its path.
+///
+/// The interactive capture below depends on *where* the echoed command line
+/// crosses the right margin, so the prompt has to be the same width on every
+/// machine - a developer's own PS1 (git branch, virtualenv, hostname) would
+/// otherwise move the wrap point and quietly stop testing the wrap.
+fn fixed_prompt_shell(dir: &Path) -> String {
+    let path = dir.join("fixed-prompt-shell.sh");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nexport PS1='$ '\nexec /bin/bash --norc --noprofile \"$@\"\n",
+    )
+    .expect("write shell wrapper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod shell wrapper");
+    }
+    std::fs::canonicalize(&path)
+        .expect("canonicalize shell wrapper")
+        .display()
+        .to_string()
+}
+
+/// A server that captures through [`fixed_prompt_shell`].
+fn make_server_with_fixed_prompt(out_dir: &Path) -> ScreenshotServer {
+    let mut config = base_config(out_dir);
+    config.shell = fixed_prompt_shell(out_dir);
+    server_from_config(config)
+}
+
+/// Coordinates of every pixel painted in the redaction block color.
+fn redaction_pixels(png: &Path) -> Vec<(u32, u32)> {
+    let img = image::open(png).expect("open png").to_rgba8();
+    let mut hits = Vec::new();
+    for (x, y, px) in img.enumerate_pixels() {
+        if px[0] == 212 && px[1] == 25 && px[2] == 25 && px[3] == 255 {
+            hits.push((x, y));
+        }
+    }
+    hits
+}
+
+/// Number of contiguous horizontal bands of redaction pixels, i.e. how many
+/// separate terminal rows carry a mask.
+fn redaction_bands(pixels: &[(u32, u32)]) -> usize {
+    let mut ys: Vec<u32> = pixels.iter().map(|&(_, y)| y).collect();
+    ys.sort_unstable();
+    ys.dedup();
+    let mut bands = 0usize;
+    let mut prev: Option<u32> = None;
+    for y in ys {
+        if prev.map(|p| y > p + 1).unwrap_or(true) {
+            bands += 1;
+        }
+        prev = Some(y);
+    }
+    bands
+}
+
+/// End-to-end regression for a secret split by a terminal soft wrap.
+///
+/// The interactive shell echoes the command it is about to run, and at 80
+/// columns that echo wraps the hash across two physical rows while the
+/// command's *output* prints it contiguously. Rebuilding the capture as screen
+/// rows joined by hard newlines destroyed the terminal's wrap flags, so the
+/// redaction pass saw the echoed hash as two unrelated lines: only the output
+/// occurrence was masked, and the PNG's `Description` leaked the other one
+/// split by a newline.
+#[tokio::test]
+async fn redact_screenshot_masks_a_secret_split_by_a_soft_wrap() {
+    let dir = Path::new("target/mcp-int/redact-soft-wrap");
+    let server = make_server_with_fixed_prompt(dir);
+
+    // Step 1: capture in an interactive shell, exactly as the MCP tool does.
+    let params = ExecuteAndScreenshotParams {
+        command: format!(
+            "printf '\\033[1;36mMCP execution test\\033[0m\\nSecret hash: {}\\nStatus: ok\\n'",
+            WRAPPED_SECRET
+        ),
+        cols: Some(80),
+        rows: Some(12),
+        timeout_secs: Some(30),
+        show_prompt: Some(true),
+        theme: None,
+        commands: None,
+        chrome: None,
+        title: None,
+        timestamp: None,
+        rounded: None,
+        redact: Some(false),
+        redaction_rules: None,
+        redact_text: None,
+        show_labels: None,
+        strip_ansi: None,
+        output_name: Some("soft-wrap-capture".to_string()),
+        auto_crop: None,
+    };
+    let captured = server
+        .execute_and_screenshot(Parameters(params))
+        .await
+        .expect("exec");
+    let png = screenshot_path(&result_text(&captured));
+
+    // Test setup: the echoed command really did wrap the hash across two rows,
+    // and the output line really does carry it whole.
+    let before = termshot::renderer::read_png_description(&png).expect("description");
+    assert!(
+        before.contains("8846f7eaee8fb117ad06\nbdd830b7586c"),
+        "test setup: the echoed hash should be split by a soft wrap:\n{}",
+        before
+    );
+    assert!(
+        before.contains(&format!("Secret hash: {}", WRAPPED_SECRET)),
+        "test setup: the output line should carry the hash whole:\n{}",
+        before
+    );
+
+    // Step 2: the agent masks the hash, keeping its first 4 characters.
+    let redact_params = RedactScreenshotParams {
+        screenshot_path: png.display().to_string(),
+        redactions: vec![RedactionSpec::Pattern {
+            pattern: "[a-f0-9]{32}".to_string(),
+            replacement: None,
+            keep_prefix: Some(4),
+            keep_suffix: None,
+        }],
+        redact_text: Some(true),
+        show_labels: None,
+        strip_ansi: None,
+    };
+    let redacted = server
+        .redact_screenshot(Parameters(redact_params))
+        .await
+        .expect("redact");
+    let redacted_text = result_text(&redacted);
+
+    // Step 3: both occurrences are reported, masked in the text, and masked in
+    // the PNG's embedded description.
+    assert!(
+        redacted_text.contains("Redacted: 2x custom_0"),
+        "expected both occurrences to match:\n{}",
+        redacted_text
+    );
+    let terminal_out = redacted_text
+        .split("--- Terminal Output ---")
+        .nth(1)
+        .expect("terminal output section");
+    for leak in [WRAPPED_SECRET, "8846f7eaee8fb117ad06", "bdd830b7586c"] {
+        assert!(
+            !terminal_out.contains(leak),
+            "redacted text still leaks {:?}:\n{}",
+            leak,
+            terminal_out
+        );
+    }
+
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    for leak in [WRAPPED_SECRET, "8846f7eaee8fb117ad06", "bdd830b7586c"] {
+        assert!(
+            !description.contains(leak),
+            "PNG description still leaks {:?}:\n{}",
+            leak,
+            description
+        );
+    }
+    // The kept prefix is still there for both occurrences, so the mask is
+    // partial rather than the whole line having been dropped.
+    assert_eq!(
+        description.matches("8846\u{2588}").count(),
+        2,
+        "both occurrences should keep their 4-character prefix:\n{}",
+        description
+    );
+
+    // Step 4: the pixels are masked on both wrapped rows. Only the echoed
+    // command reaches the right margin, so redaction ink out there is proof the
+    // wrapped occurrence was matched - and the separate band below it is the
+    // output occurrence.
+    let pixels = redaction_pixels(&png);
+    assert!(!pixels.is_empty(), "no redaction blocks were painted");
+    let img = image::open(&png).expect("open png");
+    let width = image::GenericImageView::dimensions(&img).0;
+    assert!(
+        pixels.iter().any(|&(x, _)| x as f32 >= 0.75 * width as f32),
+        "no redaction ink near the right margin: the wrapped occurrence was missed"
+    );
+    assert!(
+        redaction_bands(&pixels) >= 2,
+        "expected masks on both the echoed command and the output line"
+    );
+
+    // Step 5: composing the redacted screenshot must not resurrect the secret
+    // through the panes' inherited metadata.
+    let other = render_pane(&server, dir, "soft-wrap-other", "unrelated pane\n").await;
+    let out = dir.join("soft-wrap-composed.png");
+    let composed = compose(&server, &[png.clone(), other], &out).await;
+    let composed_description =
+        termshot::renderer::read_png_description(&composed).expect("composed description");
+    for leak in [WRAPPED_SECRET, "8846f7eaee8fb117ad06", "bdd830b7586c"] {
+        assert!(
+            !composed_description.contains(leak),
+            "composed description leaks {:?}:\n{}",
+            leak,
+            composed_description
+        );
+    }
+    assert!(
+        composed_description.contains("unrelated pane"),
+        "composed description lost the second pane:\n{}",
+        composed_description
+    );
+}
+
+/// Built-in auto-redaction must recognize a wrapped secret too, not just
+/// caller-supplied `redact_screenshot` patterns: the AWS key below is split by
+/// the same soft wrap in the echoed command line.
+#[tokio::test]
+async fn auto_redaction_masks_a_secret_split_by_a_soft_wrap() {
+    let dir = Path::new("target/mcp-int/auto-redact-soft-wrap");
+    let server = make_server_with_fixed_prompt(dir);
+
+    let params = ExecuteAndScreenshotParams {
+        command:
+            "printf 'padding padding padding padding padding padding key AKIAIOSFODNN7EXAMPLE\\n'"
+                .to_string(),
+        cols: Some(80),
+        rows: Some(10),
+        timeout_secs: Some(30),
+        show_prompt: Some(true),
+        theme: None,
+        commands: None,
+        chrome: None,
+        title: None,
+        timestamp: None,
+        rounded: None,
+        redact: Some(true),
+        redaction_rules: Some(vec!["aws_key".to_string()]),
+        redact_text: Some(true),
+        show_labels: None,
+        strip_ansi: None,
+        output_name: Some("auto-soft-wrap".to_string()),
+        auto_crop: None,
+    };
+    let result = server
+        .execute_and_screenshot(Parameters(params))
+        .await
+        .expect("exec");
+    let text = result_text(&result);
+    let png = screenshot_path(&text);
+
+    assert!(
+        text.contains("Redacted: 2x aws_key"),
+        "auto-redaction should match the wrapped echo and the output:\n{}",
+        text
+    );
+    let description = termshot::renderer::read_png_description(&png).expect("description");
+    for leak in ["AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN", "N7EXAMPLE"] {
+        assert!(
+            !description.contains(leak),
+            "PNG description leaks {:?}:\n{}",
+            leak,
+            description
+        );
+    }
+}
+
+/// The wrap-aware join must not run *hard* lines together: two consecutive
+/// output lines that would form a match only when concatenated must stay
+/// unmatched, or every screenshot would sprout phantom redactions.
+#[tokio::test]
+async fn hard_newlines_are_not_joined_into_a_match() {
+    let dir = Path::new("target/mcp-int/hard-newline-join");
+    let server = make_server(dir);
+
+    // Two halves of a 32-character hash, printed on their own lines and far
+    // from the right margin, so nothing wrapped.
+    let params = RenderAnsiParams {
+        input_path: {
+            let path = dir.join("halves.ansi");
+            std::fs::write(&path, "8846f7eaee8fb117ad06\nbdd830b7586c\n").expect("write");
+            path.display().to_string()
+        },
+        cols: Some(80),
+        rows: Some(6),
+        theme: None,
+        chrome: None,
+        title: None,
+        timestamp: None,
+        rounded: None,
+        redact: None,
+        redaction_rules: None,
+        redact_text: None,
+        show_labels: None,
+        strip_ansi: Some(true),
+        output_name: Some("halves".to_string()),
+        auto_crop: None,
+    };
+    let rendered = server
+        .render_ansi(Parameters(params))
+        .await
+        .expect("render");
+    let png = screenshot_path(&result_text(&rendered));
+
+    let redact_params = RedactScreenshotParams {
+        screenshot_path: png.display().to_string(),
+        redactions: vec![RedactionSpec::Pattern {
+            pattern: "[a-f0-9]{32}".to_string(),
+            replacement: None,
+            keep_prefix: Some(4),
+            keep_suffix: None,
+        }],
+        redact_text: Some(true),
+        show_labels: None,
+        strip_ansi: None,
+    };
+    let redacted = server
+        .redact_screenshot(Parameters(redact_params))
+        .await
+        .expect("redact");
+    let text = result_text(&redacted);
+
+    assert!(
+        !text.contains("Redacted:"),
+        "hard-separated lines were wrongly joined into a match:\n{}",
+        text
+    );
+    let terminal_out = text
+        .split("--- Terminal Output ---")
+        .nth(1)
+        .expect("terminal output section");
+    assert!(
+        terminal_out.contains("8846f7eaee8fb117ad06"),
+        "unmatched text should be untouched:\n{}",
+        terminal_out
+    );
+    assert!(
+        !terminal_out.contains('\u{2588}'),
+        "nothing should have been masked:\n{}",
+        terminal_out
+    );
+}

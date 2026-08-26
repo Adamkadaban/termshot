@@ -48,6 +48,11 @@ pub struct RenderMeta {
     /// existed.
     #[serde(default = "default_auto_crop")]
     pub auto_crop: bool,
+    /// Whether the returned text was taken from the parsed screen rather than
+    /// the source bytes (see [`TextOptions::from_screen`]). Kept so a later
+    /// re-render returns text of the same kind as the original capture.
+    #[serde(default)]
+    pub from_screen: bool,
 }
 
 fn default_auto_crop() -> bool {
@@ -291,6 +296,19 @@ pub struct TextOptions {
     /// *redacted* text is embedded so the image never carries the secrets its
     /// pixels hide.
     pub embed_description: bool,
+    /// Take the colored text from the parsed *screen* rather than echoing the
+    /// source bytes.
+    ///
+    /// Set for interactive captures, whose raw stream is a terminal session
+    /// rather than a document: it carries readline's redraws, bracketed-paste
+    /// and window-title sequences, cursor motion, and the trailing prompt the
+    /// screenshot deliberately drops. Reading those bytes as text shows things
+    /// that were never on screen, so the screen itself is the honest source.
+    ///
+    /// Left unset for `render`, where the bytes *are* the document and a log
+    /// longer than the terminal would otherwise be truncated to its last
+    /// screenful.
+    pub from_screen: bool,
 }
 
 const MAX_TITLE_CHARS: usize = 60;
@@ -598,6 +616,121 @@ fn composed_description(paths: &[PathBuf]) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// Render a parsed screen back to colored text: one line per screen row, with
+/// SGR sequences re-emitted wherever the style changes.
+///
+/// This is a *text* rendering, not a terminal stream to be re-parsed: rows are
+/// separated by hard newlines, which is exactly what a reader wants and exactly
+/// what a capture destined for the renderer must not do (it would erase the
+/// terminal's soft-wrap information, and with it the ability to redact a value
+/// that crossed the right margin).
+fn screen_ansi_text(screen: &Screen, cols: u16) -> String {
+    let (rows, _) = screen.size();
+    let mut out = String::new();
+
+    for row in 0..rows {
+        if row > 0 {
+            out.push('\n');
+        }
+        let mut style: Option<CellStyle> = None;
+        // Trailing blanks carry no information; stop at the last filled cell.
+        let last_col = (0..cols)
+            .rev()
+            .find(|&col| {
+                screen
+                    .cell(row, col)
+                    .map(|c| c.has_contents())
+                    .unwrap_or(false)
+            })
+            .map(|col| col + 1)
+            .unwrap_or(0);
+
+        for col in 0..last_col {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let cell_style = CellStyle::of(cell);
+            if style != Some(cell_style) {
+                out.push_str(&cell_style.sgr());
+                style = Some(cell_style);
+            }
+            let contents = cell.contents();
+            if contents.is_empty() {
+                out.push(' ');
+            } else {
+                out.push_str(contents);
+            }
+        }
+        if style.is_some() {
+            out.push_str("\x1b[0m");
+        }
+    }
+
+    out.trim_end().to_string()
+}
+
+/// The drawing attributes of one cell, used to emit an SGR sequence only where
+/// the style actually changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellStyle {
+    fg: vt100::Color,
+    bg: vt100::Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+impl CellStyle {
+    fn of(cell: &vt100::Cell) -> Self {
+        Self {
+            fg: cell.fgcolor(),
+            bg: cell.bgcolor(),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        }
+    }
+
+    /// The SGR escape sequence that selects this style, starting from a reset
+    /// so no attribute of a previous cell can linger.
+    fn sgr(&self) -> String {
+        let mut params: Vec<String> = vec!["0".to_string()];
+        for (on, code) in [
+            (self.bold, "1"),
+            (self.dim, "2"),
+            (self.italic, "3"),
+            (self.underline, "4"),
+            (self.inverse, "7"),
+        ] {
+            if on {
+                params.push(code.to_string());
+            }
+        }
+        match self.fg {
+            vt100::Color::Default => {}
+            vt100::Color::Idx(i) if i < 8 => params.push(format!("{}", 30 + i)),
+            vt100::Color::Idx(i) if i < 16 => params.push(format!("{}", 90 + i - 8)),
+            vt100::Color::Idx(i) => params.push(format!("38;5;{}", i)),
+            vt100::Color::Rgb(r, g, b) => params.push(format!("38;2;{};{};{}", r, g, b)),
+        }
+        match self.bg {
+            vt100::Color::Default => {}
+            vt100::Color::Idx(i) if i < 8 => params.push(format!("{}", 40 + i)),
+            vt100::Color::Idx(i) if i < 16 => params.push(format!("{}", 100 + i - 8)),
+            vt100::Color::Idx(i) => params.push(format!("48;5;{}", i)),
+            vt100::Color::Rgb(r, g, b) => params.push(format!("48;2;{};{};{}", r, g, b)),
+        }
+        format!("\x1b[{}m", params.join(";"))
+    }
 }
 
 /// Prepare terminal text for a PNG `iTXt` `Description` chunk.
@@ -976,6 +1109,7 @@ impl Renderer {
             theme: theme_name.map(str::to_owned),
             chrome: Some(chrome.clone()),
             auto_crop,
+            from_screen: text.from_screen,
         };
 
         let audit = redaction_map.map(|m| m.counts).unwrap_or_default();
@@ -1084,6 +1218,7 @@ impl Renderer {
     /// Precedence:
     /// * `redact_text` (with matches) -> stripped text with redaction blocks;
     /// * else `strip_ansi` -> plain (color-free) text from the parsed screen;
+    /// * else `from_screen` -> the screen's text with its colors re-applied;
     /// * else the original raw output with ANSI color codes preserved.
     fn output_text(
         &self,
@@ -1107,6 +1242,8 @@ impl Renderer {
                 .join("\n")
                 .trim_end()
                 .to_string()
+        } else if opts.from_screen {
+            screen_ansi_text(screen, cols)
         } else {
             String::from_utf8_lossy(data).trim_end().to_string()
         }
@@ -2863,6 +3000,7 @@ mod tests {
                     strip_ansi: false,
                     redact_text: true,
                     embed_description: true,
+                    from_screen: false,
                 },
                 true,
             )
@@ -4071,5 +4209,63 @@ mod tests {
         // The edge is anti-aliased rather than a hard staircase.
         let partial = img.pixels().filter(|p| p[3] > 0 && p[3] < 255).count();
         assert!(partial > 0, "circle edge is not anti-aliased");
+    }
+
+    /// An interactive capture's text comes from the screen: colors survive,
+    /// but the terminal bookkeeping in the raw stream (bracketed paste, window
+    /// titles, cursor motion, and the erased trailing prompt) does not.
+    #[test]
+    fn screen_text_keeps_colors_and_drops_terminal_bookkeeping() {
+        let mut parser = vt100::Parser::new(6, 40, 0);
+        parser.process(
+            b"\x1b[?2004h$ echo hi\r\n\x1b[?2004l\r\x1b[1;36mhi\x1b[0m\r\n$ \r\x1b[0m\x1b[J",
+        );
+        let text = screen_ansi_text(parser.screen(), 40);
+
+        assert!(
+            text.contains("$ echo hi"),
+            "command echo missing: {:?}",
+            text
+        );
+        assert!(text.contains("hi"), "output missing: {:?}", text);
+        assert!(text.contains('\u{1b}'), "colors were lost: {:?}", text);
+        assert!(
+            !text.contains("?2004"),
+            "bracketed paste leaked: {:?}",
+            text
+        );
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "the erased trailing prompt should be gone: {:?}",
+            text
+        );
+    }
+
+    /// The cyan attribute of a colored cell is re-emitted verbatim, and the
+    /// line is closed with a reset so the style cannot bleed.
+    #[test]
+    fn screen_text_reemits_the_cells_own_sgr() {
+        let mut parser = vt100::Parser::new(3, 20, 0);
+        parser.process(b"\x1b[1;36mMCP\x1b[0m ok\r\n");
+        let text = screen_ansi_text(parser.screen(), 20);
+        assert!(
+            text.starts_with("\x1b[0;1;36mMCP"),
+            "unexpected text: {:?}",
+            text
+        );
+        assert!(text.ends_with("\x1b[0m"), "line not reset: {:?}", text);
+    }
+
+    /// Screen-derived text is one line per *screen row*: a soft-wrapped line
+    /// becomes two, matching the image the reader is looking at.
+    #[test]
+    fn screen_text_is_one_line_per_row() {
+        let mut parser = vt100::Parser::new(4, 10, 0);
+        parser.process(b"abcdefghijklmno\r\n");
+        let text = screen_ansi_text(parser.screen(), 10);
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("abcdefghij"));
+        assert!(text.contains("klmno"));
     }
 }

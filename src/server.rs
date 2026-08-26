@@ -542,6 +542,11 @@ impl ScreenshotServer {
             strip_ansi: params.strip_ansi.unwrap_or(false),
             redact_text: params.redact_text.unwrap_or(false),
             embed_description: self.config.embed_description,
+            // An interactive capture's raw stream is a terminal session, not a
+            // document: it carries readline redraws, title and bracketed-paste
+            // sequences, and the trailing prompt the screenshot drops. Its text
+            // comes from the screen so it matches the image exactly.
+            from_screen: show_prompt,
         };
 
         // Derive the output PNG base name. An explicit `output_name` is the
@@ -665,6 +670,9 @@ impl ScreenshotServer {
                     strip_ansi: params.strip_ansi.unwrap_or(false),
                     redact_text: params.redact_text.unwrap_or(false),
                     embed_description: self.config.embed_description,
+                    // The file's bytes *are* the document here, so they are
+                    // returned whole rather than clipped to the last screenful.
+                    from_screen: false,
                 },
                 params.auto_crop.unwrap_or(true),
             )
@@ -812,6 +820,9 @@ impl ScreenshotServer {
                     strip_ansi: params.strip_ansi.unwrap_or(false),
                     redact_text: params.redact_text.unwrap_or(false),
                     embed_description: self.config.embed_description,
+                    // Re-rendering returns text of the same kind the original
+                    // capture did.
+                    from_screen: meta.from_screen,
                 },
             )
             .map_err(|e| McpError::internal_error(format!("Rendering failed: {}", e), None))?;

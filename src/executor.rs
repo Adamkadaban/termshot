@@ -23,9 +23,17 @@ pub struct ExecResult {
 ///   1. Spawn interactive shell, wait for initial prompt
 ///   2. Send all user commands, then a sentinel `echo`
 ///   3. Read output until sentinel value appears
-///   4. Use vt100 to parse and re-render only the content up to (but not
-///      including) the sentinel echo command, which also removes the
-///      trailing PS1 prompt
+///   4. Return the *original* PTY bytes, sliced to the capture: from the
+///      screen-clearing escape up to the byte offset where termshot's own
+///      bookkeeping line began, followed by an erase sequence that removes
+///      the trailing PS1 prompt
+///
+/// Step 4 deliberately keeps the raw stream instead of re-emitting the parsed
+/// screen row by row. Re-emitting turned every physical row into a hard
+/// newline, which destroyed the terminal's soft-wrap information: a secret that
+/// crossed the right margin then looked like two unrelated lines to the
+/// renderer and to the redaction pass, so only one of its occurrences was
+/// masked and the PNG metadata leaked the other.
 pub async fn execute_command(
     commands: &[&str],
     shell: &str,
@@ -96,6 +104,11 @@ pub async fn execute_command(
     .await?;
 
     let prompt_rows = prompt_height(check_parser.screen());
+    // Byte offset in `raw_after_prompt` where the captured screen begins: the
+    // screen-clearing escape the `clear` above emitted. Everything before it is
+    // shell startup noise (MOTD, banners) that the clear wiped, so slicing here
+    // gives exactly what is on screen - without rebuilding any of it.
+    let capture_start = find_clear_sequence(&raw_after_prompt);
     // Column the cursor rests at once the prompt is drawn. Used below to tell
     // "the command finished and the shell is waiting for input" apart from
     // "the command is simply quiet for a moment".
@@ -128,14 +141,21 @@ pub async fn execute_command(
     // Capture the exit status of the last command and echo a sentinel carrying
     // it back to us, on a single input line ending in a comment that holds the
     // nonce. Keeping it to one line leaves the smallest possible bookkeeping
-    // footprint on screen, and the nonce comment is what the cut below keys
-    // off: the old marker was a generic `echo ''`, which truncated any capture
-    // that merely contained that text (e.g. `cat` of a shell script).
+    // footprint on screen, and the nonce comment identifies the sentinel line
+    // in the parsed screen when the exit status is read back.
     //
     // The sentinel is spelled as two concatenated string literals so the
     // *echoed input line* never contains the token itself - only the line the
     // shell prints does. Otherwise the reader would stop the moment the shell
     // redrew the input, before the exit status had been printed.
+    //
+    // Nothing the shell echoes from here on belongs in the screenshot, so the
+    // current length of the capture buffer is the exact byte offset to cut at.
+    // Cutting by *offset* (rather than by searching the rendered screen for the
+    // marker) is what lets the capture keep the original bytes: no captured
+    // output can be mistaken for bookkeeping, and no screen row has to be
+    // rebuilt.
+    let bookkeeping_start = raw_after_prompt.len();
     writer
         .write_all(
             format!(
@@ -191,28 +211,26 @@ pub async fn execute_command(
 
     // Phase 4: Build the final output.
     //
-    // `check_parser` now holds the full screen state. The visible text is cut
-    // just before the internal bookkeeping line (the `__TS_EC` capture
-    // and the sentinel echo), which also drops the trailing PS1 prompt, and
-    // the remaining rows are re-emitted as raw bytes for rendering.
+    // The capture is a *slice of the original PTY bytes*: from the clear escape
+    // (so shell startup noise is left out) up to the offset recorded before the
+    // bookkeeping line was sent (so neither the exit-status capture nor the
+    // sentinel echo can appear). A short erase sequence is appended to remove
+    // the trailing PS1 prompt, which the shell had already drawn by then.
+    //
+    // Nothing is re-emitted row by row, so every soft wrap the terminal
+    // performed is still a soft wrap when the renderer re-parses these bytes -
+    // which is what lets redaction see a value that crossed the right margin as
+    // one string rather than two unrelated lines.
 
     let mut captured_exit: Option<i32> = None;
 
     let final_output = if found_sentinel {
-        // Use the screen rows to find where to cut.
-        // We use screen.rows() rather than screen.contents() because
-        // contents() merges wrapped lines, causing row index mismatches.
-        let screen = check_parser.screen();
-
-        // Find the first row that belongs to termshot's own bookkeeping input.
-        // Both internal lines contain the random nonce, so nothing the captured
-        // command prints can be mistaken for them.
-        let screen_rows: Vec<String> = screen.rows(0, cols).collect();
-
         // Parse the captured exit status from the sentinel output line
         // (`<sentinel>:<code>`). The shell also echoes the input line that
         // produced it, which carries the nonce comment, so rows containing the
-        // cut marker are skipped.
+        // cut marker are skipped. `screen.rows()` is used rather than
+        // `contents()` because the latter merges wrapped lines.
+        let screen_rows: Vec<String> = check_parser.screen().rows(0, cols).collect();
         let status_prefix = format!("{}:", sentinel);
         captured_exit = screen_rows.iter().find_map(|line| {
             if line.contains(&cut_marker) {
@@ -223,27 +241,24 @@ pub async fn execute_command(
                 .and_then(|rest| rest.trim().parse::<i32>().ok())
         });
 
-        let cut_line = find_cut_line(
-            screen,
-            cols,
-            &cut_marker,
-            &sentinel,
-            &prompt_prefix,
-            prompt_rows,
+        let mut kept = captured_bytes(
+            &prompt_bytes,
+            &raw_after_prompt,
+            capture_start,
+            bookkeeping_start,
         );
-
-        if let Some(idx) = cut_line {
-            rebuild_raw_from_screen(screen, idx, rows, cols)
-        } else {
-            // Sentinel line not found in screen text; use raw output as-is
-            let mut combined = prompt_bytes.clone();
-            combined.extend_from_slice(&raw_after_prompt);
-            combined
-        }
+        let erase = erase_trailing_prompt(&kept, rows, cols, prompt_rows, &prompt_prefix);
+        kept.extend_from_slice(&erase);
+        kept
     } else {
-        let mut combined = prompt_bytes.clone();
-        combined.extend_from_slice(&raw_after_prompt);
-        combined
+        // Timed out: there is no bookkeeping line to cut, so keep everything
+        // captured so far - still as original bytes.
+        captured_bytes(
+            &prompt_bytes,
+            &raw_after_prompt,
+            capture_start,
+            raw_after_prompt.len(),
+        )
     };
 
     // Phase 5: Clean up. On success, ask the login shell to exit; on timeout,
@@ -297,10 +312,10 @@ fn prompt_prefix_rows(screen: &vt100::Screen, cols: u16) -> Vec<String> {
 /// Move the cut point up over the leading rows of a multi-line prompt whose
 /// text still matches the sampled prompt.
 ///
-/// `cut` is the row holding termshot's bookkeeping input, which the shell drew
-/// after printing its final prompt. This is the text-based half of the trailing
-/// prompt strip; the height-based half in [`find_cut_line`] covers prompts
-/// whose text changed (git state, timers) since it was sampled.
+/// `cut` is the row holding the trailing prompt's input line. This is the
+/// text-based half of the trailing prompt strip; the height-based half in
+/// [`erase_trailing_prompt`] covers prompts whose text changed (git state,
+/// timers) since it was sampled.
 fn strip_trailing_prompt(rows: &[String], cut: usize, prompt_prefix: &[String]) -> usize {
     let mut idx = cut;
     for expected in prompt_prefix {
@@ -317,56 +332,104 @@ fn strip_trailing_prompt(rows: &[String], cut: usize, prompt_prefix: &[String]) 
     idx
 }
 
-/// Find the row where termshot's own bookkeeping input begins, so everything
-/// from there on (the exit-status capture, the sentinel echo, and the trailing
-/// PS1 prompt) can be cut from the screenshot.
+/// The screen-clearing escape termshot emits before the captured commands run.
+const CLEAR_SCREEN: &[u8] = b"\x1b[2J";
+
+/// Byte offset of the screen-clearing escape in a captured PTY stream, i.e.
+/// where the visible capture begins.
 ///
-/// Both internal lines carry the random nonce, so captured output can never be
-/// mistaken for them - matching a generic `echo ''` used to truncate any
-/// capture that merely contained that text. When a narrow terminal wraps the
-/// bookkeeping line, the cut moves back to the logical line's first row so no
-/// fragment of it survives.
-fn find_cut_line(
-    screen: &vt100::Screen,
-    cols: u16,
-    cut_marker: &str,
-    sentinel: &str,
-    prompt_prefix: &[String],
-    prompt_rows: usize,
-) -> Option<usize> {
-    let rows: Vec<String> = screen.rows(0, cols).collect();
-    let (flat, row_of) = flatten_screen(&rows, cols);
+/// The command that produces it is written as `printf '\033[H\033[2J'` with a
+/// *literal* backslash, so the shell's echo of the input line contains no real
+/// escape byte and cannot be mistaken for the clear itself.
+fn find_clear_sequence(data: &[u8]) -> Option<usize> {
+    data.windows(CLEAR_SCREEN.len())
+        .position(|window| window == CLEAR_SCREEN)
+}
 
-    // Search the flattened screen rather than individual rows: a narrow
-    // terminal wraps the bookkeeping input, and a per-row search would miss a
-    // marker split across the margin.
-    let marker_at = flat.find(cut_marker);
-    let anchored_at = marker_at
-        // The input line begins with the exit-status capture; anchoring there
-        // cuts the whole line even when the marker itself wrapped.
-        .and_then(|at| flat[..at].rfind(BOOKKEEPING_PREFIX))
-        .or(marker_at);
-
-    match anchored_at {
-        Some(at) => {
-            let idx = logical_line_start(screen, row_of[at] as u16) as usize;
-            // That row is the input line of the prompt the shell drew after the
-            // last command, so the `prompt_rows - 1` rows above it are the rest
-            // of that prompt and must go too - otherwise a multi-line PS1
-            // leaves its first line dangling at the bottom of the screenshot.
-            let by_height = idx.saturating_sub(prompt_rows.saturating_sub(1));
-            let by_text = strip_trailing_prompt(&rows, idx, prompt_prefix);
-            Some(by_height.min(by_text))
+/// Slice the original PTY bytes down to the visible capture: `[capture_start,
+/// end)` of `raw`, with title-setting sequences removed (vt100 renders their
+/// payload as visible text).
+///
+/// The bytes are passed through untouched apart from that, so soft wraps,
+/// in-place redraws and every escape sequence the commands emitted survive into
+/// the renderer exactly as the terminal saw them.
+///
+/// When the clear escape is missing (the `clear` failed, or output was
+/// truncated) the whole session - startup banner included - is kept rather than
+/// silently dropping content.
+fn captured_bytes(
+    prompt_bytes: &[u8],
+    raw: &[u8],
+    capture_start: Option<usize>,
+    end: usize,
+) -> Vec<u8> {
+    let end = end.min(raw.len());
+    match capture_start {
+        Some(start) if start < end => {
+            // The clear escape is preceded by a cursor-home in the stream;
+            // re-emit one so the capture starts at the origin even if the slice
+            // began at the erase itself.
+            let mut out = Vec::with_capacity(end - start + CURSOR_HOME.len());
+            out.extend_from_slice(CURSOR_HOME);
+            out.extend_from_slice(&strip_title_sequences(&raw[start..end]));
+            out
         }
-        // The input has already scrolled off: fall back to the line the
-        // sentinel printed. Its position says nothing about the prompt height,
-        // so only the text signal is used.
-        None => {
-            let at = flat.find(sentinel)?;
-            let idx = logical_line_start(screen, row_of[at] as u16) as usize;
-            Some(strip_trailing_prompt(&rows, idx, prompt_prefix))
+        _ => {
+            let mut out = strip_title_sequences(prompt_bytes);
+            out.extend_from_slice(&strip_title_sequences(&raw[..end]));
+            out
         }
     }
+}
+
+/// Cursor-home escape, emitted at the head of a capture.
+const CURSOR_HOME: &[u8] = b"\x1b[H";
+
+/// Bytes that erase the shell's trailing PS1 prompt from an already captured
+/// stream, leaving everything above it byte-for-byte untouched.
+///
+/// `data` ends where termshot's bookkeeping input was about to be echoed, so
+/// the cursor rests on the input line of the prompt the shell drew after the
+/// last command. Two independent signals decide how far up that prompt starts,
+/// and the one that removes more wins:
+///
+/// * its measured height (`prompt_rows`, sampled on a freshly cleared screen),
+///   which still works when the prompt's *text* changed since - a prompt that
+///   shows git state changes the moment the captured command stages a file;
+/// * its sampled upper rows (`prompt_prefix`), which still work when the prompt
+///   wrapped or grew taller than it was when measured.
+///
+/// Erasing (rather than rewriting the kept rows) is what preserves soft-wrap
+/// information: the rows above are never re-emitted, so the wrap flags the
+/// terminal set on them survive.
+fn erase_trailing_prompt(
+    data: &[u8],
+    rows: u16,
+    cols: u16,
+    prompt_rows: usize,
+    prompt_prefix: &[String],
+) -> Vec<u8> {
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(data);
+    let screen = parser.screen();
+
+    let cursor_row = screen.cursor_position().0;
+    // A long prompt can itself wrap; start from its first physical row.
+    let input_row = logical_line_start(screen, cursor_row) as usize;
+    let screen_rows: Vec<String> = screen.rows(0, cols).collect();
+    let by_height = input_row.saturating_sub(prompt_rows.saturating_sub(1));
+    let by_text = strip_trailing_prompt(&screen_rows, input_row, prompt_prefix);
+    let first_prompt_row = by_height.min(by_text);
+
+    // Reset the style first: `ESC [ J` erases using the *current* background,
+    // so a colored prompt would otherwise leave tinted blank rows behind.
+    let mut out = Vec::from(b"\r\x1b[0m".as_slice());
+    let up = cursor_row as usize - first_prompt_row.min(cursor_row as usize);
+    if up > 0 {
+        out.extend_from_slice(format!("\x1b[{}A", up).as_bytes());
+    }
+    out.extend_from_slice(b"\x1b[J");
+    out
 }
 
 /// How many rows the shell's prompt occupies, measured on a freshly cleared
@@ -380,28 +443,21 @@ fn prompt_height(screen: &vt100::Screen) -> usize {
     (screen.cursor_position().0 as usize + 1).clamp(1, MAX_PROMPT_ROWS)
 }
 
-/// Join the screen rows (each padded to `cols`) into one string, plus a map
-/// from byte offset back to the row it came from. Used to find text that a
-/// soft wrap split across two rows.
-fn flatten_screen(rows: &[String], cols: u16) -> (String, Vec<usize>) {
+/// Join the screen rows (each padded to `cols`) into one string, so text a soft
+/// wrap split across two rows can still be found.
+fn flatten_screen(rows: &[String], cols: u16) -> String {
     let mut flat = String::new();
-    let mut row_of = Vec::new();
-    for (idx, row) in rows.iter().enumerate() {
+    for row in rows {
         let mut width = 0usize;
         for ch in row.chars() {
-            for _ in 0..ch.len_utf8() {
-                row_of.push(idx);
-            }
             flat.push(ch);
             width += 1;
         }
         for _ in width..cols as usize {
-            row_of.push(idx);
             flat.push(' ');
         }
     }
-    row_of.push(rows.len().saturating_sub(1));
-    (flat, row_of)
+    flat
 }
 
 /// True once the sentinel's *output* line is on screen.
@@ -412,8 +468,7 @@ fn flatten_screen(rows: &[String], cols: u16) -> (String, Vec<usize>) {
 /// line still matches.
 fn sentinel_printed(screen: &vt100::Screen, cols: u16, sentinel: &str) -> bool {
     let rows: Vec<String> = screen.rows(0, cols).collect();
-    let (flat, _) = flatten_screen(&rows, cols);
-    flat.contains(sentinel)
+    flatten_screen(&rows, cols).contains(sentinel)
 }
 
 /// Walk back from `row` to the first physical row of its logical line, i.e.
@@ -452,142 +507,6 @@ async fn terminate_and_reap(child: &mut tokio::process::Child) -> Option<std::pr
         .await
         .ok()
         .and_then(|r| r.ok())
-}
-
-/// Rebuild raw ANSI bytes from a vt100 Screen, taking only the first
-/// `keep_rows` rows. This preserves colors and attributes by emitting
-/// SGR escape sequences for each cell.
-fn rebuild_raw_from_screen(
-    screen: &vt100::Screen,
-    keep_rows: usize,
-    rows: u16,
-    cols: u16,
-) -> Vec<u8> {
-    let mut output = Vec::new();
-    let total_rows = keep_rows.min(rows as usize);
-
-    for row in 0..total_rows {
-        // Track the last-emitted style to avoid redundant SGR codes
-        let mut last_fg = vt100::Color::Default;
-        let mut last_bg = vt100::Color::Default;
-        let mut last_bold = false;
-        let mut last_dim = false;
-        let mut last_italic = false;
-        let mut last_underline = false;
-        let mut last_inverse = false;
-        let mut first_cell = true;
-
-        // Find the last non-empty column in this row to avoid trailing spaces
-        let mut last_col = 0usize;
-        for col in 0..cols as usize {
-            if let Some(cell) = screen.cell(row as u16, col as u16) {
-                if cell.has_contents() {
-                    last_col = col + 1;
-                }
-            }
-        }
-
-        for col in 0..last_col {
-            if let Some(cell) = screen.cell(row as u16, col as u16) {
-                // Skip wide-char continuation cells
-                if cell.is_wide_continuation() {
-                    continue;
-                }
-
-                let fg = cell.fgcolor();
-                let bg = cell.bgcolor();
-                let bold = cell.bold();
-                let dim = cell.dim();
-                let italic = cell.italic();
-                let underline = cell.underline();
-                let inverse = cell.inverse();
-
-                // Emit SGR if style changed
-                if first_cell
-                    || fg != last_fg
-                    || bg != last_bg
-                    || bold != last_bold
-                    || dim != last_dim
-                    || italic != last_italic
-                    || underline != last_underline
-                    || inverse != last_inverse
-                {
-                    let sgr = build_sgr(fg, bg, bold, dim, italic, underline, inverse);
-                    output.extend_from_slice(sgr.as_bytes());
-                    last_fg = fg;
-                    last_bg = bg;
-                    last_bold = bold;
-                    last_dim = dim;
-                    last_italic = italic;
-                    last_underline = underline;
-                    last_inverse = inverse;
-                    first_cell = false;
-                }
-
-                let contents = cell.contents();
-                if contents.is_empty() {
-                    output.push(b' ');
-                } else {
-                    output.extend_from_slice(contents.as_bytes());
-                }
-            }
-        }
-
-        // Reset style at end of line and add newline
-        output.extend_from_slice(b"\x1b[0m");
-        if row + 1 < total_rows {
-            output.extend_from_slice(b"\r\n");
-        }
-    }
-
-    output
-}
-
-/// Build an SGR (Select Graphic Rendition) escape sequence for the given style.
-fn build_sgr(
-    fg: vt100::Color,
-    bg: vt100::Color,
-    bold: bool,
-    dim: bool,
-    italic: bool,
-    underline: bool,
-    inverse: bool,
-) -> String {
-    let mut params: Vec<String> = vec!["0".to_string()]; // reset first
-
-    if bold {
-        params.push("1".to_string());
-    }
-    if dim {
-        params.push("2".to_string());
-    }
-    if italic {
-        params.push("3".to_string());
-    }
-    if underline {
-        params.push("4".to_string());
-    }
-    if inverse {
-        params.push("7".to_string());
-    }
-
-    match fg {
-        vt100::Color::Default => {}
-        vt100::Color::Idx(i) if i < 8 => params.push(format!("{}", 30 + i)),
-        vt100::Color::Idx(i) if i < 16 => params.push(format!("{}", 90 + i - 8)),
-        vt100::Color::Idx(i) => params.push(format!("38;5;{}", i)),
-        vt100::Color::Rgb(r, g, b) => params.push(format!("38;2;{};{};{}", r, g, b)),
-    }
-
-    match bg {
-        vt100::Color::Default => {}
-        vt100::Color::Idx(i) if i < 8 => params.push(format!("{}", 40 + i)),
-        vt100::Color::Idx(i) if i < 16 => params.push(format!("{}", 100 + i - 8)),
-        vt100::Color::Idx(i) => params.push(format!("48;5;{}", i)),
-        vt100::Color::Rgb(r, g, b) => params.push(format!("48;2;{};{};{}", r, g, b)),
-    }
-
-    format!("\x1b[{}m", params.join(";"))
 }
 
 /// Execute a command non-interactively (no shell prompt).
@@ -878,110 +797,257 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output), "abc");
     }
 
-    #[test]
-    fn rebuild_raw_preserves_separate_rows() {
-        let mut parser = vt100::Parser::new(10, 80, 0);
-        parser.process(b"prompt$ ls -la\r\ntotal 616K\r\nwhoami\r\nadam\r\n");
-        let screen = parser.screen();
-
-        let rebuilt = rebuild_raw_from_screen(screen, 4, 10, 80);
-
-        let mut reparsed = vt100::Parser::new(10, 80, 0);
-        reparsed.process(&rebuilt);
-        let rows: Vec<String> = reparsed.screen().rows(0, 80).collect();
-
-        assert_eq!(rows[0].trim_end(), "prompt$ ls -la");
-        assert_eq!(rows[1].trim_end(), "total 616K");
-        assert_eq!(rows[2].trim_end(), "whoami");
-        assert_eq!(rows[3].trim_end(), "adam");
+    /// Join a parsed screen the way the redaction pass does: physical rows the
+    /// terminal soft-wrapped belong to one logical line.
+    fn logical_lines_of(screen: &vt100::Screen, cols: u16) -> Vec<String> {
+        let rows: Vec<String> = screen
+            .rows(0, cols)
+            .map(|r| format!("{:width$}", r, width = cols as usize))
+            .collect();
+        let mut lines = Vec::new();
+        let mut idx = 0usize;
+        while idx < rows.len() {
+            let mut line = String::new();
+            loop {
+                line.push_str(&rows[idx]);
+                if idx + 1 < rows.len() && screen.row_wrapped(idx as u16) {
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            lines.push(line);
+            idx += 1;
+        }
+        lines
     }
 
-    #[test]
-    fn cut_line_logic_keeps_multiple_prompts_but_not_trailing_prompt() {
-        let mut parser = vt100::Parser::new(20, 120, 0);
-        parser.process(
-            b"prompt$ ls\r\nfile1\r\nprompt$ whoami\r\nadam\r\nprompt$ __TS_EC=$?; echo \"__T\"\"S_deadbe__:$__TS_EC\" #TSdeadbe\r\n__TS_deadbe__:0\r\nprompt$ ",
+    /// Build a synthetic capture buffer shaped like a real PTY session:
+    /// startup noise, the echoed `clear` input, the clear escape itself, then
+    /// `session`. Returns the startup bytes, the capture buffer, and the offset
+    /// where termshot's bookkeeping line would start.
+    fn pty_session(session: &str) -> (Vec<u8>, Vec<u8>, usize) {
+        let prompt_bytes = b"Welcome to Ubuntu 24.04 LTS\r\nLast login: never\r\n$ ".to_vec();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"clear 2>/dev/null || printf '\\033[H\\033[2J'\r\n");
+        raw.extend_from_slice(b"\x1b[H\x1b[2J\x1b[3J");
+        raw.extend_from_slice(session.as_bytes());
+        let bookkeeping_start = raw.len();
+        raw.extend_from_slice(
+            b"__TS_EC=$?; echo \"__T\"\"S_abc123__:$__TS_EC\" #TSabc123\r\n__TS_abc123__:0\r\n$ ",
         );
-
-        let screen = parser.screen();
-        let cut_line = find_cut_line(screen, 120, "#TSdeadbe", "__TS_deadbe__", &[], 1);
-
-        assert_eq!(cut_line, Some(4));
-
-        let rebuilt = rebuild_raw_from_screen(screen, cut_line.unwrap(), 20, 120);
-        let mut reparsed = vt100::Parser::new(20, 120, 0);
-        reparsed.process(&rebuilt);
-        let rebuilt_rows: Vec<String> = reparsed.screen().rows(0, 120).collect();
-
-        assert_eq!(rebuilt_rows[0].trim_end(), "prompt$ ls");
-        assert_eq!(rebuilt_rows[1].trim_end(), "file1");
-        assert_eq!(rebuilt_rows[2].trim_end(), "prompt$ whoami");
-        assert_eq!(rebuilt_rows[3].trim_end(), "adam");
-        assert!(rebuilt_rows.iter().all(|r| !r.contains("__TS_")));
-        assert!(rebuilt_rows.iter().all(|r| !r.contains("#TS")));
+        (prompt_bytes, raw, bookkeeping_start)
     }
 
-    /// Captured output that merely *contains* `echo \'\'` (a shell script, a
-    /// Makefile, `history`) must not be mistaken for termshot's own
-    /// bookkeeping line and silently truncated.
-    #[test]
-    fn cut_line_ignores_user_output_containing_echo_blank() {
-        let mut parser = vt100::Parser::new(20, 120, 0);
-        parser.process(
-            b"prompt$ cat script.sh\r\n#!/bin/bash\r\necho \'\'\r\necho \'after the blank\'\r\nprompt$ __TS_EC=$?; echo \"__T\"\"S_0badc0__:$__TS_EC\" #TS0badc0\r\n__TS_0badc0__:0\r\nprompt$ ",
+    /// Slice + trim a synthetic session exactly the way `execute_command` does.
+    fn capture(session: &str, rows: u16, cols: u16, prompt_prefix: &[String]) -> Vec<u8> {
+        let (prompt_bytes, raw, bookkeeping_start) = pty_session(session);
+        let mut kept = captured_bytes(
+            &prompt_bytes,
+            &raw,
+            find_clear_sequence(&raw),
+            bookkeeping_start,
         );
-
-        let screen = parser.screen();
-        let cut_line = find_cut_line(screen, 120, "#TS0badc0", "__TS_0badc0__", &[], 1);
-
-        // The cut is the bookkeeping line (row 4), not the script\'s own
-        // `echo \'\'` on row 2.
-        assert_eq!(cut_line, Some(4));
-        let rebuilt = rebuild_raw_from_screen(screen, cut_line.unwrap(), 20, 120);
-        let mut reparsed = vt100::Parser::new(20, 120, 0);
-        reparsed.process(&rebuilt);
-        let rows: Vec<String> = reparsed.screen().rows(0, 120).collect();
-        assert_eq!(rows[2].trim_end(), "echo \'\'");
-        assert_eq!(rows[3].trim_end(), "echo \'after the blank\'");
+        let prompt_rows = prompt_prefix.len() + 1;
+        kept.extend_from_slice(&erase_trailing_prompt(
+            &kept,
+            rows,
+            cols,
+            prompt_rows,
+            prompt_prefix,
+        ));
+        kept
     }
 
-    /// When the bookkeeping line wraps on a narrow terminal, the cut must move
-    /// back to the first row of that logical line so no fragment survives.
-    #[test]
-    fn cut_line_walks_back_over_wrapped_bookkeeping_line() {
-        let mut parser = vt100::Parser::new(10, 20, 0);
-        parser.process(
-            b"$ ls\r\nfile1\r\n$ __TS_EC=$?; echo \"__T\"\"S_feedfa__:$__TS_EC\" #TSfeedfa\r\n",
-        );
-
-        let screen = parser.screen();
-        let cut_line = find_cut_line(screen, 20, "#TSfeedfa", "__TS_feedfa__", &[], 1);
-
-        assert_eq!(cut_line, Some(2), "cut should start at the wrapped line");
+    fn screen_rows(data: &[u8], rows: u16, cols: u16) -> Vec<String> {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(data);
+        parser
+            .screen()
+            .rows(0, cols)
+            .map(|r| r.trim_end().to_string())
+            .collect()
     }
 
-    /// The nonce marker itself can be split across the right margin; the cut
-    /// must still find it (a per-row search silently missed it and left the
-    /// bookkeeping line in the screenshot).
+    /// The hash a 32-hex-character redaction rule looks for.
+    const SECRET: &str = "8846f7eaee8fb117ad06bdd830b7586c";
+
+    /// The regression this whole rework exists for: a value the terminal
+    /// soft-wrapped across two rows must still be *one* logical line after the
+    /// capture is sliced. Re-emitting screen rows as hard newlines split it in
+    /// two, so redaction masked only the unwrapped occurrence and the leftover
+    /// half leaked into the PNG metadata.
     #[test]
-    fn cut_line_finds_marker_split_across_the_margin() {
-        // 50 columns puts the tail of the marker on the following row.
-        let mut parser = vt100::Parser::new(8, 50, 0);
-        parser.process(
-            b"$ git log\r\ncommit one\r\n$ __TS_EC=$?; echo \"__T\"\"S_8ee506__:$__TS_EC\" #TS8ee506\r\n",
-        );
+    fn capture_preserves_soft_wrapped_values() {
+        let session = format!("printf 'Secret hash: {SECRET}\\n'\r\nSecret hash: {SECRET}\r\n$ ",);
+        let kept = capture(&session, 10, 40, &[]);
+
+        let mut parser = vt100::Parser::new(10, 40, 0);
+        parser.process(&kept);
         let screen = parser.screen();
-        let rows: Vec<String> = screen.rows(0, 50).collect();
+
+        // Both the echoed command and the printed output wrapped at 40 columns.
+        let plain: Vec<String> = screen.rows(0, 40).collect();
         assert!(
-            !rows.iter().any(|r| r.contains("#TS8ee506")),
-            "test setup: the marker should be split across rows"
+            !plain.iter().any(|r| r.contains(SECRET)),
+            "test setup: the secret should be split across rows:\n{:#?}",
+            plain
         );
 
-        let cut_line = find_cut_line(screen, 50, "#TS8ee506", "__TS_8ee506__", &[], 1);
-        assert_eq!(cut_line, Some(2));
+        let logical = logical_lines_of(screen, 40);
+        let occurrences = logical.iter().filter(|l| l.contains(SECRET)).count();
+        assert_eq!(
+            occurrences, 2,
+            "both the echoed command and the output must rejoin:\n{:#?}",
+            logical
+        );
     }
 
-    /// The read loop must not stop on the shell\'s echo of the sentinel input
+    /// Startup banners are wiped by the `clear`, so the capture starts there -
+    /// the returned bytes must not carry the MOTD or the clear's own echoed
+    /// input line.
+    #[test]
+    fn capture_starts_at_the_clear_escape() {
+        let kept = capture("echo hi\r\nhi\r\n$ ", 10, 40, &[]);
+        let text = String::from_utf8_lossy(&kept);
+
+        assert!(!text.contains("Welcome to Ubuntu"), "startup banner kept");
+        assert!(!text.contains("Last login"), "startup banner kept");
+        assert!(!text.contains("clear 2>/dev/null"), "clear echo kept");
+        assert!(text.contains("echo hi"), "command echo missing:\n{}", text);
+    }
+
+    /// Everything from the bookkeeping offset on - the exit-status capture, the
+    /// sentinel echo, the sentinel output line - is cut, and so is the trailing
+    /// PS1 prompt the shell drew before it.
+    #[test]
+    fn capture_cuts_bookkeeping_and_trailing_prompt() {
+        let kept = capture("whoami\r\nadam\r\n$ ", 10, 40, &[]);
+        let text = String::from_utf8_lossy(&kept);
+        assert!(!text.contains("__TS_"), "bookkeeping leaked:\n{}", text);
+        assert!(!text.contains("#TS"), "nonce marker leaked:\n{}", text);
+
+        let rows = screen_rows(&kept, 10, 40);
+        assert_eq!(rows[0], "whoami");
+        assert_eq!(rows[1], "adam");
+        assert_eq!(rows[2], "", "trailing prompt was not erased: {:?}", rows);
+    }
+
+    /// Captured output that merely *looks* like termshot's bookkeeping (a shell
+    /// script, `history`, this crate's own source) must never truncate the
+    /// capture: the cut is a byte offset recorded before the bookkeeping line
+    /// was ever sent, not a search for its text.
+    #[test]
+    fn capture_ignores_bookkeeping_text_in_command_output() {
+        let session = "cat capture.sh\r\n#!/bin/bash\r\n__TS_EC=$?; echo done #TSabc123\r\n\
+                       echo 'after the marker'\r\n$ ";
+        let kept = capture(session, 10, 60, &[]);
+        let rows = screen_rows(&kept, 10, 60);
+
+        assert_eq!(rows[0], "cat capture.sh");
+        assert_eq!(rows[2], "__TS_EC=$?; echo done #TSabc123");
+        assert_eq!(rows[3], "echo 'after the marker'");
+        assert_eq!(rows[4], "", "capture was truncated by its own output");
+    }
+
+    /// A multi-line PS1 must be erased whole: its earlier rows would otherwise
+    /// dangle under the last command's output.
+    #[test]
+    fn multiline_trailing_prompt_is_erased_whole() {
+        let mut startup = vt100::Parser::new(10, 60, 0);
+        startup.process(b"adam@host ~/src\r\n$ ");
+        let prefix = prompt_prefix_rows(startup.screen(), 60);
+        assert_eq!(prefix, vec!["adam@host ~/src".to_string()]);
+
+        let session = "pwd\r\n/home/adam/src\r\nadam@host ~/src\r\n$ ";
+        let kept = capture(session, 10, 60, &prefix);
+        let rows = screen_rows(&kept, 10, 60);
+
+        assert_eq!(rows[0], "pwd");
+        assert_eq!(rows[1], "/home/adam/src");
+        assert_eq!(rows[2], "", "the whole trailing prompt should be erased");
+        assert_eq!(rows[3], "");
+    }
+
+    /// The measured prompt height alone must erase the trailing prompt even
+    /// when its text changed since it was sampled: a prompt that shows git
+    /// state changes the moment the captured command stages a file.
+    #[test]
+    fn trailing_prompt_is_erased_when_its_text_changed() {
+        let sampled = vec!["adam@host ~/src (main)".to_string()];
+        let session = "git add -A\r\nadam@host ~/src (main*)\r\n$ ";
+        let kept = capture(session, 10, 60, &sampled);
+        let rows = screen_rows(&kept, 10, 60);
+
+        assert_eq!(rows[0], "git add -A");
+        assert_eq!(rows[1], "", "changed trailing prompt must still be erased");
+    }
+
+    /// A prompt long enough to wrap ends on a continuation row; the erase must
+    /// start at the first physical row of that logical line.
+    #[test]
+    fn wrapped_trailing_prompt_is_erased_whole() {
+        let session = "ls\r\nfile1\r\nadam@host /very/deep/directory/path$ ";
+        let kept = capture(session, 10, 20, &[]);
+        let rows = screen_rows(&kept, 10, 20);
+
+        assert_eq!(rows[0], "ls");
+        assert_eq!(rows[1], "file1");
+        assert_eq!(rows[2], "", "wrapped prompt left a fragment: {:?}", rows);
+        assert_eq!(rows[3], "");
+    }
+
+    /// A colored prompt must not leave tinted blank rows behind: the erase
+    /// resets the style first, since `ESC [ J` clears with the current
+    /// background.
+    #[test]
+    fn erasing_a_colored_prompt_leaves_unstyled_cells() {
+        let session = "echo hi\r\nhi\r\n\x1b[41m$\x1b[49m ";
+        let kept = capture(session, 6, 20, &[]);
+        let mut parser = vt100::Parser::new(6, 20, 0);
+        parser.process(&kept);
+        let screen = parser.screen();
+        for col in 0..20 {
+            let cell = screen.cell(2, col).expect("cell");
+            assert_eq!(cell.bgcolor(), vt100::Color::Default, "col {} tinted", col);
+        }
+    }
+
+    /// Without the clear escape (a shell where `clear` failed) nothing is
+    /// dropped: the whole session, banner included, is kept rather than
+    /// silently losing content.
+    #[test]
+    fn capture_without_a_clear_keeps_everything() {
+        let raw = b"echo hi\r\nhi\r\n$ ".to_vec();
+        assert_eq!(find_clear_sequence(&raw), None);
+        let kept = captured_bytes(b"MOTD\r\n", &raw, None, raw.len());
+        let text = String::from_utf8_lossy(&kept);
+        assert!(text.starts_with("MOTD"), "banner dropped:\n{}", text);
+        assert!(text.contains("echo hi"));
+    }
+
+    /// The clear escape is found by its real bytes; the echoed input line that
+    /// produced it spells the sequence with literal backslashes and must not
+    /// match.
+    #[test]
+    fn clear_sequence_is_found_by_its_escape_bytes() {
+        let raw = b"clear 2>/dev/null || printf '\\033[H\\033[2J'\r\n\x1b[H\x1b[2Jrest";
+        let at = find_clear_sequence(raw).expect("clear escape");
+        assert_eq!(&raw[at..at + 4], b"\x1b[2J");
+        assert!(String::from_utf8_lossy(&raw[at..]).ends_with("rest"));
+    }
+
+    /// Title-setting sequences are stripped from the capture: vt100 renders
+    /// their payload as visible text.
+    #[test]
+    fn capture_strips_title_sequences() {
+        let kept = capture("ls\r\n\x1bkls\x1b\\file1\r\n$ ", 10, 40, &[]);
+        let rows = screen_rows(&kept, 10, 40);
+        assert_eq!(rows[0], "ls");
+        assert_eq!(rows[1], "file1");
+    }
+
+    /// The read loop must not stop on the shell's echo of the sentinel input
     /// line, only on the line that command actually printed - otherwise the
     /// exit status is missed.
     #[test]
@@ -994,56 +1060,12 @@ mod tests {
         assert!(sentinel_printed(parser.screen(), 120, "__TS_abcd12__"));
     }
 
-    /// A multi-line PS1 must be stripped whole: its earlier rows would
-    /// otherwise dangle under the last command\'s output.
+    /// A sentinel line the terminal wrapped must still be recognized.
     #[test]
-    fn multiline_prompt_is_stripped_whole() {
-        // Startup screen: a two-row prompt with the cursor on the input line.
-        let mut startup = vt100::Parser::new(10, 60, 0);
-        startup.process(b"adam@host ~/src\r\n$ ");
-        let prefix = prompt_prefix_rows(startup.screen(), 60);
-        assert_eq!(prefix, vec!["adam@host ~/src".to_string()]);
-
-        // Final screen: output, then the trailing two-row prompt whose input
-        // line carries the bookkeeping marker.
-        let mut parser = vt100::Parser::new(10, 60, 0);
-        parser.process(
-            b"adam@host ~/src\r\n$ pwd\r\n/home/adam/src\r\nadam@host ~/src\r\n$ __TS_EC=$?; #TS123456\r\n",
-        );
-        let screen = parser.screen();
-        let cut = find_cut_line(screen, 60, "#TS123456", "__TS_123456__", &prefix, 2);
-        assert_eq!(cut, Some(3), "the whole trailing prompt should be cut");
-    }
-
-    /// The measured prompt height alone must remove the trailing prompt, even
-    /// when its text changed since it was sampled: a prompt that shows git
-    /// state changes the moment the captured command stages a file.
-    #[test]
-    fn trailing_prompt_is_stripped_when_its_text_changed() {
-        let sampled = vec!["adam@host ~/src (main)".to_string()];
-
-        let mut parser = vt100::Parser::new(10, 60, 0);
-        parser.process(
-            b"adam@host ~/src (main)\r\n$ git add -A\r\nadam@host ~/src (main*)\r\n$ __TS_EC=$?; #TSc0ffee\r\n",
-        );
-        let screen = parser.screen();
-        let rows: Vec<String> = screen.rows(0, 60).collect();
-        assert!(rows[2].contains("(main*)"), "test setup: prompt changed");
-
-        // Text matching alone cannot recognize row 2; the measured height can.
-        let cut = find_cut_line(screen, 60, "#TSc0ffee", "__TS_c0ffee__", &sampled, 2);
-        assert_eq!(cut, Some(2), "changed trailing prompt must still be cut");
-    }
-
-    /// A single-line prompt shares its row with the bookkeeping input, so the
-    /// height must not remove anything above it.
-    #[test]
-    fn single_line_prompt_height_cuts_only_its_own_row() {
-        let mut parser = vt100::Parser::new(10, 60, 0);
-        parser.process(b"$ echo hi\r\nhi\r\n$ __TS_EC=$?; #TS0f0f0f\r\n");
-        let screen = parser.screen();
-        let cut = find_cut_line(screen, 60, "#TS0f0f0f", "__TS_0f0f0f__", &[], 1);
-        assert_eq!(cut, Some(2));
+    fn sentinel_detection_survives_a_soft_wrap() {
+        let mut parser = vt100::Parser::new(10, 12, 0);
+        parser.process(b"__TS_abcd12__:0\r\n");
+        assert!(sentinel_printed(parser.screen(), 12, "__TS_abcd12__"));
     }
 
     /// The prompt height is read off a freshly cleared screen, where the

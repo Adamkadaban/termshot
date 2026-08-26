@@ -32,7 +32,12 @@ and inspired by [Betterleaks](https://github.com/betterleaks/betterleaks) (MIT).
 
 Matches are covered with a colored block and a short `[LABEL]` tag. Rules run
 against logical lines, so a secret that crosses the right margin is masked on
-both rows. Obviously non-sensitive values such as `127.0.0.1`, `::1`, and IPv6
+both rows. That works because a capture keeps the terminal's own soft-wrap
+information: the raw PTY bytes are sliced, never re-emitted row by row, so a
+value the terminal wrapped is still one value to the rules - including in the
+line the interactive shell echoes back before it runs your command. Hard
+newlines are never joined, so two unrelated lines cannot form a match between
+them. Obviously non-sensitive values such as `127.0.0.1`, `::1`, and IPv6
 look-alikes in code (`std::fs::read`) are left visible.
 
 The built-ins favor precision over recall: a silently corrupted screenshot is
