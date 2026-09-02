@@ -73,7 +73,7 @@ four different prompts in the one built-in `dark` theme.
 </p>
 
 ```sh
-TERMSHOT_SHELL=/path/to/shell-wrapper termshot exec \
+TERMSHOT_SHELL=/path/to/shell-wrapper termshot exec --cwd /path/to/project \
   --theme dark -o prompt.png 'git status -sb'
 termshot compose --divider 4 -o prompts.png prompt-*.png
 ```

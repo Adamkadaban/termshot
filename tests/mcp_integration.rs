@@ -16,8 +16,8 @@ use termshot::redaction::ManualRedactionSpec;
 use termshot::redaction::RedactionConfig;
 use termshot::renderer::{FontSelection, Renderer, RendererOptions};
 use termshot::server::{
-    ComposeScreenshotsParams, ExecuteAndScreenshotParams, RedactScreenshotRequest,
-    RenderAnsiParams, ScreenshotServer,
+    ComposeScreenshotsParams, ExecuteAndScreenshotParams, ExecuteAndScreenshotRequest,
+    RedactScreenshotRequest, RenderAnsiParams, ScreenshotServer,
 };
 
 /// Base configuration for an isolated server whose screenshots land in
@@ -166,6 +166,135 @@ async fn execute_and_screenshot_returns_png_and_text() {
         !png.with_extension("meta.json").exists(),
         "unexpected .meta.json sidecar"
     );
+}
+
+#[tokio::test]
+async fn execute_request_sets_cwd_before_the_real_prompt_and_strips_the_last_prompt() {
+    let dir = Path::new("target/mcp-int/exec-cwd");
+    let working_dir = dir.join("short-context");
+    std::fs::create_dir_all(&working_dir).unwrap();
+    let canonical = working_dir.canonicalize().unwrap();
+    let server = make_server(dir);
+
+    let request = ExecuteAndScreenshotRequest {
+        command: None,
+        commands: Some(vec!["pwd".to_string()]),
+        cwd: Some(working_dir.display().to_string()),
+        cols: Some(100),
+        rows: Some(10),
+        timeout_secs: Some(20),
+        show_prompt: Some(true),
+        theme: None,
+        chrome: None,
+        title: None,
+        timestamp: None,
+        rounded: None,
+        redact: Some(false),
+        redaction_rules: None,
+        redactions: None,
+        redact_text: None,
+        show_labels: None,
+        strip_ansi: Some(true),
+        output_name: Some("exec-cwd".to_string()),
+        auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
+    };
+
+    let result = server
+        .execute_and_screenshot_tool(Parameters(request))
+        .await
+        .expect("cwd request");
+    let text = result_text(&result);
+    let terminal = text
+        .split("--- Terminal Output ---")
+        .nth(1)
+        .expect("terminal output")
+        .trim();
+
+    assert!(
+        terminal.contains(canonical.to_string_lossy().as_ref()),
+        "pwd did not run in requested directory:\n{terminal}"
+    );
+    assert!(
+        terminal
+            .lines()
+            .last()
+            .unwrap()
+            .ends_with(canonical.to_string_lossy().as_ref()),
+        "the final real prompt was not stripped:\n{terminal}"
+    );
+}
+
+#[tokio::test]
+async fn execute_request_rejects_bad_cwd_and_command_shapes_before_execution() {
+    let dir = Path::new("target/mcp-int/exec-cwd-invalid");
+    std::fs::create_dir_all(dir).unwrap();
+    let marker = dir.join("must-not-exist");
+    let server = make_server(dir);
+
+    let request = |command, commands, cwd| ExecuteAndScreenshotRequest {
+        command,
+        commands,
+        cwd,
+        cols: Some(80),
+        rows: Some(10),
+        timeout_secs: Some(20),
+        show_prompt: Some(false),
+        theme: None,
+        chrome: None,
+        title: None,
+        timestamp: None,
+        rounded: None,
+        redact: Some(false),
+        redaction_rules: None,
+        redactions: None,
+        redact_text: None,
+        show_labels: None,
+        strip_ansi: Some(true),
+        output_name: Some("invalid-request".to_string()),
+        auto_crop: None,
+        head_lines: None,
+        tail_lines: None,
+    };
+
+    let missing = dir.join("does-not-exist");
+    let error = server
+        .execute_and_screenshot_tool(Parameters(request(
+            Some(format!("touch {}", marker.display())),
+            None,
+            Some(missing.display().to_string()),
+        )))
+        .await
+        .expect_err("missing cwd must fail");
+    assert!(error.message.contains("Working directory"), "{error:?}");
+    assert!(!marker.exists(), "command ran despite invalid cwd");
+
+    let result = server
+        .execute_and_screenshot_tool(Parameters(request(
+            Some(format!("touch {}", marker.display())),
+            Some(vec!["echo commands-wins".to_string()]),
+            None,
+        )))
+        .await
+        .expect("legacy command plus commands shape remains accepted");
+    assert!(
+        result_text(&result).contains("commands-wins"),
+        "commands did not take precedence"
+    );
+    assert!(!marker.exists(), "ignored singular command was executed");
+
+    for invalid in [
+        request(None, None, None),
+        request(None, Some(Vec::new()), None),
+        request(None, Some(vec![" ".to_string()]), None),
+    ] {
+        let error = server
+            .execute_and_screenshot_tool(Parameters(invalid))
+            .await
+            .expect_err("invalid command shape must fail");
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
 }
 
 #[tokio::test]
@@ -960,6 +1089,20 @@ fn mcp_params_reject_unknown_fields() {
         "cols": 80,
     }))
     .expect("known fields parse");
+    serde_json::from_value::<ExecuteAndScreenshotRequest>(serde_json::json!({
+        "commands": ["pwd", "git status --short"],
+        "cwd": "~/project",
+        "cols": 100,
+    }))
+    .expect("current request fields parse");
+    assert!(
+        serde_json::from_value::<ExecuteAndScreenshotRequest>(serde_json::json!({
+            "command": "echo hi",
+            "fake_prompt": true,
+        }))
+        .is_err(),
+        "current request accepted an unknown field"
+    );
 }
 
 /// The published tool schemas tell clients that extra properties are refused,
@@ -1012,6 +1155,37 @@ fn the_published_tool_set_is_unchanged() {
             "the description stopped documenting {mentioned}: {description}"
         );
     }
+
+    let execute = tools
+        .iter()
+        .find(|tool| tool.name == "execute_and_screenshot")
+        .expect("execute_and_screenshot is published");
+    let execute_description = execute.description.as_deref().unwrap_or_default();
+    for guidance in ["real shell prompt", "`cwd`", "Never synthesize"] {
+        assert!(
+            execute_description.contains(guidance),
+            "execute description stopped documenting {guidance}: {execute_description}"
+        );
+    }
+    let execute_schema =
+        serde_json::to_value(&execute.input_schema).expect("execute schema serializes");
+    let properties = execute_schema["properties"]
+        .as_object()
+        .expect("execute properties");
+    assert!(
+        properties.contains_key("cwd"),
+        "cwd missing: {execute_schema}"
+    );
+    assert!(
+        properties.contains_key("command") && properties.contains_key("commands"),
+        "command forms missing: {execute_schema}"
+    );
+    assert!(
+        !execute_schema["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|field| field == "command")),
+        "schema still requires command even when commands is used: {execute_schema}"
+    );
 }
 
 /// The `redact_screenshot` schema a live `tools/list` publishes must describe

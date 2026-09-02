@@ -35,19 +35,30 @@ Returns the screenshot path, exit status, an optional audit, and the text. Every
 tool schema rejects unknown parameters.
 
 - `command` (or `commands` for several), `cols`, `rows`, `timeout_secs`.
+- `cwd`: set the child shell's working directory before its first prompt.
 - `head_lines` / `tail_lines` (mutually exclusive): show only the first or last
   N lines. Otherwise every line is shown, including what scrolled out of view.
 - `show_prompt` (default `true`): login + interactive shell, so the user's
-  prompt, aliases, and `PATH` apply.
+  real prompt, aliases, and `PATH` apply. A prompt appears before each command;
+  termshot always removes the final prompt after the last command.
 - `theme`, `chrome`, `title`, `timestamp`, `rounded`, `auto_crop`.
 - `output_name` (for example `finding-01-sqli`), `strip_ansi`.
 - `redact`, `redaction_rules`, `redact_text`, `show_labels`, `redactions` - see
   [redaction.md](./redaction.md#manual-redaction-cli-and-mcp).
 
 ```json
-{ "command": "nmap -F target", "chrome": "gnome", "redact": true,
+{ "command": "nmap -F target", "cwd": "~/engagement", "chrome": "gnome", "redact": true,
   "output_name": "finding-01-portscan" }
 ```
+
+Use `cwd` when the directory is useful context. If a long source path is
+incidental, stage the required files in a short directory or set
+`show_prompt: false`. Never print or manually style a prompt in `command`; with
+`show_prompt: false`, prompt-looking text is ordinary output and is not removed.
+There is no trailing-prompt option because a real trailing prompt is already
+removed automatically.
+New clients should pass either `command` or `commands`. For compatibility with
+the original schema, `commands` takes precedence if both are present.
 
 ### `render_ansi`
 

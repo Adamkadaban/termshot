@@ -16,6 +16,7 @@
 //! | `Config`                  | `LoadedConfig` (derefs to it)                |
 //! | `RenderMeta`              | `RenderContext` (flattens it)                |
 //! | `RenderOptions`           | `ExtendedRenderOptions` (`base` + `manual`)  |
+//! | `ExecuteAndScreenshotParams` | `ExecuteAndScreenshotRequest` (`cwd`)     |
 //! | `server::RedactionSpec`   | `redaction::ManualRedactionSpec` (`From`)    |
 //! | `RedactScreenshotParams`  | `RedactScreenshotRequest` (`From`)           |
 //!

@@ -45,6 +45,11 @@ enum Commands {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
 
+        /// Working directory for the command and the initial shell prompt.
+        /// Use this instead of putting `cd ...` in the captured command.
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<PathBuf>,
+
         /// Terminal width in columns (1-500)
         #[arg(short = 'c', long, default_value_t = 120, value_parser = clap::value_parser!(u16).range(1..=500))]
         cols: u16,
@@ -83,7 +88,7 @@ enum Commands {
         #[arg(long)]
         font_bold: Option<PathBuf>,
 
-        /// Hide interactive shell prompt (PS1) from screenshot.
+        /// Hide the interactive shell prompt from the screenshot.
         /// By default the command runs in an interactive login shell so
         /// the prompt is visible. Use --no-prompt to run without it.
         #[arg(long = "no-prompt", default_value_t = false)]
@@ -355,6 +360,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Exec {
             command,
+            cwd,
             cols,
             rows,
             timeout,
@@ -392,6 +398,10 @@ async fn main() -> anyhow::Result<()> {
 
             let lines = line_selection(head_lines, tail_lines)?;
             let timeout = Duration::from_secs(timeout);
+            let working_dir = cwd
+                .as_deref()
+                .map(executor::resolve_working_directory)
+                .transpose()?;
 
             // Compile any --redaction specifications before the command runs,
             // so an invalid regex, color, or JSON object fails without having
@@ -400,14 +410,29 @@ async fn main() -> anyhow::Result<()> {
 
             let exec_result = if !no_prompt {
                 // Each CLI argument is a separate command. The shell will
-                // show a PS1 prompt before each one.
+                // show a shell prompt before each one.
                 let cmd_refs: Vec<&str> = command.iter().map(|s| s.as_str()).collect();
-                executor::execute_command(&cmd_refs, &config.shell, rows, cols, timeout).await?
+                executor::execute_command_in_dir(
+                    &cmd_refs,
+                    &config.shell,
+                    rows,
+                    cols,
+                    timeout,
+                    working_dir.as_deref(),
+                )
+                .await?
             } else {
                 // Without prompt, join everything into a single shell -c invocation
                 let cmd_str = command.join(" ");
-                executor::execute_command_simple(&cmd_str, &config.shell, rows, cols, timeout)
-                    .await?
+                executor::execute_command_simple_in_dir(
+                    &cmd_str,
+                    &config.shell,
+                    rows,
+                    cols,
+                    timeout,
+                    working_dir.as_deref(),
+                )
+                .await?
             };
 
             let theme_name = theme.as_deref();
@@ -429,8 +454,11 @@ async fn main() -> anyhow::Result<()> {
             });
 
             let output_name = {
-                let cwd = std::env::current_dir().ok();
-                fallback_output_name(cwd.as_deref(), &command.join(" "))
+                let fallback_dir = working_dir
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .or_else(|| std::env::current_dir().ok());
+                fallback_output_name(fallback_dir.as_deref(), &command.join(" "))
             };
             let (image_path, terminal_text, redactions, meta) = renderer
                 .render_bytes_with_extended_options(

@@ -25,12 +25,16 @@ use std::time::Duration;
 /// typo, or a field from an older schema - gets a clear error instead of a
 /// screenshot silently rendered with different settings than it asked for.
 /// (`embed_description` in particular is deliberately global config only.)
+/// The `execute_and_screenshot` parameters published in 1.0.0.
+///
+/// Kept at its original shape so Rust callers using exhaustive struct literals
+/// remain source-compatible. The MCP tool now publishes
+/// [`ExecuteAndScreenshotRequest`], which adds `cwd` and permits either
+/// `command` or `commands`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExecuteAndScreenshotParams {
-    /// Shell command to execute. The command is run in an interactive shell,
-    /// so the PS1 prompt (username, directory, etc.) will be visible in the
-    /// screenshot.
+    /// Shell command to execute.
     pub command: String,
 
     /// Terminal width in columns. Defaults to server config value (120).
@@ -45,8 +49,8 @@ pub struct ExecuteAndScreenshotParams {
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 
-    /// If true, run the command in an interactive login shell so the PS1
-    /// prompt is rendered. If false, run the command directly (no prompt).
+    /// If true, run the command in an interactive login shell so the user's
+    /// real shell prompt is rendered. If false, run the command directly.
     /// Defaults to true.
     #[serde(default)]
     pub show_prompt: Option<bool>,
@@ -56,7 +60,8 @@ pub struct ExecuteAndScreenshotParams {
     pub theme: Option<String>,
 
     /// Optional list of commands. If provided, each command is executed on its
-    /// own line and receives its own PS1 prompt. If omitted, `command` is used.
+    /// own line and receives its own shell prompt. If omitted, `command` is
+    /// used.
     #[serde(default)]
     pub commands: Option<Vec<String>>,
 
@@ -148,6 +153,157 @@ pub struct ExecuteAndScreenshotParams {
     /// every retained line is shown. Mutually exclusive with `head_lines`.
     #[serde(default)]
     pub tail_lines: Option<usize>,
+}
+
+/// Current MCP request for `execute_and_screenshot`.
+///
+/// This is separate from [`ExecuteAndScreenshotParams`] to preserve the
+/// published Rust API while allowing the wire protocol to evolve.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteAndScreenshotRequest {
+    /// One shell command to execute. Prefer passing either `command` or
+    /// `commands`. If an older client sends both, `commands` takes precedence
+    /// for compatibility. The command is typed into the real interactive shell
+    /// when `show_prompt` is true.
+    #[serde(default)]
+    pub command: Option<String>,
+
+    /// Several commands to execute in order. Prefer passing either `commands`
+    /// or `command`; this field takes precedence if both are sent for
+    /// compatibility with the original required-`command` schema. Each command
+    /// receives its own real shell prompt when `show_prompt` is true.
+    #[serde(default)]
+    pub commands: Option<Vec<String>>,
+
+    /// Working directory for the child shell and its initial prompt. Relative
+    /// paths resolve from the MCP server's launch directory; `~` is supported.
+    ///
+    /// Set this when the directory is meaningful context. If the full source
+    /// path is incidental or sensitive, use a short staging directory that
+    /// contains the needed inputs, or disable the prompt. Do not put `cd ...`
+    /// in the command merely to alter the prompt, and never print or synthesize
+    /// a fake prompt.
+    #[serde(default)]
+    pub cwd: Option<String>,
+
+    /// Terminal width in columns. Defaults to server config value (120).
+    #[serde(default)]
+    pub cols: Option<u16>,
+
+    /// Terminal height in rows. Defaults to server config value (40).
+    #[serde(default)]
+    pub rows: Option<u16>,
+
+    /// Maximum time in seconds to wait for the command to finish. Defaults to
+    /// 30.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+
+    /// If true (default), run in the user's real interactive login shell so
+    /// their configured prompt, aliases, and PATH are captured. A prompt is
+    /// shown before each captured command; the final prompt after the last
+    /// command is always removed automatically. No trailing-prompt option or
+    /// image cropping is needed.
+    ///
+    /// Never echo, print, or manually style a prompt. With `show_prompt:
+    /// false`, prompt-like text is ordinary command output and cannot be
+    /// identified or removed safely.
+    #[serde(default)]
+    pub show_prompt: Option<bool>,
+
+    /// Theme name for rendering. Uses default theme from config if unspecified.
+    #[serde(default)]
+    pub theme: Option<String>,
+
+    /// Chrome preset: none, minimal, gnome, macos, report.
+    #[serde(default)]
+    pub chrome: Option<String>,
+
+    /// Optional chrome title.
+    #[serde(default)]
+    pub title: Option<String>,
+
+    /// Whether to add a UTC timestamp watermark below the terminal content.
+    #[serde(default)]
+    pub timestamp: Option<bool>,
+
+    /// Draw soft rounded corners (default: true).
+    #[serde(default)]
+    pub rounded: Option<bool>,
+
+    /// Enable or disable built-in sensitive-data redaction. When omitted, the
+    /// server's config decides.
+    #[serde(default)]
+    pub redact: Option<bool>,
+
+    /// Specific built-in/configured redaction rules to apply.
+    #[serde(default)]
+    pub redaction_rules: Option<Vec<String>>,
+
+    /// Manual regex or coordinate redactions applied while rendering.
+    #[serde(default)]
+    pub redactions: Option<Vec<ManualRedactionSpec>>,
+
+    /// Also redact returned terminal text. The PNG alone is redacted by
+    /// default.
+    #[serde(default)]
+    pub redact_text: Option<bool>,
+
+    /// Draw labels over redaction blocks. Defaults to true.
+    #[serde(default)]
+    pub show_labels: Option<bool>,
+
+    /// Strip ANSI codes from returned text. Defaults to false.
+    #[serde(default)]
+    pub strip_ansi: Option<bool>,
+
+    /// Descriptive PNG base name. When omitted, the fallback uses `cwd` (when
+    /// supplied) and the first command word.
+    #[serde(default)]
+    pub output_name: Option<String>,
+
+    /// Trim image width to the rightmost content. Defaults to true.
+    #[serde(default)]
+    pub auto_crop: Option<bool>,
+
+    /// Show only the first N logical output lines.
+    #[serde(default)]
+    pub head_lines: Option<usize>,
+
+    /// Show only the last N logical output lines.
+    #[serde(default)]
+    pub tail_lines: Option<usize>,
+}
+
+impl From<ExecuteAndScreenshotParams> for ExecuteAndScreenshotRequest {
+    fn from(params: ExecuteAndScreenshotParams) -> Self {
+        let command = params.commands.is_none().then_some(params.command);
+        Self {
+            command,
+            commands: params.commands,
+            cwd: None,
+            cols: params.cols,
+            rows: params.rows,
+            timeout_secs: params.timeout_secs,
+            show_prompt: params.show_prompt,
+            theme: params.theme,
+            chrome: params.chrome,
+            title: params.title,
+            timestamp: params.timestamp,
+            rounded: params.rounded,
+            redact: params.redact,
+            redaction_rules: params.redaction_rules,
+            redactions: params.redactions,
+            redact_text: params.redact_text,
+            show_labels: params.show_labels,
+            strip_ansi: params.strip_ansi,
+            output_name: params.output_name,
+            auto_crop: params.auto_crop,
+            head_lines: params.head_lines,
+            tail_lines: params.tail_lines,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -637,7 +793,14 @@ impl ScreenshotServer {
     /// sequences (colors, formatting, cursor movement) are rendered into an
     /// image that looks like a real terminal. When `show_prompt` is true
     /// (default), it runs in an interactive login shell so the screenshot
-    /// includes the PS1 prompt (username, host, directory, ...).
+    /// includes the user's real shell prompt before each command (username,
+    /// host, directory, ...), but never the final prompt after the last
+    /// command.
+    /// Set `cwd` before capture when the prompt should identify a meaningful
+    /// project directory. If a path is incidental, use a short staging
+    /// directory or hide the prompt. Never synthesize a prompt in `command`:
+    /// termshot strips the final real shell prompt, but prompt-like command
+    /// output must be preserved.
     ///
     /// Redaction: by default the rendered PNG is automatically scanned and
     /// masked for known secret patterns (IPs, AWS keys, JWTs, private keys,
@@ -657,9 +820,28 @@ impl ScreenshotServer {
     /// Returns the saved PNG path, the exit status, an optional redaction audit
     /// summary, and the terminal text output.
     #[tool(name = "execute_and_screenshot")]
+    pub async fn execute_and_screenshot_tool(
+        &self,
+        Parameters(params): Parameters<ExecuteAndScreenshotRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        self.execute_and_screenshot_impl(params).await
+    }
+
+    /// Direct-call API published in 1.0.0.
+    ///
+    /// The MCP router uses [`ScreenshotServer::execute_and_screenshot_tool`],
+    /// whose request adds `cwd` and permits `commands` without a redundant
+    /// `command`. This wrapper preserves the original Rust method signature.
     pub async fn execute_and_screenshot(
         &self,
         Parameters(params): Parameters<ExecuteAndScreenshotParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.execute_and_screenshot_impl(params.into()).await
+    }
+
+    async fn execute_and_screenshot_impl(
+        &self,
+        params: ExecuteAndScreenshotRequest,
     ) -> Result<CallToolResult, McpError> {
         let cols = params.cols.unwrap_or(self.config.default_cols);
         let rows = params.rows.unwrap_or(self.config.default_rows);
@@ -676,9 +858,13 @@ impl ScreenshotServer {
         // executed anything - exactly as the CLI's `--redaction` does.
         let manual = manual_redactions(params.redactions.as_deref(), params.redact, show_labels)?;
         let show_prompt = params.show_prompt.unwrap_or(true);
-        let commands = params
-            .commands
-            .unwrap_or_else(|| vec![params.command.clone()]);
+        let commands = request_commands(params.command, params.commands)?;
+        let working_dir = params
+            .cwd
+            .as_deref()
+            .map(|path| executor::resolve_working_directory(Path::new(path)))
+            .transpose()
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let command_refs: Vec<&str> = commands.iter().map(|s| s.as_str()).collect();
         let chrome_options = chrome_options_from_params(
             &self.config,
@@ -690,17 +876,26 @@ impl ScreenshotServer {
         );
 
         let result = if show_prompt {
-            executor::execute_command(&command_refs, &self.config.shell, rows, cols, timeout).await
+            executor::execute_command_in_dir(
+                &command_refs,
+                &self.config.shell,
+                rows,
+                cols,
+                timeout,
+                working_dir.as_deref(),
+            )
+            .await
         } else {
             // Each element of `commands` is an independent command line, so
             // join them with newlines (not spaces) when running without a
             // prompt, so `["pwd", "whoami"]` runs as two commands.
-            executor::execute_command_simple(
+            executor::execute_command_simple_in_dir(
                 &commands.join("\n"),
                 &self.config.shell,
                 rows,
                 cols,
                 timeout,
+                working_dir.as_deref(),
             )
             .await
         };
@@ -735,8 +930,11 @@ impl ScreenshotServer {
         // preferred, descriptive choice; otherwise fall back to
         // `{cwd_basename}-{first_word_of_command}`.
         let output_name = params.output_name.clone().unwrap_or_else(|| {
-            let cwd = std::env::current_dir().ok();
-            fallback_output_name(cwd.as_deref(), &commands.join(" "))
+            let fallback_dir = working_dir
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| std::env::current_dir().ok());
+            fallback_output_name(fallback_dir.as_deref(), &commands.join(" "))
         });
 
         let (image_path, plain_text, redactions, context) = self
@@ -1132,7 +1330,11 @@ impl ServerHandler for ScreenshotServer {
             .with_instructions(
                 "Terminal screenshot MCP server. Use execute_and_screenshot to run \
                  commands and capture PNG screenshots of the terminal output, including \
-                 PS1 prompt, colors, and full ANSI rendering. Use render_ansi to render \
+                 the user's real shell prompt before each command, colors, and full ANSI \
+                 rendering; the final prompt is removed automatically. Set its \
+                 `cwd` when directory context belongs in the screenshot; if the path is \
+                 incidental, use a short staging directory or hide the prompt. Never \
+                 print or synthesize a prompt in the command. Use render_ansi to render \
                  previously captured terminal output from a file. Both take an optional \
                  `redactions` list (regex patterns and/or cell ranges) to mask sensitive \
                  data as the image is rendered. Use redact_screenshot \
@@ -1151,6 +1353,31 @@ pub async fn run_mcp_server(config: Config, renderer: Renderer) -> anyhow::Resul
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// Resolve the request's mutually exclusive singular/plural command forms.
+fn request_commands(
+    command: Option<String>,
+    commands: Option<Vec<String>>,
+) -> Result<Vec<String>, McpError> {
+    let resolved = match (command, commands) {
+        (Some(_), Some(commands)) => commands,
+        (Some(command), None) => vec![command],
+        (None, Some(commands)) => commands,
+        (None, None) => {
+            return Err(McpError::invalid_params(
+                "Missing command: pass `command` or a non-empty `commands` list.".to_string(),
+                None,
+            ));
+        }
+    };
+    if resolved.is_empty() || resolved.iter().any(|command| command.trim().is_empty()) {
+        return Err(McpError::invalid_params(
+            "`command` and every entry in `commands` must contain a shell command.".to_string(),
+            None,
+        ));
+    }
+    Ok(resolved)
 }
 
 /// Turn a mutually exclusive `head_lines` / `tail_lines` pair into a line

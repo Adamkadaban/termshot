@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -41,6 +42,19 @@ pub async fn execute_command(
     cols: u16,
     timeout: Duration,
 ) -> Result<ExecResult> {
+    execute_command_in_dir(commands, shell, rows, cols, timeout, None).await
+}
+
+/// Execute commands in an interactive login shell whose initial prompt starts
+/// in `working_dir`. Passing `None` preserves [`execute_command`] behavior.
+pub async fn execute_command_in_dir(
+    commands: &[&str],
+    shell: &str,
+    rows: u16,
+    cols: u16,
+    timeout: Duration,
+    working_dir: Option<&Path>,
+) -> Result<ExecResult> {
     let size = pty_process::Size::new(rows, cols);
     let (pty, pts) = pty_process::open().context("Failed to open PTY")?;
     pty.resize(size).context("Failed to resize PTY")?;
@@ -50,6 +64,10 @@ pub async fn execute_command(
     let cmd = pty_process::Command::new(shell)
         .args(["-l", "-i"])
         .env("TERM", "xterm-256color");
+    let cmd = match working_dir {
+        Some(dir) => cmd.current_dir(dir),
+        None => cmd,
+    };
     let mut child = cmd.spawn(pts).context("Failed to spawn shell")?;
 
     let (mut reader, mut writer) = pty.into_split();
@@ -80,6 +98,7 @@ pub async fn execute_command(
     let clean_prompt = strip_title_sequences(&prompt_bytes);
     let mut check_parser = vt100::Parser::new(rows, cols, 0);
     check_parser.process(&clean_prompt);
+    let initial_prompt_col = check_parser.screen().cursor_position().1;
 
     // Phase 1b: clear the screen, which does two jobs at once.
     //
@@ -94,11 +113,11 @@ pub async fn execute_command(
         .write_all(b"clear 2>/dev/null || printf '\\033[H\\033[2J'\n")
         .await
         .context("Failed to write screen reset to PTY")?;
-    read_until_quiet(
+    read_until_prompt(
         &mut reader,
         &mut raw_after_prompt,
         &mut check_parser,
-        QUIET_PERIOD,
+        initial_prompt_col,
         deadline,
     )
     .await?;
@@ -517,6 +536,20 @@ pub async fn execute_command_simple(
     cols: u16,
     timeout: Duration,
 ) -> Result<ExecResult> {
+    execute_command_simple_in_dir(command, shell, rows, cols, timeout, None).await
+}
+
+/// Execute a command non-interactively with `working_dir` as the child
+/// process's current directory. Passing `None` preserves
+/// [`execute_command_simple`] behavior.
+pub async fn execute_command_simple_in_dir(
+    command: &str,
+    shell: &str,
+    rows: u16,
+    cols: u16,
+    timeout: Duration,
+    working_dir: Option<&Path>,
+) -> Result<ExecResult> {
     let size = pty_process::Size::new(rows, cols);
     let (pty, pts) = pty_process::open().context("Failed to open PTY")?;
     pty.resize(size).context("Failed to resize PTY")?;
@@ -524,6 +557,10 @@ pub async fn execute_command_simple(
     let cmd = pty_process::Command::new(shell)
         .args(["-c", command])
         .env("TERM", "xterm-256color");
+    let cmd = match working_dir {
+        Some(dir) => cmd.current_dir(dir),
+        None => cmd,
+    };
     let mut child = cmd.spawn(pts).context("Failed to spawn command")?;
 
     let (mut reader, _writer) = pty.into_split();
@@ -570,6 +607,45 @@ pub async fn execute_command_simple(
     })
 }
 
+/// Resolve a CLI or MCP working-directory path before any command executes.
+///
+/// A leading `~` is expanded for convenience; other relative paths are
+/// resolved from the termshot process's current directory. The canonical path
+/// is returned so the child shell and fallback filename use the same location.
+pub fn resolve_working_directory(path: &Path) -> Result<PathBuf> {
+    let raw = path.to_string_lossy();
+    let expanded = if raw == "~" {
+        PathBuf::from(
+            std::env::var_os("HOME")
+                .ok_or_else(|| anyhow::anyhow!("Cannot expand '~': HOME is not set"))?,
+        )
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        PathBuf::from(
+            std::env::var_os("HOME")
+                .ok_or_else(|| anyhow::anyhow!("Cannot expand '{}': HOME is not set", raw))?,
+        )
+        .join(rest)
+    } else if raw.starts_with('~') {
+        anyhow::bail!(
+            "Unsupported working directory '{}': only '~' and '~/' expansion are supported",
+            raw
+        );
+    } else {
+        path.to_path_buf()
+    };
+
+    let resolved = expanded.canonicalize().with_context(|| {
+        format!(
+            "Working directory '{}' does not exist or cannot be accessed",
+            path.display()
+        )
+    })?;
+    if !resolved.is_dir() {
+        anyhow::bail!("Working directory '{}' is not a directory", path.display());
+    }
+    Ok(resolved)
+}
+
 /// Leading fragment of the sentinel token. The shell command that prints it
 /// concatenates this with the rest, so the token only ever appears whole in the
 /// shell's *output*, never in the input line it echoes back.
@@ -602,28 +678,30 @@ async fn read_until_quiet(
     parser: &mut vt100::Parser,
     quiet_period: Duration,
     deadline: tokio::time::Instant,
-) -> Result<()> {
+) -> Result<bool> {
     let mut buf = [0u8; 4096];
+    let mut saw_output = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Ok(());
+            return Ok(saw_output);
         }
         match tokio::time::timeout(quiet_period.min(remaining), reader.read(&mut buf)).await {
-            Ok(Ok(0)) => return Ok(()),
+            Ok(Ok(0)) => return Ok(saw_output),
             Ok(Ok(n)) => {
+                saw_output = true;
                 let chunk = &buf[..n];
                 raw.extend_from_slice(chunk);
                 parser.process(&strip_title_sequences(chunk));
             }
             Ok(Err(e)) => {
                 if e.raw_os_error() == Some(5) {
-                    return Ok(());
+                    return Ok(saw_output);
                 }
                 return Err(anyhow::anyhow!("PTY read error: {}", e));
             }
-            // Quiet period elapsed with no new output: the command is done.
-            Err(_) => return Ok(()),
+            // Quiet period elapsed with no new output.
+            Err(_) => return Ok(saw_output),
         }
     }
 }
@@ -643,9 +721,15 @@ async fn read_until_prompt(
     prompt_col: u16,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
+    // Before the shell has echoed or otherwise reacted to the command, the
+    // parser still shows the old prompt at `prompt_col`. Under scheduler load,
+    // accepting that untouched state after one quiet period races the child
+    // and can skip the command entirely.
+    let mut saw_command_activity = false;
     loop {
-        read_until_quiet(reader, raw, parser, QUIET_PERIOD, deadline).await?;
-        if parser.screen().cursor_position().1 == prompt_col {
+        saw_command_activity |=
+            read_until_quiet(reader, raw, parser, QUIET_PERIOD, deadline).await?;
+        if saw_command_activity && parser.screen().cursor_position().1 == prompt_col {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -664,6 +748,7 @@ async fn read_until_idle(
     let mut output = Vec::new();
     let mut buf = [0u8; 4096];
     let deadline = tokio::time::Instant::now() + max_wait;
+    let mut saw_output = false;
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -675,6 +760,7 @@ async fn read_until_idle(
         match tokio::time::timeout(read_timeout, reader.read(&mut buf)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => {
+                saw_output = true;
                 output.extend_from_slice(&buf[..n]);
             }
             Ok(Err(e)) => {
@@ -683,7 +769,11 @@ async fn read_until_idle(
                 }
                 return Err(anyhow::anyhow!("PTY read error: {}", e));
             }
-            Err(_) => break,
+            // Before the child emits anything, an idle timeout only means it
+            // has not been scheduled yet. Once output has arrived, the same
+            // quiet period is the prompt-ready signal.
+            Err(_) if saw_output => break,
+            Err(_) => continue,
         }
     }
 
