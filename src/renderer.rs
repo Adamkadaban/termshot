@@ -4,6 +4,8 @@ use crate::capture::{
 };
 use crate::config::{ChromeConfig, ThemeConfig};
 use crate::redaction::{ManualRedactions, RedactionEngine, RedactionMap};
+use crate::shaping::{FontSource, GlyphBitmap, RunCell, RunRequest, ShapingEngine, ShapingOptions};
+use crate::unicode;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use fontdue::{Font, FontSettings};
@@ -11,6 +13,7 @@ use image::{ImageBuffer, Rgba, RgbaImage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use unicode_script::UnicodeScript;
 
 /// JetBrains Mono font compiled directly into the binary so that release
 /// archives and `cargo install` builds always have a working font, even when
@@ -881,6 +884,10 @@ pub struct ThemeFonts {
     fallback_fonts: Vec<Font>,
     cell_width: u32,
     cell_height: u32,
+    /// The shaped path for this same chain: the cells `fontdue` cannot draw
+    /// one scalar at a time. Built lazily on first use, so a chain that only
+    /// ever renders ASCII never touches a font database.
+    shaping: ShapingEngine,
 }
 
 /// The font files one theme resolves to. Doubles as the cache key that lets
@@ -892,11 +899,42 @@ struct FontChainSpec {
     fallbacks: Vec<PathBuf>,
 }
 
+impl FontChainSpec {
+    /// The same chain, in the same order, as the shaped path's font sources:
+    /// primary face, bold face, the embedded JetBrains Mono, then every
+    /// configured fallback. Automatic system font discovery comes after all of
+    /// them, so an explicitly configured font is never overruled by whatever
+    /// happens to be installed.
+    fn shaping_sources(&self) -> Vec<FontSource> {
+        let mut sources = Vec::with_capacity(self.fallbacks.len() + 3);
+        let push = |source: FontSource, sources: &mut Vec<FontSource>| {
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+        };
+        if let Some(primary) = &self.primary {
+            push(FontSource::File(primary.clone()), &mut sources);
+        }
+        if let Some(bold) = &self.bold {
+            push(FontSource::File(bold.clone()), &mut sources);
+        }
+        push(FontSource::Embedded(EMBEDDED_FONT), &mut sources);
+        for fallback in &self.fallbacks {
+            push(FontSource::File(fallback.clone()), &mut sources);
+        }
+        sources
+    }
+}
+
 impl ThemeFonts {
     /// Load one font chain. The primary and bold faces are hard errors when
     /// they cannot be read or parsed (the user asked for that exact file);
     /// fallback entries are best-effort and only shrink the chain.
-    fn load(spec: &FontChainSpec, font_size: f32) -> Result<Self> {
+    ///
+    /// `shaping` decides how the same chain is set up for the shaped path,
+    /// which is built lazily and only consulted for cells `fontdue` cannot
+    /// draw correctly on its own.
+    fn load(spec: &FontChainSpec, font_size: f32, shaping: &ShapingOptions) -> Result<Self> {
         // Use an explicitly configured font file if provided, otherwise fall
         // back to the font embedded in the binary.
         let font_data = match spec.primary.as_deref() {
@@ -951,7 +989,32 @@ impl ThemeFonts {
             fallback_fonts,
             cell_width,
             cell_height,
+            shaping: ShapingEngine::new(spec.shaping_sources(), shaping.clone()),
         })
+    }
+
+    /// Whether any face in the `fontdue` chain genuinely covers `ch`.
+    ///
+    /// This is the same walk [`Renderer::font_for_char`] makes, asked as a
+    /// yes/no question: a character nothing covers is one the shaped path has
+    /// to try, because the alternative is the tofu box 1.1.5 drew.
+    fn chain_covers(&self, ch: char, bold: bool, font_size: f32) -> bool {
+        let primary = match (bold, self.font_bold.as_ref()) {
+            (true, Some(bold_font)) => bold_font,
+            _ => &self.font,
+        };
+        font_covers(primary, ch, font_size)
+            || self
+                .fallback_fonts
+                .iter()
+                .any(|font| font_covers(font, ch, font_size))
+    }
+
+    /// The shaped path built for this chain. Exposed so tests can inspect the
+    /// font precedence the shaper resolved.
+    #[cfg(test)]
+    pub(crate) fn shaping(&self) -> &ShapingEngine {
+        &self.shaping
     }
 }
 
@@ -1184,6 +1247,9 @@ impl Renderer {
     }
 
     /// [`Renderer::new`] with explicit capture options.
+    ///
+    /// Unicode shaping is configured from the environment; use
+    /// [`Renderer::new_with_shaping`] to set it explicitly.
     pub fn new_with_options(
         fonts: &FontSelection,
         font_size: f32,
@@ -1191,6 +1257,34 @@ impl Renderer {
         default_theme: &str,
         chrome_config: &ChromeConfig,
         options: RendererOptions,
+    ) -> Result<Self> {
+        Self::new_with_shaping(
+            fonts,
+            font_size,
+            theme_configs,
+            default_theme,
+            chrome_config,
+            options,
+            ShapingOptions::from_env(),
+        )
+    }
+
+    /// [`Renderer::new_with_options`] with the shaped text path configured
+    /// explicitly.
+    ///
+    /// [`ShapingOptions::deterministic`] restricts every shaped run to the
+    /// fonts the configuration names, which is what a reproducible screenshot
+    /// pipeline - or a test - wants; [`ShapingOptions::disabled`] reproduces
+    /// the 1.1.5 renderer exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_shaping(
+        fonts: &FontSelection,
+        font_size: f32,
+        theme_configs: &HashMap<String, ThemeConfig>,
+        default_theme: &str,
+        chrome_config: &ChromeConfig,
+        options: RendererOptions,
+        shaping: ShapingOptions,
     ) -> Result<Self> {
         // Parse all themes
         let mut themes = HashMap::new();
@@ -1211,7 +1305,7 @@ impl Renderer {
         // when a theme's own fonts cannot be loaded), so a broken font here is
         // a hard error rather than a silent downgrade.
         let default_spec = fonts.spec_for(theme_configs.get(default_theme));
-        let default_fonts = Arc::new(ThemeFonts::load(&default_spec, font_size)?);
+        let default_fonts = Arc::new(ThemeFonts::load(&default_spec, font_size, &shaping)?);
 
         // One font chain per theme, deduplicated by the files it resolves to:
         // the common case (every theme using the same font) parses one chain.
@@ -1224,7 +1318,7 @@ impl Renderer {
                 theme_fonts.insert(name.clone(), Arc::clone(existing));
                 continue;
             }
-            match ThemeFonts::load(&spec, font_size) {
+            match ThemeFonts::load(&spec, font_size, &shaping) {
                 Ok(loaded) => {
                     let loaded = Arc::new(loaded);
                     by_spec.insert(spec, Arc::clone(&loaded));
@@ -1896,100 +1990,420 @@ impl Renderer {
             height,
         } = *layout;
         let hi_font_size = self.font_size * RENDER_SCALE as f32;
-        let scale = RENDER_SCALE;
 
         self.draw_rect(img, ox, oy, width, height, theme.background);
 
-        for row in 0..content_rows {
-            for col in 0..content_cols {
-                if let Some(cell) = screen.cell(row as u16, col as u16) {
-                    let x = ox + col * cell_w + padding;
-                    let y = oy + row * cell_h + padding;
+        let shaping = fonts.shaping.enabled();
 
-                    // Redaction: draw a block (with an optional short label)
-                    // in place of sensitive cell contents, using the color the
-                    // matching rule requested.
-                    if let Some(rc) = redaction.and_then(|m| m.get(row as u16, col as u16)) {
-                        let block =
-                            Rgba([rc.block_color[0], rc.block_color[1], rc.block_color[2], 255]);
-                        self.draw_rect(img, x, y, cell_w, cell_h, block);
-                        if let Some(label_ch) = rc.label_char {
-                            let label = Rgba([
-                                rc.label_color[0],
-                                rc.label_color[1],
-                                rc.label_color[2],
-                                255,
-                            ]);
-                            self.draw_char_with_font(
-                                img,
-                                fonts,
-                                x,
-                                y,
-                                label_ch,
-                                label,
-                                false,
-                                hi_font_size,
-                                &self.font_for_char(fonts, label_ch, false, hi_font_size),
-                                cell_w,
-                            );
-                        }
+        for row in 0..content_rows {
+            // First column past a run the shaper could not draw, so a failed
+            // attempt is not repeated cell by cell across the same run.
+            let mut unshapable_until = 0u32;
+            let mut col = 0u32;
+            while col < content_cols {
+                let Some(cell) = screen.cell(row as u16, col as u16) else {
+                    col += 1;
+                    continue;
+                };
+                let x = ox + col * cell_w + padding;
+                let y = oy + row * cell_h + padding;
+
+                // Redaction: draw a block (with an optional short label)
+                // in place of sensitive cell contents, using the color the
+                // matching rule requested.
+                if let Some(rc) = redaction.and_then(|m| m.get(row as u16, col as u16)) {
+                    let block =
+                        Rgba([rc.block_color[0], rc.block_color[1], rc.block_color[2], 255]);
+                    self.draw_rect(img, x, y, cell_w, cell_h, block);
+                    if let Some(label_ch) = rc.label_char {
+                        let label =
+                            Rgba([rc.label_color[0], rc.label_color[1], rc.label_color[2], 255]);
+                        self.draw_char_with_font(
+                            img,
+                            fonts,
+                            x,
+                            y,
+                            label_ch,
+                            label,
+                            false,
+                            hi_font_size,
+                            &self.font_for_char(fonts, label_ch, false, hi_font_size),
+                            cell_w,
+                        );
+                    }
+                    col += 1;
+                    continue;
+                }
+
+                // Cells the per-scalar path cannot draw correctly - combining
+                // marks, joining and reordering scripts, emoji, anything no
+                // configured font covers - are gathered into a run of cells
+                // with one style and shaped together. Everything else takes
+                // the path it always took, so ordinary output is untouched.
+                if shaping && col >= unshapable_until && self.cell_needs_shaping(fonts, cell) {
+                    let run =
+                        self.collect_shaped_run(screen, fonts, row, col, content_cols, redaction);
+                    if self
+                        .draw_shaped_run(img, fonts, theme, screen, row, col, &run, layout, ox, oy)
+                    {
+                        col += run.cols;
                         continue;
                     }
-
-                    let (fg_color, bg_color) = self.resolve_cell_colors(cell, theme);
-
-                    // Draw background
-                    if bg_color != theme.background {
-                        self.draw_rect(img, x, y, cell_w, cell_h, bg_color);
-                    }
-
-                    // Draw character(s) at 2x font size
-                    let ch = cell.contents();
-                    if !ch.is_empty() && ch != " " {
-                        // A double-width character owns this cell and the
-                        // vt100 continuation cell after it, so a fallback
-                        // glyph is centered across both.
-                        let cell_span = if cell.is_wide() { cell_w * 2 } else { cell_w };
-                        let bold = cell.bold();
-                        let has_bold_font = fonts.font_bold.is_some();
-                        for c in ch.chars() {
-                            let chosen = self.font_for_char(fonts, c, bold, hi_font_size);
-                            self.draw_char_with_font(
-                                img,
-                                fonts,
-                                x,
-                                y,
-                                c,
-                                fg_color,
-                                cell.italic(),
-                                hi_font_size,
-                                &chosen,
-                                cell_span,
-                            );
-                            // Faux bold only when no bold font is available
-                            if bold && !has_bold_font {
-                                self.draw_char_with_font(
-                                    img,
-                                    fonts,
-                                    x + 1,
-                                    y,
-                                    c,
-                                    fg_color,
-                                    cell.italic(),
-                                    hi_font_size,
-                                    &chosen,
-                                    cell_span,
-                                );
-                            }
-                        }
-                    }
-
-                    // Underline
-                    if cell.underline() {
-                        let uy = y + cell_h.saturating_sub(2 * scale);
-                        self.draw_rect(img, x, uy, cell_w, scale, fg_color);
-                    }
+                    unshapable_until = col + run.cols;
                 }
+
+                self.draw_cell(img, fonts, theme, cell, x, y, cell_w, cell_h, hi_font_size);
+                col += 1;
+            }
+        }
+    }
+
+    /// Draw one cell the way the renderer always has: its background, its
+    /// characters through the `fontdue` chain, then its underline.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_cell(
+        &self,
+        img: &mut RgbaImage,
+        fonts: &ThemeFonts,
+        theme: &Theme,
+        cell: &vt100::Cell,
+        x: u32,
+        y: u32,
+        cell_w: u32,
+        cell_h: u32,
+        hi_font_size: f32,
+    ) {
+        let (fg_color, bg_color) = self.resolve_cell_colors(cell, theme);
+
+        // Draw background
+        if bg_color != theme.background {
+            self.draw_rect(img, x, y, cell_w, cell_h, bg_color);
+        }
+
+        // Draw character(s) at 2x font size
+        let ch = cell.contents();
+        if !ch.is_empty() && ch != " " {
+            // A double-width character owns this cell and the
+            // vt100 continuation cell after it, so a fallback
+            // glyph is centered across both.
+            let cell_span = if cell.is_wide() { cell_w * 2 } else { cell_w };
+            let bold = cell.bold();
+            let has_bold_font = fonts.font_bold.is_some();
+            for c in ch.chars() {
+                let chosen = self.font_for_char(fonts, c, bold, hi_font_size);
+                self.draw_char_with_font(
+                    img,
+                    fonts,
+                    x,
+                    y,
+                    c,
+                    fg_color,
+                    cell.italic(),
+                    hi_font_size,
+                    &chosen,
+                    cell_span,
+                );
+                // Faux bold only when no bold font is available
+                if bold && !has_bold_font {
+                    self.draw_char_with_font(
+                        img,
+                        fonts,
+                        x + 1,
+                        y,
+                        c,
+                        fg_color,
+                        cell.italic(),
+                        hi_font_size,
+                        &chosen,
+                        cell_span,
+                    );
+                }
+            }
+        }
+
+        // Underline
+        if cell.underline() {
+            let uy = y + cell_h.saturating_sub(2 * RENDER_SCALE);
+            self.draw_rect(img, x, uy, cell_w, RENDER_SCALE, fg_color);
+        }
+    }
+
+    /// Whether a cell has to go through the shaper.
+    ///
+    /// Four cases, and only four:
+    ///
+    /// * the cell holds more than one scalar, which is how vt100 stores a base
+    ///   character plus its combining marks, a variation sequence, or a keycap;
+    /// * the cell asks for emoji presentation, which wants a color font;
+    /// * the cell belongs to a script whose glyphs depend on their neighbours
+    ///   (Arabic joining, Brahmic reordering, Hebrew points); or
+    /// * no font in the configured chain covers it, so the alternative is the
+    ///   tofu box the renderer used to draw.
+    ///
+    /// Everything else - ASCII, box drawing, Latin, Greek, Cyrillic, CJK the
+    /// chain covers - answers `false` and is drawn exactly as before.
+    fn cell_needs_shaping(&self, fonts: &ThemeFonts, cell: &vt100::Cell) -> bool {
+        let contents = cell.contents();
+        if contents.is_empty() || contents == " " {
+            return false;
+        }
+        let mut chars = contents.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if chars.next().is_some() {
+            return true;
+        }
+        if unicode::cluster_is_emoji(contents) {
+            return true;
+        }
+        if unicode::script_needs_shaping(first.script()) {
+            return true;
+        }
+        let hi_font_size = self.font_size * RENDER_SCALE as f32;
+        !fonts.chain_covers(first, cell.bold(), hi_font_size)
+    }
+
+    /// Gather the run of cells starting at `col` that will be shaped together.
+    ///
+    /// A run stops at the first cell that is redacted, styled differently,
+    /// does not need shaping at all, or belongs to a different shaping class
+    /// (emoji against text, a joining or reordering script against everything
+    /// else). That is what keeps a ligature or an overhanging mark from
+    /// crossing a redaction block or a color change: the shaper never sees the
+    /// two sides of such a boundary as one piece of text, and the run's glyphs
+    /// are clipped to the run's own columns.
+    fn collect_shaped_run(
+        &self,
+        screen: &CapturedScreen,
+        fonts: &ThemeFonts,
+        row: u32,
+        col: u32,
+        content_cols: u32,
+        redaction: Option<&RedactionMap>,
+    ) -> ShapedRunSpan {
+        let mut cells = Vec::new();
+        let mut cols = 0u32;
+        let mut style = None;
+        let mut class = None;
+        let mut at = col;
+        while at < content_cols {
+            let Some(cell) = screen.cell(row as u16, at as u16) else {
+                break;
+            };
+            let wide = cell.is_wide() && at + 1 < content_cols;
+            let span = if wide { 2 } else { 1 };
+            if (0..span).any(|offset| {
+                redaction
+                    .and_then(|map| map.get(row as u16, (at + offset) as u16))
+                    .is_some()
+            }) {
+                break;
+            }
+            let cell_style = CellStyle::of(cell);
+            match style {
+                None => style = Some(cell_style),
+                Some(first) if first == cell_style => {}
+                Some(_) => break,
+            }
+            if !self.cell_needs_shaping(fonts, cell) {
+                break;
+            }
+            let contents = cell.contents();
+            let cell_class = (
+                unicode::cluster_is_emoji(contents),
+                unicode::cluster_forces_contiguous_run(contents),
+            );
+            match class {
+                None => class = Some(cell_class),
+                Some(first) if first == cell_class => {}
+                Some(_) => break,
+            }
+            cells.push(RunCell {
+                text: contents.to_string(),
+                cols: span,
+            });
+            cols += span;
+            at += span;
+        }
+        ShapedRunSpan { cells, cols }
+    }
+
+    /// Draw a run of cells through the shaper.
+    ///
+    /// Returns `false` when the shaper produced nothing, in which case the
+    /// caller falls back to the per-cell path it always used.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_shaped_run(
+        &self,
+        img: &mut RgbaImage,
+        fonts: &ThemeFonts,
+        theme: &Theme,
+        screen: &CapturedScreen,
+        row: u32,
+        col: u32,
+        run: &ShapedRunSpan,
+        layout: &ScreenLayout,
+        ox: u32,
+        oy: u32,
+    ) -> bool {
+        if run.cells.is_empty() {
+            return false;
+        }
+        let ScreenLayout {
+            cell_w,
+            cell_h,
+            padding,
+            ..
+        } = *layout;
+        let Some(first) = screen.cell(row as u16, col as u16) else {
+            return false;
+        };
+        let hi_font_size = self.font_size * RENDER_SCALE as f32;
+        let bold = first.bold();
+        let has_bold_font = fonts.font_bold.is_some();
+        let request = RunRequest {
+            cells: &run.cells,
+            cell_w,
+            font_size: hi_font_size,
+            ascent: font_ascent(&fonts.font, hi_font_size),
+            bold: bold && has_bold_font,
+            italic: first.italic(),
+        };
+        let placed = fonts.shaping.place_run(&request);
+        if placed.is_empty() {
+            return false;
+        }
+
+        let run_x = ox + col * cell_w + padding;
+        let run_y = oy + row * cell_h + padding;
+        let (fg_color, _) = self.resolve_cell_colors(first, theme);
+
+        // Backgrounds first, for every column the run owns, so a shaped glyph
+        // is never painted over by the cell after it.
+        for offset in 0..run.cols {
+            let Some(cell) = screen.cell(row as u16, (col + offset) as u16) else {
+                continue;
+            };
+            let (_, bg_color) = self.resolve_cell_colors(cell, theme);
+            if bg_color != theme.background {
+                self.draw_rect(
+                    img,
+                    run_x + offset * cell_w,
+                    run_y,
+                    cell_w,
+                    cell_h,
+                    bg_color,
+                );
+            }
+        }
+
+        // The run's own rectangle is the clip: nothing shaped may reach the
+        // cell after it, redacted or not.
+        let clip = ClipRect {
+            x0: run_x as i32,
+            x1: (run_x + run.cols * cell_w) as i32,
+            y0: run_y as i32,
+            y1: (run_y + cell_h) as i32,
+        };
+        for glyph in &placed {
+            self.blend_glyph_bitmap(
+                img,
+                run_x as i32 + glyph.x,
+                run_y as i32 + glyph.y,
+                &glyph.bitmap,
+                fg_color,
+                clip,
+            );
+            // Faux bold, exactly as the per-scalar path does it when no bold
+            // face is configured.
+            if bold && !has_bold_font {
+                self.blend_glyph_bitmap(
+                    img,
+                    run_x as i32 + glyph.x + 1,
+                    run_y as i32 + glyph.y,
+                    &glyph.bitmap,
+                    fg_color,
+                    clip,
+                );
+            }
+        }
+
+        for offset in 0..run.cols {
+            let Some(cell) = screen.cell(row as u16, (col + offset) as u16) else {
+                continue;
+            };
+            if cell.underline() {
+                let (cell_fg, _) = self.resolve_cell_colors(cell, theme);
+                let uy = run_y + cell_h.saturating_sub(2 * RENDER_SCALE);
+                self.draw_rect(
+                    img,
+                    run_x + offset * cell_w,
+                    uy,
+                    cell_w,
+                    RENDER_SCALE,
+                    cell_fg,
+                );
+            }
+        }
+        true
+    }
+
+    /// Blend one rasterized glyph bitmap into `img`, clipped to `clip`.
+    ///
+    /// A coverage bitmap is modulated by `color` exactly like a `fontdue`
+    /// glyph; a color bitmap carries its own RGBA and only takes `color`'s
+    /// alpha, so a color emoji keeps its own palette instead of being tinted
+    /// with the cell's foreground.
+    fn blend_glyph_bitmap(
+        &self,
+        img: &mut RgbaImage,
+        x: i32,
+        y: i32,
+        bitmap: &GlyphBitmap,
+        color: Rgba<u8>,
+        clip: ClipRect,
+    ) {
+        for gy in 0..bitmap.height {
+            let py = y + gy as i32;
+            if py < clip.y0 || py >= clip.y1 || py < 0 || py as u32 >= img.height() {
+                continue;
+            }
+            for gx in 0..bitmap.width {
+                let px = x + gx as i32;
+                if px < clip.x0 || px >= clip.x1 || px < 0 || px as u32 >= img.width() {
+                    continue;
+                }
+                let index = (gy * bitmap.width + gx) as usize;
+                let pixel = if bitmap.color {
+                    let at = index * 4;
+                    let Some(rgba) = bitmap.data.get(at..at + 4) else {
+                        continue;
+                    };
+                    if rgba[3] == 0 {
+                        continue;
+                    }
+                    Rgba([
+                        rgba[0],
+                        rgba[1],
+                        rgba[2],
+                        ((rgba[3] as u32 * color[3] as u32) / 255) as u8,
+                    ])
+                } else {
+                    let Some(&coverage) = bitmap.data.get(index) else {
+                        continue;
+                    };
+                    if coverage == 0 {
+                        continue;
+                    }
+                    Rgba([
+                        color[0],
+                        color[1],
+                        color[2],
+                        ((coverage as u32 * color[3] as u32) / 255) as u8,
+                    ])
+                };
+                self.put_pixel_blend(img, px as u32, py as u32, pixel);
             }
         }
     }
@@ -3046,6 +3460,26 @@ struct ScreenLayout {
     height: u32,
 }
 
+/// A run of consecutive cells that share one style and all need the shaper.
+///
+/// `cols` counts grid columns rather than cells, so the vt100 continuation
+/// column of a double-width character is part of the run's span even though it
+/// contributes no text of its own.
+struct ShapedRunSpan {
+    cells: Vec<RunCell>,
+    cols: u32,
+}
+
+/// Pixel bounds a shaped glyph may paint inside: always the run's own
+/// rectangle, so shaping can never leak into a neighbouring cell.
+#[derive(Debug, Clone, Copy)]
+struct ClipRect {
+    x0: i32,
+    x1: i32,
+    y0: i32,
+    y1: i32,
+}
+
 /// Pixel geometry of a chrome-framed screenshot, worked out before anything is
 /// allocated so [`ChromeMetrics::check_budget`] can refuse an impossible render
 /// instead of the allocator aborting on it.
@@ -3819,6 +4253,12 @@ mod tests {
             fallback_fonts: Vec::new(),
             cell_width: 8,
             cell_height: 16,
+            // Explicit fonts only: a unit test must not render differently
+            // depending on what the machine running it has installed.
+            shaping: ShapingEngine::new(
+                vec![FontSource::Embedded(EMBEDDED_FONT)],
+                ShapingOptions::deterministic(),
+            ),
         }
     }
 
@@ -3862,6 +4302,7 @@ mod tests {
                 fallbacks: Vec::new(),
             },
             16.0,
+            &ShapingOptions::deterministic(),
         )
         .expect("the embedded font loads");
         let mut renderer = bare_renderer();
@@ -4379,8 +4820,22 @@ mod tests {
     const FALLBACK_CHARS: [char; 5] = ['\u{2500}', '\u{2502}', '\u{250c}', '\u{2713}', '\u{3bb}'];
 
     fn renderer_with(primary: Option<&str>, fallbacks: &[&str]) -> Renderer {
+        renderer_with_shaping(primary, fallbacks, ShapingOptions::deterministic())
+    }
+
+    /// [`renderer_with`] with the shaped path configured explicitly.
+    ///
+    /// Every font test uses [`ShapingOptions::deterministic`] so the result
+    /// depends only on the fixtures in this repository: automatic system font
+    /// fallback is a real feature, but a test that asserts on it would assert
+    /// on whatever the machine running it happens to have installed.
+    fn renderer_with_shaping(
+        primary: Option<&str>,
+        fallbacks: &[&str],
+        shaping: ShapingOptions,
+    ) -> Renderer {
         let fallbacks: Vec<PathBuf> = fallbacks.iter().map(PathBuf::from).collect();
-        Renderer::new(
+        Renderer::new_with_shaping(
             &FontSelection {
                 font_override: primary.map(PathBuf::from),
                 font_bold_override: None,
@@ -4391,6 +4846,8 @@ mod tests {
             &HashMap::new(),
             "dark",
             &ChromeConfig::default(),
+            RendererOptions::default(),
+            shaping,
         )
         .expect("renderer builds")
     }
@@ -5736,5 +6193,302 @@ mod tests {
                 "{preset} (shadow={shadow}) is no longer pixel identical"
             );
         }
+    }
+    // ---------------------------------------------------------------------
+    // Unicode shaping
+    // ---------------------------------------------------------------------
+
+    /// Two synthetic fonts covering the same characters with visibly different
+    /// outlines: `A` inks the left third of the cell, `B` the right third.
+    const SHAPE_A: &str = "tests/fixtures/shape-a.ttf";
+    /// See [`SHAPE_A`].
+    const SHAPE_B: &str = "tests/fixtures/shape-b.ttf";
+    /// A COLRv0 font: two layers per glyph, in two loud palette colors.
+    const COLOR_EMOJI: &str = "tests/fixtures/color-emoji.ttf";
+    /// A two-face collection whose faces cover different code points.
+    const COLLECTION: &str = "tests/fixtures/collection.ttc";
+
+    /// Devanagari KA. Its script always needs a shaper, so it exercises font
+    /// precedence on the *shaped* path rather than the fontdue one.
+    const DEVANAGARI_KA: char = '\u{0915}';
+
+    fn cell_at(screen: &CapturedScreen, col: u16) -> &vt100::Cell {
+        screen.cell(0, col).expect("cell in range")
+    }
+
+    /// Ordinary output must never reach the shaper: that is the whole reason
+    /// existing screenshots still render the way they always did.
+    #[test]
+    fn ordinary_output_never_reaches_the_shaper() {
+        let renderer = renderer_with(None, &[]);
+        let fonts = &renderer.default_fonts;
+        let plain = "abc XYZ 019 => != -> <= |> ::";
+        let captured = screen_of(plain.as_bytes(), 2, 40);
+        for col in 0..plain.chars().count() as u16 {
+            assert!(
+                !renderer.cell_needs_shaping(fonts, cell_at(&captured, col)),
+                "ASCII cell {col} was sent to the shaper"
+            );
+        }
+        // Box drawing, Greek, Cyrillic and CJK the chain covers are all
+        // correct one cell at a time.
+        for text in [
+            "\u{250C}\u{2500}\u{2510}\u{2502}\u{2514}\u{2518}",
+            "\u{03B1}\u{03B2}\u{0416}\u{0429}",
+        ] {
+            let captured = screen_of(text.as_bytes(), 2, 20);
+            for col in 0..text.chars().count() as u16 {
+                assert!(
+                    !renderer.cell_needs_shaping(fonts, cell_at(&captured, col)),
+                    "{text:?} cell {col} was sent to the shaper"
+                );
+            }
+        }
+    }
+
+    /// The four - and only four - reasons a cell is shaped.
+    #[test]
+    fn only_cells_the_fast_path_cannot_draw_are_shaped() {
+        let renderer = renderer_with(None, &[]);
+        let fonts = &renderer.default_fonts;
+        // (sample, column that must need shaping, why)
+        let corpus: &[(&str, u16, &str)] = &[
+            ("e\u{0301}", 0, "base plus combining mark is one cell"),
+            ("1\u{FE0F}\u{20E3}", 0, "keycap sequence is one cell"),
+            ("\u{2764}\u{FE0F}", 0, "variation selector sequence"),
+            ("\u{1F600}", 0, "emoji presentation"),
+            ("\u{1F44D}\u{1F3FD}", 0, "emoji plus skin tone modifier"),
+            ("\u{1F1FA}\u{1F1F8}", 0, "regional indicators"),
+            ("\u{0645}\u{0631}", 0, "Arabic joins"),
+            ("\u{0915}\u{094D}\u{0937}", 1, "Devanagari reorders"),
+            ("\u{4F60}", 0, "no configured font covers this CJK"),
+        ];
+        for (text, col, why) in corpus {
+            let captured = screen_of(text.as_bytes(), 2, 20);
+            assert!(
+                renderer.cell_needs_shaping(fonts, cell_at(&captured, *col)),
+                "{text:?} column {col} should be shaped: {why}"
+            );
+        }
+    }
+
+    /// The shaper is only reached when it is enabled, so
+    /// [`ShapingOptions::disabled`] really is the 1.1.5 renderer.
+    #[test]
+    fn disabling_shaping_turns_the_whole_path_off() {
+        let renderer = renderer_with_shaping(None, &[], ShapingOptions::disabled());
+        assert!(!renderer.default_fonts.shaping().enabled());
+        assert!(renderer.default_fonts.shaping().families().is_empty());
+    }
+
+    /// A run stops at the first cell whose style differs, so a ligature or an
+    /// overhanging mark can never cross a color change.
+    #[test]
+    fn a_shaped_run_stops_at_a_style_boundary() {
+        let renderer = renderer_with(None, &[]);
+        let fonts = &renderer.default_fonts;
+        // Two Arabic letters, the second in a different color.
+        let captured = screen_of("\u{0645}\u{001b}[31m\u{0631}\u{001b}[0m".as_bytes(), 2, 20);
+        let run = renderer.collect_shaped_run(&captured, fonts, 0, 0, 20, None);
+        assert_eq!(
+            run.cells.len(),
+            1,
+            "the run crossed a style boundary: {:?}",
+            run.cells
+        );
+        // Same two letters in one style shape together.
+        let captured = screen_of("\u{0645}\u{0631}".as_bytes(), 2, 20);
+        let run = renderer.collect_shaped_run(&captured, fonts, 0, 0, 20, None);
+        assert_eq!(
+            run.cells.len(),
+            2,
+            "same-style Arabic did not shape as one run"
+        );
+    }
+
+    /// A run also stops where the *kind* of shaping changes: a joining script
+    /// is laid out as one contiguous piece and an emoji is projected cluster
+    /// by cluster, so mixing them in one run would apply the wrong rule to
+    /// half of it.
+    #[test]
+    fn a_shaped_run_stops_where_the_shaping_kind_changes() {
+        let renderer = renderer_with(None, &[]);
+        let fonts = &renderer.default_fonts;
+
+        // Arabic followed by an emoji: two runs, not one.
+        let captured = screen_of("\u{0645}\u{1F600}".as_bytes(), 2, 20);
+        let run = renderer.collect_shaped_run(&captured, fonts, 0, 0, 20, None);
+        assert_eq!(run.cells.len(), 1, "an emoji joined an Arabic run");
+
+        // The pieces vt100 splits an emoji sequence into are all emoji, so
+        // they still shape as one run - which is what makes the picture right.
+        let captured = screen_of("\u{1F44D}\u{1F3FD}".as_bytes(), 2, 20);
+        let run = renderer.collect_shaped_run(&captured, fonts, 0, 0, 20, None);
+        assert_eq!(
+            run.cells.len(),
+            2,
+            "a split emoji sequence did not shape as one run"
+        );
+        assert_eq!(run.cols, 4, "the run must own every column vt100 gave it");
+    }
+
+    /// A run stops at a redacted cell, so nothing shaped is ever laid out
+    /// across a redaction block.
+    #[test]
+    fn a_shaped_run_stops_at_a_redaction_boundary() {
+        use crate::redaction::RedactionMap;
+
+        let renderer = renderer_with(None, &[]);
+        let fonts = &renderer.default_fonts;
+        let captured = screen_of("\u{0645}\u{0631}\u{062D}".as_bytes(), 2, 20);
+
+        let mut map = RedactionMap::default();
+        map.add_manual(0, 1, 2, None);
+        let run = renderer.collect_shaped_run(&captured, fonts, 0, 0, 20, Some(&map));
+        assert_eq!(
+            run.cells.len(),
+            1,
+            "the run ran into a redacted cell: {:?}",
+            run.cells
+        );
+    }
+
+    /// Explicit fonts are searched in the order they were configured, and that
+    /// order decides which glyph a shaped run gets. The two fixtures ink
+    /// opposite halves of the cell, so the pixels say which one won.
+    #[test]
+    fn configured_font_order_decides_a_shaped_glyph() {
+        let ka = DEVANAGARI_KA.to_string();
+        for (fallbacks, expect_left) in [([SHAPE_A, SHAPE_B], true), ([SHAPE_B, SHAPE_A], false)] {
+            let renderer = renderer_with(None, &fallbacks);
+            let img = render_line(&renderer, &ka, 6);
+            let cell_w = renderer.default_fonts.cell_width * RENDER_SCALE;
+            let padding = renderer.padding * RENDER_SCALE;
+            let left = ink_in_columns(&img, padding, padding + cell_w / 2);
+            let right = ink_in_columns(&img, padding + cell_w / 2, padding + cell_w);
+            if expect_left {
+                assert!(
+                    left > right,
+                    "{fallbacks:?}: expected the first font's left bar, got left={left} right={right}"
+                );
+            } else {
+                assert!(
+                    right > left,
+                    "{fallbacks:?}: expected the first font's right bar, got left={left} right={right}"
+                );
+            }
+        }
+    }
+
+    /// The families the shaper will try are the configured chain, in order,
+    /// with the embedded font between the explicit faces and the fallbacks.
+    #[test]
+    fn shaped_font_precedence_matches_the_configured_chain() {
+        let renderer = renderer_with(Some(LIMITED_PRIMARY), &[SHAPE_A, SHAPE_B]);
+        assert_eq!(
+            renderer.default_fonts.shaping().families(),
+            vec![
+                "Termshot Test ASCII".to_string(),
+                "JetBrains Mono".to_string(),
+                "Termshot Shape A".to_string(),
+                "Termshot Shape B".to_string(),
+            ]
+        );
+    }
+
+    /// Every face of a font collection is loaded with the index `fontdb`
+    /// discovered, not collapsed onto face 0.
+    #[test]
+    fn font_collection_faces_keep_their_indices() {
+        let renderer = renderer_with(None, &[COLLECTION]);
+        let faces = renderer.default_fonts.shaping().loaded_faces();
+        assert!(
+            faces.contains(&("Termshot Collection Zero".to_string(), 0)),
+            "face 0 missing from {faces:?}"
+        );
+        assert!(
+            faces.contains(&("Termshot Collection One".to_string(), 1)),
+            "face 1 missing from {faces:?}"
+        );
+    }
+
+    /// `fontdue` only ever loads face 0 of a collection, so a character that
+    /// exists only in face 1 proves the shaped path used the right index.
+    #[test]
+    fn a_glyph_only_in_the_second_collection_face_still_renders() {
+        // A primary face whose `.notdef` is empty, so "nothing was drawn"
+        // really means nothing: the embedded JetBrains Mono draws a tofu box
+        // for a character no font covers, exactly as it did in 1.1.5.
+        let renderer = renderer_with(Some(LIMITED_PRIMARY), &[COLLECTION]);
+        assert!(
+            ink(&render_line(&renderer, "\u{E021}", 6)) > 0,
+            "the second collection face was never reached"
+        );
+        assert_eq!(
+            ink(&render_line(&renderer, "\u{E022}", 6)),
+            0,
+            "a code point no configured face covers must stay blank"
+        );
+    }
+
+    /// A cluster that asks for emoji presentation is shaped with a color font
+    /// when one is configured, and its own palette reaches the canvas.
+    #[test]
+    fn emoji_presentation_uses_a_configured_color_font() {
+        let renderer = renderer_with(None, &[COLOR_EMOJI]);
+        assert_eq!(
+            renderer.default_fonts.shaping().emoji_family().as_deref(),
+            Some("Termshot Color Emoji")
+        );
+        let img = render_line(&renderer, "\u{1F600}", 6);
+        let reds = count_near(&img, Rgba([255, 0, 0, 255]));
+        let blues = count_near(&img, Rgba([0, 0, 255, 255]));
+        assert!(
+            reds > 0 && blues > 0,
+            "color layers missing: {reds} red, {blues} blue pixels"
+        );
+    }
+
+    /// Variation selectors decide presentation: `FE0F` asks for the color
+    /// font, `FE0E` keeps the monochrome text glyph.
+    #[test]
+    fn variation_selectors_choose_the_presentation() {
+        // A monochrome font covering U+2764 ahead of the color one, so the
+        // test can tell "text presentation" from "no glyph at all".
+        let renderer = renderer_with(None, &[SHAPE_A, COLOR_EMOJI]);
+
+        let emoji = render_line(&renderer, "\u{2764}\u{FE0F}", 6);
+        assert!(
+            count_near(&emoji, Rgba([255, 0, 0, 255])) > 0
+                && count_near(&emoji, Rgba([0, 0, 255, 255])) > 0,
+            "VS16 did not select the color font"
+        );
+
+        let text = render_line(&renderer, "\u{2764}\u{FE0E}", 6);
+        assert_eq!(
+            count_near(&text, Rgba([0, 0, 255, 255])),
+            0,
+            "VS15 must keep the text presentation, not the color font"
+        );
+        assert!(ink(&text) > 0, "VS15 drew no glyph at all");
+    }
+
+    /// The renderer is shared behind an `Arc` by the MCP server and its tokio
+    /// tasks, so everything the shaped path added has to stay shareable: the
+    /// font system, the swash scaler, and the caches all sit behind one mutex
+    /// that is taken per run, never for a whole image.
+    #[test]
+    fn the_renderer_stays_shareable_across_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Renderer>();
+        assert_send_sync::<ThemeFonts>();
+    }
+
+    /// Pixels within a small distance of `want`, so anti-aliased edges of a
+    /// palette color still count.
+    fn count_near(img: &RgbaImage, want: Rgba<u8>) -> usize {
+        img.pixels()
+            .filter(|p| (0..3).all(|i| (p[i] as i32 - want[i] as i32).abs() <= 40) && p[3] > 200)
+            .count()
     }
 }

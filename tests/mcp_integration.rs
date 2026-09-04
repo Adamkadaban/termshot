@@ -19,6 +19,7 @@ use termshot::server::{
     ComposeScreenshotsParams, ExecuteAndScreenshotParams, ExecuteAndScreenshotRequest,
     RedactScreenshotRequest, RenderAnsiParams, ScreenshotServer,
 };
+use termshot::shaping::ShapingOptions;
 
 /// Base configuration for an isolated server whose screenshots land in
 /// `out_dir`. The scrollback capacity rides in `LoadedConfig`, beside the
@@ -47,12 +48,17 @@ fn base_config(out_dir: &Path) -> LoadedConfig {
 
 /// Build a server from a config, exactly the way `termshot mcp` does: one
 /// renderer that owns a font chain per configured theme.
+///
+/// The one deviation is [`ShapingOptions::deterministic`], which turns off
+/// automatic system font discovery. `termshot mcp` leaves it on, but a test
+/// that let it run would be asserting on whichever fonts the machine running
+/// it happens to have installed - the CJK assertions below in particular.
 fn server_from_config(loaded: LoadedConfig) -> ScreenshotServer {
     let LoadedConfig {
         config,
         max_scrollback_lines,
     } = loaded;
-    let renderer = Renderer::new_with_options(
+    let renderer = Renderer::new_with_shaping(
         &FontSelection {
             global_font: config.font_path.clone(),
             ..FontSelection::default()
@@ -62,6 +68,7 @@ fn server_from_config(loaded: LoadedConfig) -> ScreenshotServer {
         &config.default_theme,
         &config.chrome,
         RendererOptions::default().with_max_scrollback_lines(max_scrollback_lines),
+        ShapingOptions::deterministic(),
     )
     .expect("renderer");
     ScreenshotServer::new(config, renderer)

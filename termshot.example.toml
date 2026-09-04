@@ -105,8 +105,12 @@ palette = [
 # font_bold = "~/.local/share/fonts/MyMono-Bold.otf"
 # Extra faces searched, in order, for characters the fonts above lack. The
 # bundled JetBrains Mono is always tried first (it covers box drawing, arrows,
-# and symbols), so only list what it misses - CJK and Nerd Font glyphs.
-# Color-bitmap emoji fonts are not supported; use outline fonts only.
+# and symbols), so only list what it misses - CJK, Nerd Font glyphs, emoji.
+# Color emoji fonts (COLR, CBDT, sbix) work here, and font collections keep
+# every face they declare. Anything none of these cover is looked up in the
+# fonts installed on the machine; set TERMSHOT_SYSTEM_FONTS=0 to switch that
+# off and keep rendering reproducible across machines.
 # fallback_fonts = [
 #   "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+#   "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
 # ]

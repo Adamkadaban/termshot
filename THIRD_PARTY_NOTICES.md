@@ -42,8 +42,14 @@ rewrites the font's family/full/PostScript name records to `Termshot Test ASCII`
 / `TermshotTestASCII` so the fixture can never be mistaken for, or presented as,
 JetBrains Mono.
 
-`tests/fixtures/cjk-fallback.ttf` is built from scratch by the same script and
-contains no third-party material.
+`tests/fixtures/cjk-fallback.ttf`, `shape-a.ttf`, `shape-b.ttf`,
+`color-emoji.ttf`, and `collection.ttc` are built from scratch by the same
+script - filled rectangles, generated outlines, and generated name tables - and
+contain no third-party material. They are covered by this project's own
+[MIT License](./LICENSE). No real emoji, CJK, or Indic font is redistributed
+here: the Unicode rendering tests deliberately use synthetic faces so they
+assert on the renderer rather than on whatever is installed on the machine
+running them.
 
 ---
 
@@ -64,9 +70,10 @@ patched copy. §4(d) (propagate `NOTICE`) does not apply either: the upstream
 repository and the published `.crate` files contain no `NOTICE` file, so there
 is no notice content to propagate.
 
-`rmcp` and `rmcp-macros` are the only Apache-2.0-**only** crates in the
-dependency graph. Every other Apache-licensed dependency is dual-licensed and is
-taken under MIT.
+`rmcp`, `rmcp-macros`, and `unicode-linebreak` (reached through `cosmic-text`)
+are the only Apache-2.0-**only** crates in the dependency graph, and the same
+license text covers all three. Every other Apache-licensed dependency is
+dual-licensed and is taken under MIT.
 
 ---
 
@@ -116,32 +123,36 @@ shipped verbatim as well:
 | Crate | License | Text |
 |---|---|---|
 | `foldhash` | `Zlib` | [`LICENSES/Zlib.txt`](./LICENSES/Zlib.txt) |
+| `slotmap` | `Zlib` | [`LICENSES/Zlib.txt`](./LICENSES/Zlib.txt) |
 | `unicode-ident` | `(MIT OR Apache-2.0) AND Unicode-3.0` | [`LICENSES/Unicode-3.0.txt`](./LICENSES/Unicode-3.0.txt) — the MIT half is covered by [`LICENSE`](./LICENSE) |
 
 ---
 
 ## 5. Dependency license summary
 
-All 124 non-dev transitive dependencies carry an explicit SPDX `license` field.
-Every expression is permissive and compatible with MIT redistribution. There is
-no GPL, AGPL, LGPL, MPL, CDDL, EPL, or SSPL anywhere in the graph.
+All 152 non-dev transitive dependency crate versions carry an explicit SPDX
+`license` field. Every expression is permissive and compatible with MIT
+redistribution. One crate (`self_cell`) offers a copyleft option alongside a
+permissive one; this project elects the permissive half, and nothing in the
+graph is copyleft-only.
 
 | License expression | Crates |
 |---|---:|
-| `MIT OR Apache-2.0` | 71 |
-| `MIT` | 29 |
-| `Apache-2.0 OR MIT` | 7 |
+| `MIT OR Apache-2.0` | 85 |
+| `MIT` | 32 |
+| `Apache-2.0 OR MIT` | 11 |
 | `Unlicense OR MIT` | 3 |
+| `Zlib OR Apache-2.0 OR MIT` | 3 |
+| `Apache-2.0` | 3 |
+| `Zlib` | 2 |
+| `MIT OR Apache-2.0 OR Zlib` | 2 |
+| `MIT/Apache-2.0` (legacy slash form for `OR`) | 2 |
 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | 2 |
 | `BSD-3-Clause OR Apache-2.0` | 2 |
-| `Apache-2.0` | 2 |
 | `0BSD OR MIT OR Apache-2.0` | 1 |
-| `Zlib OR Apache-2.0 OR MIT` | 1 |
-| `Zlib` | 1 |
-| `MIT OR Apache-2.0 OR Zlib` | 1 |
-| `MIT/Apache-2.0` (legacy slash form for `OR`) | 1 |
 | `MIT OR Zlib OR Apache-2.0` | 1 |
 | `Apache-2.0 OR BSL-1.0` | 1 |
+| `Apache-2.0 OR GPL-2.0-only` | 1 |
 | `(MIT OR Apache-2.0) AND Unicode-3.0` | 1 |
 
 **Dual-license elections made by this project**
@@ -149,13 +160,25 @@ no GPL, AGPL, LGPL, MPL, CDDL, EPL, or SSPL anywhere in the graph.
 | Crate(s) | Expression | Elected |
 |---|---|---|
 | all `MIT OR Apache-2.0` / `Apache-2.0 OR MIT` / `MIT/Apache-2.0` crates | dual | **MIT** |
-| `adler2`, `bytemuck`, `fontdue`, `miniz_oxide` | includes `Zlib`/`0BSD` | **MIT** |
+| `adler2`, `bytemuck`, `fontdue`, `miniz_oxide`, `tinyvec` | includes `Zlib`/`0BSD` | **MIT** |
 | `linux-raw-sys`, `rustix` | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | **MIT** |
 | `moxcms`, `pxfm` | `BSD-3-Clause OR Apache-2.0` | **Apache-2.0** (see [`LICENSES/Apache-2.0.txt`](./LICENSES/Apache-2.0.txt)) |
 | `ryu` | `Apache-2.0 OR BSL-1.0` | **Apache-2.0** |
-| `foldhash` | `Zlib` only | no election — Zlib applies |
+| `self_cell` | `Apache-2.0 OR GPL-2.0-only` | **Apache-2.0** — the GPL option is never exercised |
+| `foldhash`, `slotmap` | `Zlib` only | no election — Zlib applies |
 | `unicode-ident` | `(MIT OR Apache-2.0) AND Unicode-3.0` | **MIT** for the code half; Unicode-3.0 applies to the embedded Unicode data and its notice is shipped |
-| `rmcp`, `rmcp-macros` | `Apache-2.0` only | no election — Apache-2.0 applies |
+| `rmcp`, `rmcp-macros`, `unicode-linebreak` | `Apache-2.0` only | no election — Apache-2.0 applies |
+
+### 5a. Text shaping stack (`cosmic-text`)
+
+Unicode shaping, system font discovery, and color glyph rasterization come from
+`cosmic-text` and the crates it pulls in - `fontdb`, `fontconfig-parser`,
+`harfrust`, `swash`, `skrifa`, `read-fonts`, `font-types`, `zeno`, `yazi`,
+`unicode-bidi`, `unicode-linebreak`, `unicode-script`, `unicode-segmentation`,
+`rangemap`, `slotmap`, `smol_str`, `self_cell`, `linebender_resource_handle`,
+`memmap2`, `roxmltree`, and `rustc-hash`. All are permissive, all are covered by
+the table above, and all are pure Rust: nothing here links Pango, Cairo, or
+FreeType, so the static musl release is unaffected.
 
 The `cargo deny check licenses` allow-list in [`deny.toml`](./deny.toml) encodes
 exactly this set, so an unexpected license entering the graph fails CI.

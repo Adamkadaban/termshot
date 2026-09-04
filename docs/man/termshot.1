@@ -748,6 +748,18 @@ The pre\-rename
 spellings are still read, with a deprecation warning. The default output
 directory is
 .IR /tmp/termshot .
+.PP
+Two further variables control Unicode text shaping. Setting
+.B TERMSHOT_SYSTEM_FONTS
+to
+.I 0
+restricts rendering to the fonts named in the configuration, with no system
+font discovery, so a screenshot reproduces identically on any machine; setting
+.B TERMSHOT_UNICODE_SHAPING
+to
+.I 0
+disables the shaped text path entirely, drawing every cell one Unicode scalar
+at a time.
 .SH EXAMPLES
 Capture a themed test run with GNOME chrome for a blog post:
 .PP

@@ -58,6 +58,24 @@ pty-process = { version = "0.5", features = ["async"] }
 
 # Image rendering
 fontdue = "0.9"
+# Shaped text for the cells `fontdue` cannot draw one scalar at a time:
+# combining marks, joining and reordering scripts, and color emoji.
+#
+# NOTE (dependency policy): this is deliberately the *pure Rust* stack -
+# `fontdb` for system font discovery, `harfrust` for shaping, `swash` for
+# rasterization - so the static musl release keeps building with no Pango,
+# Cairo or FreeType. The default features are exactly that set; `fontdb`'s
+# `fontconfig` support is a Rust parser for `fonts.conf`, not a binding to
+# libfontconfig. `fontdue` stays as the fast, exact path for everything that
+# already rendered correctly, so existing screenshots do not move.
+cosmic-text = "0.19"
+# Locale for cosmic-text's Han unification fallback. Already in the tree via
+# cosmic-text's `std` feature; named directly so the renderer can build a
+# `FontSystem` from its own font database.
+sys-locale = "0.3"
+# Script property lookup, used to decide which cells need a shaper. Already in
+# the tree via cosmic-text.
+unicode-script = "0.5"
 # PNG only: `compose` reads and writes PNG screenshots exclusively, so the
 # default codec set (AVIF/EXR/TIFF/WebP/...) would only widen the parser
 # surface reachable from agent-supplied MCP paths.

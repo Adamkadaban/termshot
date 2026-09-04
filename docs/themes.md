@@ -63,13 +63,15 @@ standard palette colors use their bright variants, as in most terminals.
 
 Paths in `font`, `font_bold`, and `fallback_fonts` expand `~` and resolve
 relative entries against the theme file's directory. An entry that is missing or
-unusable is skipped with a warning. Fonts must contain outline glyphs:
-color-bitmap emoji fonts (Noto Color Emoji, Apple Color Emoji) are not
-supported.
+unusable is skipped with a warning. Font collections (`.ttc`) are supported:
+every face in the collection is available to the shaped text path below, at the
+index the file declares.
 
 ## Glyph fallback
 
-Each character is drawn by the first font in this chain that has a real glyph:
+Ordinary output - ASCII, box drawing, Latin, Greek, Cyrillic, and anything else
+that is correct one character at a time - is drawn by the first font in this
+chain that has a real glyph:
 
 1. the theme's `font` (or `font_bold` for a bold cell),
 2. the bundled JetBrains Mono,
@@ -77,5 +79,42 @@ Each character is drawn by the first font in this chain that has a real glyph:
 
 Step 2 is why a font with no box drawing glyphs still captures `bat`, `btop`, or
 `eza` cleanly. Fallback glyphs are scaled to the primary font's advance, so the
-monospace grid is untouched. Characters no font in the chain covers are drawn as
-`.notdef` boxes; add a covering face to `fallback_fonts`.
+monospace grid is untouched.
+
+Cells that cannot be drawn one character at a time take a second, shaped path:
+combining marks, emoji (including variation selectors, keycaps, skin tones, and
+ZWJ sequences), joining scripts such as Arabic, reordering scripts such as
+Devanagari, and any character no font above covers. Those runs are shaped with
+the same chain in the same order, and only if none of those fonts covers the run
+are the machine's installed fonts searched. A cluster asking for emoji
+presentation prefers a color emoji font, so **color-bitmap and COLR emoji fonts
+are now supported** - configure one in `fallback_fonts` to pin it, or let system
+discovery find the usual ones (Noto Color Emoji, Apple Color Emoji, Segoe UI
+Emoji).
+
+The terminal grid stays in charge either way: shaped glyphs are fitted to the
+cells the terminal allocated and clipped to them, so nothing is drawn across a
+style change or a redaction block. Shaping never invents a substitute glyph
+either - a character it cannot find anywhere falls back to the per-character
+path, which draws the primary font's `.notdef` box as it always did. Add a
+covering face to `fallback_fonts` to fix one for good.
+
+Set `TERMSHOT_SYSTEM_FONTS=0` to keep rendering to the fonts your configuration
+names, which makes screenshots reproducible across machines;
+`TERMSHOT_UNICODE_SHAPING=0` turns the shaped path off completely.
+
+Font files are binary parser inputs. MCP requests cannot provide font paths,
+but an operator-controlled theme, fontconfig file, or system font directory
+can. Hardened multi-user deployments should set `TERMSHOT_SYSTEM_FONTS=0` and
+configure only immutable, deployment-owned font files.
+
+### Known limitation: emoji sequence width
+
+The terminal core stores one Unicode *scalar cluster* per cell, not one
+grapheme cluster, so a ZWJ sequence (`👨‍👩‍👧`) or an emoji plus a skin tone
+modifier (`👍🏽`) is split across several cells and given several cells' worth of
+width. termshot reassembles the sequence and draws the one correct picture at
+the width it actually needs, so the rest of the line is unaffected - but the
+extra columns the terminal reserved are left blank. Flags (`🇺🇸`) come out at the
+right width by accident. Fixing the width properly needs grapheme-cluster
+support in the terminal core.

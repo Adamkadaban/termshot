@@ -26,7 +26,9 @@ termshot exec --chrome gnome --title 'termshot - ls src/' 'ls --color=always -la
 ## Highlights
 
 **Real ANSI rendering** - colors, bold, italic, underline, Unicode, at 2x
-resolution with your own font.
+resolution with your own font. Combining marks, Arabic, Indic scripts, and
+color emoji are shaped with system font fallback; see
+[docs/themes.md](./docs/themes.md#glyph-fallback).
 
 <p align="center">
   <img src="docs/assets/ansi.png" alt="Screenshot of a colorized 'git log --graph --oneline' with orange commit hashes rendered next to the shell prompt" width="700">

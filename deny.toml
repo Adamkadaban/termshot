@@ -25,19 +25,23 @@ ignore = [
     #
     # This is an *unmaintained* notice, not a vulnerability: no defect is
     # known and no fixed release exists to upgrade to. `ttf-parser` reaches
-    # termshot only through `fontdue`, which has no alternative backend, so
-    # the only remedies are (a) waiting for `fontdue` to migrate or (b)
-    # replacing the rasterizer outright with `swash`/`cosmic-text` - a large,
-    # behaviour-changing rewrite of the glyph pipeline for a warning with no
-    # associated exploit.
+    # termshot through `fontdue` (the per-character rasterizer) and through
+    # `fontdb` (font discovery for the shaped text path). `fontdue` has no
+    # alternative backend, so the only remedies are (a) waiting for it to
+    # migrate or (b) moving every glyph onto `swash`/`skrifa`, which would
+    # change the pixels of every existing screenshot - for a warning with no
+    # associated exploit. `fontdb`'s own use is metadata parsing only; the
+    # glyphs on the shaped path are rasterized by `swash`, which is already
+    # `skrifa`-based.
     #
-    # Scope of exposure: `ttf-parser` parses the embedded JetBrains Mono file
-    # and any font the operator points `--font` / `font_path` at. It is never
-    # reachable from captured command output or from MCP tool arguments.
+    # Scope of exposure: `ttf-parser` parses the embedded JetBrains Mono file,
+    # any font the operator points `--font` / `font_path` / `fallback_fonts`
+    # at, and the fonts installed on the machine. It is never reachable from
+    # captured command output or from MCP tool arguments.
     #
     # Review trigger: revisit when `fontdue` ships a release that drops
     # `ttf-parser`, or if this advisory is ever upgraded to a vulnerability.
-    { id = "RUSTSEC-2026-0192", reason = "unmaintained-only notice; no fix exists upstream and `fontdue` has no alternative backend. Fonts are operator-supplied, never agent- or output-supplied." },
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained-only notice; no fix exists upstream and `fontdue` has no alternative backend. Fonts are operator- or system-supplied, never agent- or output-supplied." },
 ]
 
 [licenses]

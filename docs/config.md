@@ -91,6 +91,13 @@ keep_prefix = 4
 override the matching config keys. The pre-rename `SCREENSHOT_MCP_*` spellings
 are still read with a deprecation warning.
 
+Two more control text shaping (see [themes.md](./themes.md#glyph-fallback)):
+
+| Variable | Default | Effect when set to `0` |
+| --- | --- | --- |
+| `TERMSHOT_SYSTEM_FONTS` | on | Only fonts named in the configuration are used - no system font discovery - so the same input renders identically on any machine. |
+| `TERMSHOT_UNICODE_SHAPING` | on | Turns the shaped text path off entirely: every cell is drawn one Unicode scalar at a time, as in 1.1.5. |
+
 ## Output filenames
 
 On the CLI, `-o` sets the path; over MCP, `output_name` takes a short slug such
