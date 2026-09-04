@@ -2169,10 +2169,12 @@ impl Renderer {
     /// A run stops at the first cell that is redacted, styled differently,
     /// does not need shaping at all, or belongs to a different shaping class
     /// (emoji against text, a joining or reordering script against everything
-    /// else). That is what keeps a ligature or an overhanging mark from
-    /// crossing a redaction block or a color change: the shaper never sees the
-    /// two sides of such a boundary as one piece of text, and the run's glyphs
-    /// are clipped to the run's own columns.
+    /// else). Spaces inside a contiguous script phrase are retained when the
+    /// same shaping class resumes afterward; splitting Arabic at each space
+    /// would reverse its word order by laying out each word independently.
+    /// These boundaries keep a ligature or an overhanging mark from crossing a
+    /// redaction block or a color change: the shaper never sees the two sides
+    /// as one piece of text, and the run's glyphs are clipped to its columns.
     fn collect_shaped_run(
         &self,
         screen: &CapturedScreen,
@@ -2207,6 +2209,26 @@ impl Renderer {
                 Some(_) => break,
             }
             if !self.cell_needs_shaping(fonts, cell) {
+                let bridges_contiguous_phrase = class == Some((false, true))
+                    && cell.contents() == " "
+                    && self.contiguous_shaping_resumes(
+                        screen,
+                        fonts,
+                        row,
+                        at + span,
+                        content_cols,
+                        redaction,
+                        cell_style,
+                    );
+                if bridges_contiguous_phrase {
+                    cells.push(RunCell {
+                        text: cell.contents().to_string(),
+                        cols: span,
+                    });
+                    cols += span;
+                    at += span;
+                    continue;
+                }
                 break;
             }
             let contents = cell.contents();
@@ -2227,6 +2249,47 @@ impl Renderer {
             at += span;
         }
         ShapedRunSpan { cells, cols }
+    }
+
+    /// Whether a sequence of same-style spaces is followed by another cell in
+    /// the current contiguous shaping class without crossing a redaction.
+    #[allow(clippy::too_many_arguments)]
+    fn contiguous_shaping_resumes(
+        &self,
+        screen: &CapturedScreen,
+        fonts: &ThemeFonts,
+        row: u32,
+        mut at: u32,
+        content_cols: u32,
+        redaction: Option<&RedactionMap>,
+        style: CellStyle,
+    ) -> bool {
+        while at < content_cols {
+            let Some(cell) = screen.cell(row as u16, at as u16) else {
+                return false;
+            };
+            let span = if cell.is_wide() && at + 1 < content_cols {
+                2
+            } else {
+                1
+            };
+            if (0..span).any(|offset| {
+                redaction
+                    .and_then(|map| map.get(row as u16, (at + offset) as u16))
+                    .is_some()
+            }) || CellStyle::of(cell) != style
+            {
+                return false;
+            }
+            if cell.contents() == " " {
+                at += span;
+                continue;
+            }
+            return self.cell_needs_shaping(fonts, cell)
+                && !unicode::cluster_is_emoji(cell.contents())
+                && unicode::cluster_forces_contiguous_run(cell.contents());
+        }
+        false
     }
 
     /// Draw a run of cells through the shaper.
@@ -6303,6 +6366,47 @@ mod tests {
             run.cells.len(),
             2,
             "same-style Arabic did not shape as one run"
+        );
+    }
+
+    /// Spaces between words stay inside a contiguous RTL run so the bidi
+    /// shaper sees the phrase as a phrase rather than independently reversing
+    /// and anchoring each word.
+    #[test]
+    fn an_arabic_phrase_shapes_across_its_space() {
+        let renderer = renderer_with(None, &[]);
+        let fonts = &renderer.default_fonts;
+        let phrase = "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} \
+                      \u{0628}\u{0627}\u{0644}\u{0639}\u{0627}\u{0644}\u{0645}";
+        let captured = screen_of(phrase.as_bytes(), 2, 30);
+        let run = renderer.collect_shaped_run(&captured, fonts, 0, 0, 30, None);
+        assert_eq!(
+            run.cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>(),
+            phrase
+        );
+        assert_eq!(run.cols, phrase.chars().count() as u32);
+    }
+
+    #[test]
+    fn a_supported_width_arabic_phrase_stays_in_one_run() {
+        let renderer = renderer_with(None, &[]);
+        let fonts = &renderer.default_fonts;
+        let phrase = "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627} ".repeat(80);
+        let captured = screen_of(phrase.as_bytes(), 2, 500);
+        let run = renderer.collect_shaped_run(&captured, fonts, 0, 0, 500, None);
+        assert!(
+            run.cols > 256 && run.cols <= 500,
+            "fixture must cross the ordinary shaping limit"
+        );
+        assert_eq!(
+            run.cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>(),
+            phrase.trim_end()
         );
     }
 

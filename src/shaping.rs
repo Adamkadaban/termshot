@@ -76,6 +76,25 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// shaping work and the size of a shape-cache key.
 const MAX_RUN_CELLS: usize = 256;
 
+/// Largest contiguous joining/reordering run shaped as one piece.
+///
+/// The CLI and MCP interfaces cap terminal width at 500 columns. Keeping one
+/// such row intact is necessary for paragraph-level RTL word order; splitting
+/// it into independently right-aligned chunks would reverse the chunks. The
+/// separate ordinary-run limit above remains smaller.
+const MAX_CONTIGUOUS_RUN_CELLS: usize = 512;
+
+fn run_chunk_limit(cells: &[RunCell]) -> usize {
+    if cells
+        .iter()
+        .any(|cell| unicode::cluster_forces_contiguous_run(&cell.text))
+    {
+        MAX_CONTIGUOUS_RUN_CELLS
+    } else {
+        MAX_RUN_CELLS
+    }
+}
+
 /// Largest glyph bitmap, in pixels, that will be kept and drawn. A broken or
 /// hostile font can report an enormous bitmap for one glyph; past this it is
 /// dropped rather than allocated.
@@ -547,7 +566,8 @@ impl ShapingState {
     fn place_run(&mut self, request: &RunRequest<'_>) -> Vec<PlacedGlyph> {
         let mut placed = Vec::new();
         let mut origin_cols = 0u32;
-        for chunk in request.cells.chunks(MAX_RUN_CELLS) {
+        let chunk_cells = run_chunk_limit(request.cells);
+        for chunk in request.cells.chunks(chunk_cells) {
             let chunk_request = RunRequest {
                 cells: chunk,
                 ..request.clone()
@@ -1002,6 +1022,26 @@ mod tests {
         assert!(!glyph_cache_full(0, 0));
         assert!(glyph_cache_full(MAX_GLYPH_CACHE_ENTRIES, 0));
         assert!(glyph_cache_full(0, MAX_GLYPH_CACHE_BYTES));
+    }
+
+    #[test]
+    fn supported_width_contiguous_runs_are_never_split() {
+        let arabic = vec![
+            RunCell {
+                text: "\u{0645}".to_string(),
+                cols: 1,
+            };
+            500
+        ];
+        let emoji = vec![
+            RunCell {
+                text: "\u{1F600}".to_string(),
+                cols: 2,
+            };
+            500
+        ];
+        assert_eq!(run_chunk_limit(&arabic), 512);
+        assert_eq!(run_chunk_limit(&emoji), 256);
     }
 
     #[test]
