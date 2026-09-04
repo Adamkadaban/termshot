@@ -26,26 +26,14 @@ termshot exec --chrome gnome --title 'termshot - ls src/' 'ls --color=always -la
 ## Highlights
 
 **Real ANSI rendering** - colors, bold, italic, underline, Unicode, at 2x
-resolution with your own font. Combining marks, Arabic, Indic scripts, and
-color emoji are shaped with system font fallback; see
-[docs/themes.md](./docs/themes.md#glyph-fallback).
+resolution with your own font.
 
 <p align="center">
-  <img src="docs/assets/ansi.png" alt="A macOS-framed terminal screenshot titled 'Unicode + ANSI' with rows demonstrating bold, italic, underline, 24-bit color, color emoji and emoji sequences, attached combining marks, CJK, correctly ordered Arabic, Devanagari, and Bengali text" width="700">
+  <img src="docs/assets/ansi.png" alt="Screenshot of a colorized 'git log --graph --oneline' with orange commit hashes rendered next to the shell prompt" width="700">
 </p>
 
-```bash
-printf '%b' \
-  '\e[38;2;137;180;250mANSI styles\e[0m   \e[1mbold\e[0m  \e[3mitalic\e[0m  \e[4munderline\e[0m  \e[38;2;255;121;198m24-bit color\e[0m\n' \
-  '\e[38;2;137;180;250mColor emoji\e[0m   😀 🚀 🔥 ❤️\n' \
-  '\e[38;2;137;180;250mSequences\e[0m     👍🏽 👩‍💻 🏳️‍🌈 🇺🇸 1️⃣\n' \
-  '\e[38;2;137;180;250mCombining\e[0m     cafe\u0301  A\u030Angstro\u0308m  man\u0303ana\n' \
-  '\e[38;2;137;180;250mCJK\e[0m           日本語  ·  中文  ·  한글\n' \
-  '\e[38;2;137;180;250mArabic\e[0m        مرحبا بالعالم\n' \
-  '\e[38;2;137;180;250mDevanagari\e[0m    नमस्ते दुनिया\n' \
-  '\e[38;2;137;180;250mBengali\e[0m       নমস্কার বিশ্ব\n' |
-  termshot render - --theme dark --chrome macos --title 'Unicode + ANSI' \
-    --cols 76 --rows 10
+```sh
+termshot exec 'git log --graph --oneline --color=always -n 6'
 ```
 
 **Redaction** - opt-in masking of secrets in the image; the text returned to
