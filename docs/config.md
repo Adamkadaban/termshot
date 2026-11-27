@@ -11,6 +11,7 @@ not overwrite your settings.
 | Key | Default | Description |
 | --- | --- | --- |
 | `output_dir` | `/tmp/termshot` | Directory where screenshots are written. |
+| `backend` | `builtin` | Renderer: `builtin` or experimental Linux `vte`. See [backends.md](./backends.md) for native dependencies and limits. |
 | `font_size` | `16.0` | Text size in pixels. |
 | `cols` | `120` | Default terminal width in columns. |
 | `rows` | `40` | Default terminal viewport height in rows. |
@@ -29,6 +30,10 @@ either warns rather than truncating silently. Use `--head-lines N` /
 `--tail-lines N` (`head_lines` / `tail_lines` over MCP, mutually exclusive) to
 render one end only. Full-screen programs such as `vim` and `htop` repaint the
 viewport, so only their active screen is captured.
+
+These scrollback and line-selection behaviors describe `builtin`. The
+experimental VTE backend captures only the current viewport and rejects
+head/tail selections and redaction.
 
 ## `[chrome]`
 
@@ -87,11 +92,13 @@ keep_prefix = 4
 
 `TERMSHOT_OUTPUT_DIR`, `TERMSHOT_FONT_PATH`, `TERMSHOT_FONT_SIZE`,
 `TERMSHOT_COLS`, `TERMSHOT_ROWS`, `TERMSHOT_MAX_SCROLLBACK_LINES`,
-`TERMSHOT_TIMEOUT`, `TERMSHOT_SHELL`, `TERMSHOT_THEME`, and `TERMSHOT_CHROME`
+`TERMSHOT_TIMEOUT`, `TERMSHOT_SHELL`, `TERMSHOT_THEME`, `TERMSHOT_CHROME`, and
+`TERMSHOT_BACKEND`
 override the matching config keys. The pre-rename `SCREENSHOT_MCP_*` spellings
 are still read with a deprecation warning.
 
-Two more control text shaping (see [themes.md](./themes.md#glyph-fallback)):
+Two more control text shaping in the built-in backend
+(see [themes.md](./themes.md#glyph-fallback)):
 
 | Variable | Default | Effect when set to `0` |
 | --- | --- | --- |

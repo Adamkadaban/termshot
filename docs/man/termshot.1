@@ -73,6 +73,13 @@ programmatically.
 .SH GLOBAL OPTIONS
 These options are accepted before or after any subcommand.
 .TP
+.BI \-\-backend " NAME"
+Rendering backend: \fBbuiltin\fR (default) or experimental \fBvte\fR.
+VTE requires Linux, system Python/PyGObject, GTK4/VTE, and a display
+(or \fBxvfb\-run\fR). It captures only the current viewport, returns plain
+visible text, and rejects redaction and head/tail selections. No fallback
+occurs if the native runtime is unavailable.
+.TP
 .BI \-\-config " PATH"
 Path to the configuration file. Defaults to
 .IR ~/.config/termshot/config.toml .
@@ -741,6 +748,7 @@ Several settings can also be overridden by environment variables:
 .BR TERMSHOT_TIMEOUT ,
 .BR TERMSHOT_SHELL ,
 .BR TERMSHOT_THEME ,
+.BR TERMSHOT_BACKEND ,
 and
 .BR TERMSHOT_CHROME .
 The pre\-rename

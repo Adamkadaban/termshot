@@ -50,6 +50,38 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
+  vte:
+    name: experimental VTE
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GTK_A11Y: none
+      GSK_RENDERER: cairo
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: vte
+
+      - name: Install optional native runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 python3-gi gir1.2-gtk-4.0 gir1.2-vte-3.91 fontconfig xvfb xauth
+
+      - name: Native CLI and MCP regression tests
+        run: xvfb-run -a cargo test --locked --test vte_backend -- --include-ignored --test-threads=1
+
   # Advisory and license gate. Kept in its own job so a new RustSec advisory
   # never blocks the compile/test signal, and Linux-only because the resolved
   # graph `cargo deny` inspects is target-independent here.

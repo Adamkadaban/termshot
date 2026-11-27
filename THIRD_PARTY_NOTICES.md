@@ -182,3 +182,19 @@ FreeType, so the static musl release is unaffected.
 
 The `cargo deny check licenses` allow-list in [`deny.toml`](./deny.toml) encodes
 exactly this set, so an unexpected license entering the graph fails CI.
+
+## 6. Optional native VTE runtime
+
+The experimental `--backend vte` runs termshot's own Python helper against
+separately installed system libraries. GTK4 is LGPL-2.1-or-later and VTE is
+LGPL-3.0-or-later. PyGObject, Pango, Cairo, Fontconfig, and their dependencies
+are also supplied by the operating system under their respective licenses.
+See [GTK](https://www.gtk.org/docs/),
+[VTE](https://gitlab.gnome.org/GNOME/vte), and your distribution's package
+copyright files for the exact versions and notices.
+
+No GTK/VTE source or native libraries are copied into this repository, added
+to its Cargo dependency graph, or bundled in termshot releases. This optional
+system runtime is separate from the permissive Rust dependency elections
+above; termshot's own code remains MIT licensed. Redistributors bundling the
+native runtime must also satisfy those libraries' licenses.

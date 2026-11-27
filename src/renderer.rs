@@ -1,3 +1,4 @@
+use crate::backend::{Backend, NativeCapture, VteRequest, render_vte};
 use crate::capture::{
     CapturedScreen, DEFAULT_MAX_SCROLLBACK_LINES, LineSelection, cell_has_content,
     effective_scrollback_lines,
@@ -876,6 +877,7 @@ fn description_text_chunk(text: &str) -> String {
 /// constructed and shared (behind an `Arc`) by every theme that resolves to the
 /// same files, so no font is ever parsed per screenshot - let alone per cell.
 pub struct ThemeFonts {
+    spec: FontChainSpec,
     font: Font,
     font_bold: Option<Font>,
     /// Fonts searched, in order, for characters the primary face does not
@@ -984,6 +986,7 @@ impl ThemeFonts {
         let cell_height = font_line_height(&font, font_size).ceil() as u32;
 
         Ok(Self {
+            spec: spec.clone(),
             font,
             font_bold,
             fallback_fonts,
@@ -1203,8 +1206,9 @@ impl<'a> ExtendedRenderOptions<'a> {
     }
 }
 
-/// Renders a vt100 screen buffer to a PNG image.
+/// Renders terminal bytes to PNG with the built-in or optional native backend.
 pub struct Renderer {
+    backend: Backend,
     /// Font chain per theme name, so a screenshot rendered with theme `x`
     /// always uses `x`'s primary, bold, and fallback fonts. Built once at
     /// construction; themes with identical font files share one entry.
@@ -1338,6 +1342,7 @@ impl Renderer {
         }
 
         Ok(Self {
+            backend: Backend::Builtin,
             theme_fonts,
             default_fonts,
             font_size,
@@ -1347,6 +1352,21 @@ impl Renderer {
             padding: 16,
             max_scrollback_lines: options.max_scrollback_lines,
         })
+    }
+
+    /// Select the byte-to-PNG backend. Cell-inspection APIs remain built-in only.
+    pub fn with_backend(mut self, backend: Backend) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    pub fn check_backend(&self, lines: LineSelection, redaction: bool) -> Result<()> {
+        self.backend.validate(lines, redaction)?;
+        self.backend.check()
     }
 
     /// Resolve a requested theme name to one that exists, falling back to the
@@ -1505,6 +1525,36 @@ impl Renderer {
         options: ExtendedRenderOptions<'_>,
     ) -> Result<RenderOutputWithContext> {
         let lines = options.base.lines;
+        self.backend.validate(
+            lines,
+            redaction.is_some()
+                || options.manual.is_some_and(|manual| !manual.is_empty())
+                || text.redact_text,
+        )?;
+        if self.backend == Backend::Vte {
+            let (image, visible_text, truncated) =
+                self.render_vte_image(data, cols, rows, theme_name, chrome, auto_crop)?;
+            let base = sanitize_base_name(output_name.unwrap_or(""));
+            let path = unique_png_path(output_dir, &base);
+            save_png(
+                &image,
+                &path,
+                text.embed_description.then_some(visible_text.as_str()),
+            )?;
+            let context = RenderContext {
+                meta: RenderMeta {
+                    cols,
+                    rows,
+                    theme: theme_name.map(str::to_owned),
+                    chrome: Some(chrome.unwrap_or(&self.default_chrome).clone()),
+                    auto_crop,
+                    from_screen: true,
+                },
+                lines,
+                truncated,
+            };
+            return Ok((path, visible_text, Vec::new(), context));
+        }
         let capture = self.capture(data, rows, cols, lines);
         let screen = &capture;
         if capture.truncated() {
@@ -1595,9 +1645,92 @@ impl Renderer {
         Ok((path, plain_text, audit, context))
     }
 
-    /// Capture the terminal session in `data` exactly the way
+    #[allow(clippy::too_many_arguments)]
+    fn render_vte_image(
+        &self,
+        data: &[u8],
+        cols: u16,
+        rows: u16,
+        theme_name: Option<&str>,
+        chrome: Option<&ChromeOptions>,
+        auto_crop: bool,
+    ) -> Result<(RgbaImage, String, bool)> {
+        let theme = self.get_theme(theme_name);
+        let fonts = self.fonts_for(theme_name);
+        let normalized = normalize_newlines(data);
+        let NativeCapture {
+            image: source,
+            cell_width,
+            cell_height,
+            text,
+            truncated,
+        } = render_vte(&VteRequest {
+            data: &normalized,
+            cols,
+            rows,
+            font_size: self.font_size,
+            font: fonts.spec.primary.as_deref(),
+            font_bold: fonts.spec.bold.as_deref(),
+            fallback_fonts: &fonts.spec.fallbacks,
+            embedded_font: EMBEDDED_FONT,
+            foreground: theme.foreground.0,
+            background: theme.background.0,
+            palette: theme.palette.map(|color| color.0),
+            scale: RENDER_SCALE,
+        })?;
+        let mut right = cell_width.min(source.width());
+        let mut bottom = cell_height.min(source.height());
+        for (x, y, pixel) in source.enumerate_pixels() {
+            if pixel != &theme.background {
+                right = right.max(x + 1);
+                bottom = bottom.max(y + 1);
+            }
+        }
+        let content_width = if auto_crop {
+            (right.div_ceil(cell_width) * cell_width).min(source.width())
+        } else {
+            source.width()
+        };
+        let content_height = (bottom.div_ceil(cell_height) * cell_height).min(source.height());
+        let padding = self.padding * RENDER_SCALE;
+        let width = content_width + padding * 2;
+        let height = content_height + padding * 2;
+        let chrome = chrome.unwrap_or(&self.default_chrome);
+        let (budget_width, budget_height, layers) = if chrome.enabled {
+            let metrics = ChromeMetrics::new(chrome, width, height, self.timestamp_reserve(fonts));
+            (
+                metrics.width,
+                metrics.height,
+                if chrome.shadow { 3 } else { 2 },
+            )
+        } else {
+            (width, height, 2)
+        };
+        if let Some(reason) = image_budget_reason(budget_width, budget_height, layers) {
+            anyhow::bail!(
+                "the VTE capture would render as {budget_width}x{budget_height} px, \
+                 needing {reason}; use fewer rows/columns or a smaller font"
+            );
+        }
+        let mut image = RgbaImage::from_pixel(width, height, theme.background);
+        for y in 0..content_height {
+            for x in 0..content_width {
+                image.put_pixel(x + padding, y + padding, *source.get_pixel(x, y));
+            }
+        }
+        drop(source);
+        if chrome.enabled {
+            image = self.compose_with_chrome(image, theme, fonts, chrome);
+        } else if chrome.rounded {
+            self.round_image_corners(&mut image, chrome.radius * RENDER_SCALE);
+        }
+        Ok((image, text, truncated))
+    }
+
+    /// Capture the terminal session in `data` with the built-in backend, exactly the way
     /// [`render_bytes_with_options`] does, so a redaction map built from the
     /// returned capture addresses the same cells the renderer will draw.
+    /// This cell-inspection API does not apply to native VTE captures.
     ///
     /// [`render_bytes_with_options`]: Self::render_bytes_with_options
     pub fn capture(
@@ -1709,6 +1842,7 @@ impl Renderer {
         out_path: &Path,
         text: TextOptions,
     ) -> Result<(String, Vec<(String, usize)>)> {
+        self.backend.validate(LineSelection::All, true)?;
         let meta = &context.meta;
         let capture = self.capture_for(data, context);
         let screen = &capture;
@@ -3629,6 +3763,21 @@ fn check_render_budget(
     layers: u64,
     screen: &CapturedScreen,
 ) -> Result<()> {
+    let Some(reason) = image_budget_reason(width, height, layers) else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "the capture would render as a {}x{} px image, needing {}: it holds {} lines of \
+         output. Narrow it with --head-lines/--tail-lines (head_lines/tail_lines over MCP), \
+         or use fewer columns.",
+        width,
+        height,
+        reason,
+        screen.size().0
+    );
+}
+
+fn image_budget_reason(width: u32, height: u32, layers: u64) -> Option<String> {
     let pixels = u64::from(width) * u64::from(height);
     let bytes = pixels * BYTES_PER_PIXEL * layers;
     let reason = if pixels > MAX_IMAGE_PIXELS {
@@ -3644,17 +3793,9 @@ fn check_render_budget(
             MAX_RENDER_BYTES / (1024 * 1024)
         )
     } else {
-        return Ok(());
+        return None;
     };
-    anyhow::bail!(
-        "the capture would render as a {}x{} px image, needing {}: it holds {} lines of \
-         output. Narrow it with --head-lines/--tail-lines (head_lines/tail_lines over MCP), \
-         or use fewer columns.",
-        width,
-        height,
-        reason,
-        screen.size().0
-    );
+    Some(reason)
 }
 
 #[cfg(test)]
@@ -4307,6 +4448,11 @@ mod tests {
     /// single font chain of the test renderers below.
     fn test_fonts() -> ThemeFonts {
         ThemeFonts {
+            spec: FontChainSpec {
+                primary: None,
+                bold: None,
+                fallbacks: Vec::new(),
+            },
             font: Font::from_bytes(
                 std::fs::read("fonts/JetBrainsMono-Regular.ttf").expect("font present"),
                 FontSettings::default(),
@@ -4328,6 +4474,7 @@ mod tests {
     /// A renderer with one font chain and the given chrome defaults.
     fn renderer_with_chrome(default_chrome: ChromeOptions) -> Renderer {
         Renderer {
+            backend: Backend::Builtin,
             theme_fonts: HashMap::new(),
             default_fonts: Arc::new(test_fonts()),
             font_size: 16.0,

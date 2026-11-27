@@ -1,3 +1,4 @@
+use crate::backend::{Backend, VTE_VIEWPORT_NOTICE};
 use crate::capture::LineSelection;
 use crate::config::Config;
 use crate::executor;
@@ -706,6 +707,25 @@ impl ScreenshotServer {
         }
     }
 
+    fn check_backend(&self, lines: LineSelection, redaction: bool) -> Result<(), McpError> {
+        self.renderer
+            .backend()
+            .validate(lines, redaction)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        self.renderer
+            .backend()
+            .check()
+            .map_err(|error| McpError::internal_error(error.to_string(), None))
+    }
+
+    fn capture_notice(&self, rows: u16, cols: u16) -> String {
+        if self.renderer.backend() == Backend::Vte {
+            VTE_VIEWPORT_NOTICE.to_string()
+        } else {
+            truncation_notice(self.renderer.effective_scrollback_lines(rows, cols))
+        }
+    }
+
     /// Remember a rendered screenshot's source bytes + metadata in memory so it
     /// can later be re-rendered by `redact_screenshot`.
     ///
@@ -714,6 +734,9 @@ impl ScreenshotServer {
     /// [`MAX_CACHE_ENTRIES`] or [`MAX_CACHE_BYTES`] is exceeded, rather than
     /// keeping every capture for the lifetime of the process.
     fn remember_render(&self, path: &Path, data: &[u8], context: RenderContext) {
+        if self.renderer.backend() == Backend::Vte {
+            return;
+        }
         let mut cache = match self.render_cache.lock() {
             Ok(cache) => cache,
             Err(_) => {
@@ -857,6 +880,18 @@ impl ScreenshotServer {
         // invalid regex, color, or coordinate range fails without having
         // executed anything - exactly as the CLI's `--redaction` does.
         let manual = manual_redactions(params.redactions.as_deref(), params.redact, show_labels)?;
+        let redaction_engine =
+            self.resolve_redaction(params.redact, params.redaction_rules.as_ref(), show_labels)?;
+        let redaction_request = redaction_engine.as_ref().map(|engine| RedactionRequest {
+            engine,
+            rules: params.redaction_rules.clone(),
+        });
+        self.check_backend(
+            lines,
+            redaction_request.is_some()
+                || manual.as_ref().is_some_and(|manual| !manual.is_empty())
+                || params.redact_text.unwrap_or(false),
+        )?;
         let show_prompt = params.show_prompt.unwrap_or(true);
         let commands = request_commands(params.command, params.commands)?;
         let working_dir = params
@@ -905,15 +940,6 @@ impl ScreenshotServer {
         })?;
 
         let theme_name = params.theme.as_deref();
-
-        // Resolve redaction: an explicit `redact` flag (or a rules list) wins;
-        // otherwise fall back to the server's auto-redaction config.
-        let redaction_engine =
-            self.resolve_redaction(params.redact, params.redaction_rules.as_ref(), show_labels)?;
-        let redaction_request = redaction_engine.as_ref().map(|engine| RedactionRequest {
-            engine,
-            rules: params.redaction_rules.clone(),
-        });
 
         let text_options = TextOptions {
             strip_ansi: params.strip_ansi.unwrap_or(false),
@@ -982,9 +1008,7 @@ impl ScreenshotServer {
             content.push(ContentBlock::text(format!("Redacted: {}", summary)));
         }
         if truncated {
-            content.push(ContentBlock::text(truncation_notice(
-                self.renderer.effective_scrollback_lines(rows, cols),
-            )));
+            content.push(ContentBlock::text(self.capture_notice(rows, cols)));
         }
         content.push(ContentBlock::text(format!(
             "--- Terminal Output ---\n{}",
@@ -1019,6 +1043,18 @@ impl ScreenshotServer {
         // invalid regex, color, or coordinate range fails up front - exactly
         // as the CLI's `--redaction` does.
         let manual = manual_redactions(params.redactions.as_deref(), params.redact, show_labels)?;
+        let redaction_engine =
+            self.resolve_redaction(params.redact, params.redaction_rules.as_ref(), show_labels)?;
+        let redaction_request = redaction_engine.as_ref().map(|engine| RedactionRequest {
+            engine,
+            rules: params.redaction_rules.clone(),
+        });
+        self.check_backend(
+            lines,
+            redaction_request.is_some()
+                || manual.as_ref().is_some_and(|manual| !manual.is_empty())
+                || params.redact_text.unwrap_or(false),
+        )?;
         let theme_name = params.theme.as_deref();
         let chrome_options = chrome_options_from_params(
             &self.config,
@@ -1041,16 +1077,6 @@ impl ScreenshotServer {
             std::path::Path::new(&params.input_path)
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
-        });
-
-        // Rendering a captured log honors the same redaction policy as
-        // execution: this is exactly the case where the caller has not read
-        // the content first.
-        let redaction_engine =
-            self.resolve_redaction(params.redact, params.redaction_rules.as_ref(), show_labels)?;
-        let redaction_request = redaction_engine.as_ref().map(|engine| RedactionRequest {
-            engine,
-            rules: params.redaction_rules.clone(),
         });
 
         let (image_path, plain_text, redactions, context) = self
@@ -1096,9 +1122,7 @@ impl ScreenshotServer {
             content.push(ContentBlock::text(format!("Redacted: {}", summary)));
         }
         if truncated {
-            content.push(ContentBlock::text(truncation_notice(
-                self.renderer.effective_scrollback_lines(rows, cols),
-            )));
+            content.push(ContentBlock::text(self.capture_notice(rows, cols)));
         }
         content.push(ContentBlock::text(format!(
             "--- Terminal Output ---\n{}",
@@ -1179,6 +1203,10 @@ impl ScreenshotServer {
         &self,
         params: RedactScreenshotRequest,
     ) -> Result<CallToolResult, McpError> {
+        self.renderer
+            .backend()
+            .validate(LineSelection::All, true)
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         let png_path = std::path::PathBuf::from(&params.screenshot_path);
         let key = cache_key(&png_path);
 
@@ -1325,10 +1353,24 @@ impl ScreenshotServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ScreenshotServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::from_build_env())
-            .with_instructions(
-                "Terminal screenshot MCP server. Use execute_and_screenshot to run \
+        let info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::from_build_env());
+        if self.renderer.backend() == Backend::Vte {
+            return info.with_instructions(
+                "Terminal screenshot MCP server using the experimental native VTE backend. \
+                 Use execute_and_screenshot to run commands, or render_ansi to replay a file. \
+                 Only the final visible viewport is captured: cols/rows limit the image, \
+                 and returned text and PNG Description contain plain visible text only. \
+                 The user's real shell prompt is shown unless show_prompt is false; the \
+                 final prompt is removed automatically. Use cwd for directory context. \
+                 Never print or synthesize a prompt in the command. Redaction (including \
+                 redact_screenshot) and head_lines/tail_lines are unsupported and rejected \
+                 before command execution. Use a server configured with --backend builtin \
+                 when redaction or scrollback is required. compose_screenshots remains available.",
+            );
+        }
+        info.with_instructions(
+            "Terminal screenshot MCP server. Use execute_and_screenshot to run \
                  commands and capture PNG screenshots of the terminal output, including \
                  the user's real shell prompt before each command, colors, and full ANSI \
                  rendering; the final prompt is removed automatically. Set its \
@@ -1342,7 +1384,7 @@ impl ServerHandler for ScreenshotServer {
                  coordinates (run execute_and_screenshot first without redaction, inspect \
                  the plain text, then redact what is sensitive). Use compose_screenshots \
                  to place two or more screenshots side by side or stacked into one image.",
-            )
+        )
     }
 }
 

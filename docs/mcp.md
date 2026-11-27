@@ -20,6 +20,12 @@ server too: `--config <path>` selects a `config.toml` ([config.md](./config.md))
 and `--rules-path <dir>` loads extra redaction rules
 ([redaction.md](./redaction.md)).
 
+For the experimental native Linux renderer, use
+`"args": ["--backend", "vte", "mcp"]`. It captures only the current viewport,
+returns plain visible text, and rejects redaction and head/tail selections.
+The tools below otherwise describe the default built-in backend.
+See [backends.md](./backends.md) for dependencies and headless setup.
+
 ## Tools
 
 | Tool | Purpose |

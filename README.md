@@ -125,6 +125,7 @@ Prebuilt binaries, packages, and source builds: [docs/install.md](./docs/install
 - [docs/themes.md](./docs/themes.md) - built-in and user themes, fonts, fallback
 - [docs/redaction.md](./docs/redaction.md) - rules, custom rules, partial redaction
 - [docs/config.md](./docs/config.md) - `config.toml` reference
+- [docs/backends.md](./docs/backends.md) - experimental native VTE rendering
 - [docs/man/termshot.1](./docs/man/termshot.1) - full CLI reference
 
 ## License

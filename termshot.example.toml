@@ -1,10 +1,14 @@
 output_dir = "/tmp/termshot"
+# Optional native Linux renderer: "vte". See docs/backends.md for requirements
+# and viewport-only limitations. The default needs no GTK/VTE runtime.
+backend = "builtin"
 font_size = 16.0
 cols = 120
 # The terminal viewport a command runs in: `rows` decides where long lines wrap,
 # not how much of the output the screenshot shows. Everything that scrolls off
 # the top is kept and rendered, up to `max_scrollback_lines`. Use
-# --head-lines/--tail-lines to render only one end.
+# --head-lines/--tail-lines to render only one end. With backend = "vte", only
+# the current viewport is rendered and head/tail selections are unsupported.
 rows = 40
 max_scrollback_lines = 10000
 timeout_secs = 30

@@ -2,6 +2,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Duration;
+use termshot::backend::{Backend, VTE_VIEWPORT_NOTICE};
 use termshot::capture::LineSelection;
 use termshot::config::Config;
 use termshot::redaction::{
@@ -32,6 +33,10 @@ struct Cli {
     /// load in addition to the built-in and config rules.
     #[arg(long, global = true)]
     rules_path: Option<String>,
+
+    /// Renderer: builtin, or experimental vte (Linux with GTK4/VTE installed).
+    #[arg(long, global = true, value_enum)]
+    backend: Option<Backend>,
 }
 
 #[derive(Subcommand)]
@@ -346,7 +351,9 @@ async fn main() -> anyhow::Result<()> {
 
     // `Config` is frozen at its 1.0.0 shape, so the scrollback capacity - a
     // setting added since - travels beside it in the loaded configuration.
-    let loaded = Config::load_with_options(cli.config.as_deref(), cli.rules_path.as_deref())?;
+    let (loaded, configured_backend) =
+        Config::load_with_backend(cli.config.as_deref(), cli.rules_path.as_deref())?;
+    let backend = cli.backend.unwrap_or(configured_backend);
     let max_scrollback_lines = loaded.max_scrollback_lines;
     let config = loaded.into_config();
 
@@ -355,7 +362,7 @@ async fn main() -> anyhow::Result<()> {
             // One renderer serves every request: it holds a font chain per
             // theme, so a request that selects another theme gets that theme's
             // fonts without rebuilding anything.
-            let renderer = build_renderer(&config, max_scrollback_lines, None, None)?;
+            let renderer = build_renderer(&config, max_scrollback_lines, None, None, backend)?;
             server::run_mcp_server(config, renderer).await?;
         }
         Commands::Exec {
@@ -394,6 +401,7 @@ async fn main() -> anyhow::Result<()> {
                 max_scrollback_lines,
                 font.as_deref(),
                 font_bold.as_deref(),
+                backend,
             )?;
 
             let lines = line_selection(head_lines, tail_lines)?;
@@ -407,6 +415,18 @@ async fn main() -> anyhow::Result<()> {
             // so an invalid regex, color, or JSON object fails without having
             // executed anything.
             let manual = manual_redactions(&redaction)?;
+            let redaction_engine =
+                resolve_redaction(&config, redact, redact_rules.as_deref(), no_redact)?;
+            let redaction_request = redaction_engine.as_ref().map(|engine| RedactionRequest {
+                engine,
+                rules: redact_rules.as_ref().map(|s| parse_rule_list(s)),
+            });
+            renderer.check_backend(
+                lines,
+                redaction_request.is_some()
+                    || manual.as_ref().is_some_and(|manual| !manual.is_empty())
+                    || redact_text,
+            )?;
 
             let exec_result = if !no_prompt {
                 // Each CLI argument is a separate command. The shell will
@@ -444,14 +464,6 @@ async fn main() -> anyhow::Result<()> {
                 rounded_override(rounded, no_rounded),
                 command.first().map(String::as_str),
             );
-
-            // Resolve whether redaction runs, then build the engine on demand.
-            let redaction_engine =
-                resolve_redaction(&config, redact, redact_rules.as_deref(), no_redact)?;
-            let redaction_request = redaction_engine.as_ref().map(|engine| RedactionRequest {
-                engine,
-                rules: redact_rules.as_ref().map(|s| parse_rule_list(s)),
-            });
 
             let output_name = {
                 let fallback_dir = working_dir
@@ -539,9 +551,21 @@ async fn main() -> anyhow::Result<()> {
             rounded,
             no_rounded,
         } => {
-            let renderer = build_renderer(&config, max_scrollback_lines, None, None)?;
+            let renderer = build_renderer(&config, max_scrollback_lines, None, None, backend)?;
             let lines = line_selection(head_lines, tail_lines)?;
             let manual = manual_redactions(&redaction)?;
+            let redaction_engine =
+                resolve_redaction(&config, redact, redact_rules.as_deref(), no_redact)?;
+            let redaction_request = redaction_engine.as_ref().map(|engine| RedactionRequest {
+                engine,
+                rules: redact_rules.as_ref().map(|s| parse_rule_list(s)),
+            });
+            renderer.check_backend(
+                lines,
+                redaction_request.is_some()
+                    || manual.as_ref().is_some_and(|manual| !manual.is_empty())
+                    || redact_text,
+            )?;
 
             let data = if input == "-" {
                 use std::io::Read;
@@ -570,16 +594,6 @@ async fn main() -> anyhow::Result<()> {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
             };
-
-            // `render` honors the same redaction policy as `exec`: rendering a
-            // captured log is exactly the case where the content has not been
-            // eyeballed first.
-            let redaction_engine =
-                resolve_redaction(&config, redact, redact_rules.as_deref(), no_redact)?;
-            let redaction_request = redaction_engine.as_ref().map(|engine| RedactionRequest {
-                engine,
-                rules: redact_rules.as_ref().map(|s| parse_rule_list(s)),
-            });
 
             let (image_path, plain_text, redactions, meta) = renderer
                 .render_bytes_with_extended_options(
@@ -635,7 +649,7 @@ async fn main() -> anyhow::Result<()> {
             title,
             output,
         } => {
-            let renderer = build_renderer(&config, max_scrollback_lines, None, None)?;
+            let renderer = build_renderer(&config, max_scrollback_lines, None, None, backend)?;
             let layout = ComposeLayout::parse(&layout)?;
             let chrome_options =
                 chrome_options_from_args(&config, chrome, title, false, None, None);
@@ -653,7 +667,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", path.display());
         }
         Commands::Themes => {
-            let renderer = build_renderer(&config, max_scrollback_lines, None, None)?;
+            let renderer = build_renderer(&config, max_scrollback_lines, None, None, backend)?;
             let names = renderer.theme_names();
             let default = &config.default_theme;
             for name in &names {
@@ -686,21 +700,28 @@ fn build_renderer(
     max_scrollback_lines: usize,
     font: Option<&std::path::Path>,
     font_bold: Option<&std::path::Path>,
+    backend: Backend,
 ) -> anyhow::Result<Renderer> {
+    if backend == Backend::Vte {
+        tracing::warn!(
+            "Using experimental VTE: viewport-only rendering, native font matching, no redaction"
+        );
+    }
     let selection = FontSelection {
         font_override: font.map(PathBuf::from),
         font_bold_override: font_bold.map(PathBuf::from),
         global_font: config.font_path.clone(),
         global_fallback_fonts: Vec::new(),
     };
-    Renderer::new_with_options(
+    Ok(Renderer::new_with_options(
         &selection,
         config.font_size,
         &config.themes,
         &config.default_theme,
         &config.chrome,
         RendererOptions::default().with_max_scrollback_lines(max_scrollback_lines),
-    )
+    )?
+    .with_backend(backend))
 }
 
 /// Compile the repeatable `--redaction '<JSON>'` options into the shared
@@ -832,6 +853,9 @@ fn line_selection(head: Option<u64>, tail: Option<u64>) -> anyhow::Result<LineSe
 /// `max_scrollback_lines`" when raising it would change nothing is worse than
 /// no advice at all.
 fn truncation_notice(renderer: &Renderer, rows: u16, cols: u16) -> String {
+    if renderer.backend() == Backend::Vte {
+        return VTE_VIEWPORT_NOTICE.to_string();
+    }
     let configured = renderer.max_scrollback_lines();
     let effective = renderer.effective_scrollback_lines(rows, cols);
     let advice = if effective < configured {

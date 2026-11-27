@@ -1,3 +1,4 @@
+use crate::backend::Backend;
 use crate::capture::{DEFAULT_MAX_SCROLLBACK_LINES, MAX_SCROLLBACK_LIMIT};
 use crate::redaction::RedactionConfig;
 use anyhow::Result;
@@ -68,6 +69,7 @@ impl Default for ConfigFile {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 struct ConfigFileExtensions {
+    backend: Backend,
     /// How many scrolled-off lines each capture retains, so a screenshot can
     /// show output that never fit in the viewport. Capped at
     /// [`MAX_SCROLLBACK_LIMIT`].
@@ -77,6 +79,7 @@ struct ConfigFileExtensions {
 impl Default for ConfigFileExtensions {
     fn default() -> Self {
         Self {
+            backend: Backend::Builtin,
             max_scrollback_lines: DEFAULT_MAX_SCROLLBACK_LINES,
         }
     }
@@ -318,6 +321,14 @@ impl Config {
         config_path: Option<&str>,
         rules_path: Option<&str>,
     ) -> Result<LoadedConfig> {
+        Ok(Self::load_with_backend(config_path, rules_path)?.0)
+    }
+
+    /// Load backend selection alongside the unchanged public configuration types.
+    pub fn load_with_backend(
+        config_path: Option<&str>,
+        rules_path: Option<&str>,
+    ) -> Result<(LoadedConfig, Backend)> {
         let config_dir = dirs_config().join("termshot");
 
         // Create the config directory and default config/theme files the first
@@ -423,6 +434,10 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(extensions.max_scrollback_lines)
             .clamp(1, MAX_SCROLLBACK_LIMIT);
+        let backend = env_var("BACKEND")
+            .map(|value| value.parse())
+            .transpose()?
+            .unwrap_or(extensions.backend);
 
         let shell = env_var("SHELL")
             .or(file_config.shell)
@@ -452,24 +467,27 @@ impl Config {
         let mut redaction = file_config.redaction;
         merge_rule_dirs(&mut redaction, &config_dir, rules_path);
 
-        Ok(LoadedConfig {
-            config: Self {
-                output_dir,
-                font_path,
-                font_size,
-                default_cols,
-                default_rows,
-                default_timeout_secs,
-                shell,
-                embed_description: file_config.embed_description,
-                default_theme,
-                chrome,
-                themes,
-                user_theme_names,
-                redaction,
+        Ok((
+            LoadedConfig {
+                config: Self {
+                    output_dir,
+                    font_path,
+                    font_size,
+                    default_cols,
+                    default_rows,
+                    default_timeout_secs,
+                    shell,
+                    embed_description: file_config.embed_description,
+                    default_theme,
+                    chrome,
+                    themes,
+                    user_theme_names,
+                    redaction,
+                },
+                max_scrollback_lines,
             },
-            max_scrollback_lines,
-        })
+            backend,
+        ))
     }
 
     /// Resolve the regular and bold font paths declared by a theme, expanding
@@ -885,12 +903,16 @@ const DEFAULT_CONFIG_TOML: &str = r##"# termshot configuration
 # extra downloads. Drop your own theme files in themes/ to add more - see
 # docs/themes.md for the format and per-theme font options.
 default_theme = "dark"
+# Optional native Linux renderer: "vte". See docs/backends.md for requirements
+# and viewport-only limitations.
+backend = "builtin"
 font_size = 16.0
 cols = 120
 # The terminal viewport a command runs in: `rows` decides where long lines wrap,
 # not how much of the output the screenshot shows. Everything that scrolls off
 # the top is kept and rendered, up to `max_scrollback_lines`. Use
-# --head-lines/--tail-lines to render only one end.
+# --head-lines/--tail-lines to render only one end. The experimental VTE backend
+# instead captures only the current viewport, without head/tail selections.
 rows = 40
 max_scrollback_lines = 10000
 timeout_secs = 30
@@ -1029,7 +1051,7 @@ palette = ["#000000", "#111111", "#222222", "#333333", "#444444", "#555555", "#6
         std::fs::write(
             &path,
             format!(
-                "output_dir = {:?}\ncols = 111\nmax_scrollback_lines = 777\n",
+                "output_dir = {:?}\ncols = 111\nmax_scrollback_lines = 777\nbackend = \"vte\"\n",
                 dir.join("out").display().to_string()
             ),
         )
@@ -1038,6 +1060,8 @@ palette = ["#000000", "#111111", "#222222", "#333333", "#444444", "#555555", "#6
         let loaded = Config::load_with_options(Some(path.to_str().unwrap()), None).unwrap();
         assert_eq!(loaded.default_cols, 111);
         assert_eq!(loaded.max_scrollback_lines, 777);
+        let (_, backend) = Config::load_with_backend(Some(path.to_str().unwrap()), None).unwrap();
+        assert_eq!(backend, Backend::Vte);
 
         // The 1.0.0 entry point still hands back a plain `Config`.
         let config: Config = Config::load(Some(path.to_str().unwrap()), None).unwrap();
